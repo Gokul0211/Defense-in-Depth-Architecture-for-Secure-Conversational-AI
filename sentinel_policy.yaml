@@ -1,0 +1,12 @@
+output_policy:
+  forbidden_topics:
+    - investment_advice_unqualified
+    - guarantee_returns
+    - regulatory_violations
+  required_disclaimers:
+    - condition: "interest rates"
+      disclaimer: "Rates subject to change. Not financial advice."
+    - condition: "medical diagnosis"
+      disclaimer: "Consult a doctor for medical advice."
+  max_commitment_level: "informational"
+  pii_handling: "redact"
