@@ -1,4 +1,4 @@
-# SENTINEL
+# Defense-in-Depth-Architecture-for-Secure-Conversational-AI
 
 **A real-time, semantic-layer security fabric for production LLM systems.**
 
