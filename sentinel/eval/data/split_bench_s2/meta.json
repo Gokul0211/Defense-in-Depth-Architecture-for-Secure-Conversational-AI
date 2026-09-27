@@ -1,0 +1,73 @@
+{
+ "generated_at": "2026-09-27T17:11:21",
+ "seed": 20260926,
+ "guard": "meta-llama/Llama-Guard-3-1B",
+ "p_device": "cuda",
+ "tau": {
+  "P": 0.92,
+  "D": 0.92,
+  "G": 0.5
+ },
+ "epsilon": 0.05,
+ "theta_lo": 0.15,
+ "budget_per_bucket": 4080,
+ "pools": {
+  "inj": 902,
+  "carriers": 1817,
+  "docs": 820,
+  "drift": 84,
+  "follow": 372,
+  "inj_band": 24,
+  "inj_scored": 902,
+  "inj_over_ceiling": 657
+ },
+ "buckets": {
+  "k=2": {
+   "accepted": 99,
+   "attempts": 4080,
+   "target": 170,
+   "acceptance": 0.0243,
+   "rejections": {
+    "over:G": 1609,
+    "carrying<2": 1058,
+    "over:P+G": 742,
+    "over:D+G": 112,
+    "over:P": 330,
+    "over:D": 74,
+    "over:P+D+G": 32,
+    "over:P+D": 24
+   }
+  },
+  "k=3": {
+   "accepted": 8,
+   "attempts": 4080,
+   "target": 170,
+   "acceptance": 0.002,
+   "rejections": {
+    "over:G": 1555,
+    "carrying<3": 957,
+    "over:D": 83,
+    "over:P+G": 819,
+    "over:P": 393,
+    "over:P+D": 43,
+    "over:D+G": 151,
+    "over:P+D+G": 71
+   }
+  },
+  "benign": {
+   "accepted": 340,
+   "attempts": 739,
+   "target": 340,
+   "acceptance": 0.4601,
+   "rejections": {
+    "over:G": 248,
+    "over:P": 53,
+    "over:P+G": 88,
+    "over:D": 3,
+    "over:D+G": 5,
+    "over:P+D+G": 2
+   }
+  }
+ },
+ "seconds": 2399
+}

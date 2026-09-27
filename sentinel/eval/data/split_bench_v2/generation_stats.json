@@ -1,0 +1,160 @@
+{
+  "stats": {
+    "k=2": {
+      "accepted": 170,
+      "attempts": 241,
+      "duplicates_skipped": 8,
+      "acceptance_rate": 0.7054,
+      "top_rejection_reasons": [
+        [
+          "only 1 layers carry signal >",
+          27
+        ],
+        [
+          "L3",
+          25
+        ],
+        [
+          "L2",
+          11
+        ]
+      ]
+    },
+    "k=3": {
+      "accepted": 0,
+      "attempts": 4080,
+      "duplicates_skipped": 0,
+      "acceptance_rate": 0.0,
+      "top_rejection_reasons": [
+        [
+          "only 2 layers carry signal >",
+          3737
+        ],
+        [
+          "L2",
+          343
+        ]
+      ]
+    },
+    "benign": {
+      "accepted": 340,
+      "attempts": 350,
+      "duplicates_skipped": 10,
+      "acceptance_rate": 0.9714,
+      "rejection_reasons": []
+    }
+  },
+  "epsilon": 0.05,
+  "theta_lo": 0.15,
+  "seed": 909,
+  "eligible_layers": [
+    "L1",
+    "L2",
+    "L3"
+  ],
+  "combinatorial_capacity": {
+    "benign": 8640,
+    "k=2": 69984,
+    "k=3": 1152
+  },
+  "n_unique_texts": 510,
+  "l1_llm_judge_enabled_during_generation": false,
+  "l1_tier_fusion_enabled_during_generation": false,
+  "fusion_aware": false,
+  "fusion_margin": 0.0,
+  "config": {
+    "l1_tier_fusion": false,
+    "l1_llm_judge_enabled": false,
+    "l1_judge_band": [
+      0.3,
+      0.75
+    ],
+    "l1_tier1_threshold": 0.45,
+    "l1_warn_threshold": 0.5494,
+    "l1_block_threshold": 0.85,
+    "l1_semantic_medium": 0.3,
+    "l1_semantic_high": 0.75,
+    "l1_fused_semantic_medium": 0.3883,
+    "l1_fused_semantic_high": 0.5073,
+    "l1_conformal_alpha": 0.01,
+    "l1_harm_probe_tier": false,
+    "l1_harm_content_tier": false,
+    "l1_tier3_mode": "agreement",
+    "l1_judge_prompt_version": "v7",
+    "llm_judge_reasoning_effort": "low",
+    "l1_judge_model": "openai/gpt-oss-safeguard-20b",
+    "l1_harm_probe_variant": "shipped",
+    "l1_harm_fused_warn_threshold": 0.3177,
+    "l2_content_type_routing": true,
+    "l2_tool_response_flag_threshold": 0.813,
+    "l2_tool_response_doc_flag_threshold": "mondrian_warn_anchor",
+    "l2_document_threat_scorer": true,
+    "l2_warn_threshold": 0.372876,
+    "l2_document_threat_warn_threshold": 0.250618,
+    "l2_block_threshold": 0.6,
+    "l3_score_mode": "production",
+    "l3_warn_threshold": 0.27,
+    "l3_block_threshold": 0.5,
+    "l3_velocity_weight": 0.1,
+    "l3_drift_weight": 0.15,
+    "l3_harm_alignment_weight": 0.5,
+    "l3_escalation_weight": 0.25,
+    "l3_escalation_threshold": 0.45,
+    "l3_max_history": 10,
+    "safety_guard_model": "Qwen/Qwen3Guard-Gen-0.6B",
+    "safety_guard_head": "",
+    "l1_safety_tier": false,
+    "l1_safety_tau": 0.6737,
+    "l1_safety_may_block": false,
+    "l2_document_threat_warn_threshold_code": 0.644572,
+    "l2_document_threat_block_threshold_code": 0.776558,
+    "l3_content_signal": "anchors",
+    "l3_guard_combine": "replace",
+    "l3_guard_warn_threshold": null,
+    "l3_guard_block_threshold": null,
+    "l3_decoded_guard": false,
+    "l1_harm_head": "separate",
+    "l1_harm_tau": 0.6737,
+    "l1_harm_may_block": false,
+    "l1_harm_block_tau": null,
+    "l1_harm_judge": false,
+    "l1_harm_judge_band": [
+      0.1,
+      0.9
+    ],
+    "harm_policy_version": "harm_v1",
+    "l1_judge_may_lower": false,
+    "l2_short_doc_scorer": "piguard",
+    "l2_document_threat_warn_threshold_short": 0.999712,
+    "l2_document_threat_block_threshold_short": 0.999933,
+    "l2_short_doc_judge": false,
+    "l2_short_doc_judge_band": [
+      0.1,
+      0.9
+    ],
+    "l2_retrieval_min_similarity": 0.0,
+    "l2_shared_axis_in_app": false,
+    "l4_alignment_judge": false,
+    "policy_judge_enabled": true,
+    "l2_shared_axis": true,
+    "pipeline_fusion": "off",
+    "l3_decoded_guard_tau": 0.6737,
+    "l3_calibration": "youden",
+    "l3_conformal_warn_threshold": 0.2806,
+    "l4_provenance_policy": "action",
+    "pipeline_block_policy": "single_layer",
+    "pipeline_corroboration_k": 2,
+    "torch_threads": "0",
+    "l4_decision_threshold": 0.97,
+    "l5_provenance_min_identifier_len": 12,
+    "warn_threshold": 0.5,
+    "block_threshold": 0.85,
+    "embedding_model": "all-MiniLM-L6-v2",
+    "llm_backend": "https://api.groq.com/openai/v1/chat/completions",
+    "llm_model_override": "openai/gpt-oss-20b",
+    "llm_api_key_present": true,
+    "git_hash": null,
+    "python": "3.14.3",
+    "platform": "Windows-11-10.0.26200-SP0"
+  }
+}

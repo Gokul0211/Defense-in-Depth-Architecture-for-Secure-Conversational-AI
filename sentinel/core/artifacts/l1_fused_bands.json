@@ -1,0 +1,53 @@
+{
+  "generated_at": "2026-09-19T01:48:21",
+  "source_file": "eval_conformal_fusion_paired_20260919_014456.json",
+  "calibration_arms": [
+    "alpaca_calibration",
+    "alpaca_validation"
+  ],
+  "n_calibration": 1000,
+  "source_bands": {
+    "L1_SEMANTIC_MEDIUM": 0.3,
+    "L1_SEMANTIC_HIGH": 0.75
+  },
+  "bands": {
+    "L1_FUSED_SEMANTIC_MEDIUM": {
+      "source_band": 0.3,
+      "method": "benign_quantile_match",
+      "benign_quantile": 0.752,
+      "n_calibration": 1000,
+      "matched_band": 0.3883,
+      "saturated": false,
+      "bootstrap_sd": 0.0014,
+      "bootstrap_ci95": [
+        0.3856,
+        0.3915
+      ],
+      "verify_fused_quantile": 0.752,
+      "source_band_benign_quantile_on_max_axis": 0.752,
+      "source_axis_benign_max": 0.6797
+    },
+    "L1_FUSED_SEMANTIC_HIGH": {
+      "source_band": 0.75,
+      "method": "conformal_upper_anchor",
+      "benign_quantile": 1.0,
+      "n_calibration": 1000,
+      "matched_band": 0.5073,
+      "saturated": true,
+      "bootstrap_sd": 0.0139,
+      "bootstrap_ci95": [
+        0.4716,
+        0.5073
+      ],
+      "verify_fused_quantile": 1.0,
+      "source_band_benign_quantile_on_max_axis": 1.0,
+      "source_axis_benign_max": 0.6797
+    }
+  },
+  "ordering_preserved": true,
+  "usable": true,
+  "identification": {
+    "band_gap": 0.119,
+    "worst_bootstrap_sd": 0.0139
+  }
+}

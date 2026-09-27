@@ -1,0 +1,33 @@
+{
+  "artifact": "l1_harm_probe.json",
+  "frozen_at": "2026-09-21T00:09:54",
+  "fit_harmful_corpus": "jailbreakbench",
+  "fit_harmful_source": "C:\\Users\\gokul\\Downloads\\sentinel_project\\sentinel\\eval\\data\\cache\\jailbreakbench\\test\\samples.jsonl",
+  "fit_harmful_sha256": "146d04bdcab8070e097e688911e7df83d96070a93e67e421935a28454e33988f",
+  "n_harmful": 100,
+  "fit_benign_corpus": "alpaca rows 500-2000",
+  "fit_benign_source": "C:\\Users\\gokul\\Downloads\\sentinel_project\\sentinel\\eval\\data\\cache\\alpaca\\test\\samples.jsonl",
+  "fit_benign_sha256": "8132c2728da7b443aab1bfd8eb2044f05e366f1499d0e64c9598ec671b1bc8e8",
+  "n_benign": 1500,
+  "C": 0.01,
+  "warn_quantile": 0.99,
+  "block_quantile": 0.999,
+  "quantile_selection_rule": "the probe's benign budget on the fit half must not exceed L1's own measured benign rate (Alpaca FPR 0.0300), so adding a tier cannot spend more false-positive budget than the layer already had",
+  "held_out_corpora": [
+    "wildjailbreak",
+    "tensortrust",
+    "sentinel_bench",
+    "alpaca rows 0-500"
+  ],
+  "held_out_rationale": "WildJailbreak, TensorTrust and sentinel_bench carry every claim this probe is evaluated against and are never fitted on. Alpaca is split: rows 500-2000 fit, rows 0-500 evaluate, disjoint by construction. JailbreakBench is a reported L1 row and is RETIRED as a zero-shot row for this component by being fitted on -- see the module docstring.",
+  "controls_passed": {
+    "shape_only_transfer_wildjailbreak": 0.4137,
+    "permuted_labels_mean_50_refits": 0.5076,
+    "fitset_bootstrap_mean_200_refits": 0.7992,
+    "fitset_bootstrap_ci95": [
+      0.7723,
+      0.8275
+    ]
+  },
+  "artifact_sha256": "6ac1a9612a4fed7ec06a85d9613ee98c000998cee2f80dd6f30ee685c5163828"
+}

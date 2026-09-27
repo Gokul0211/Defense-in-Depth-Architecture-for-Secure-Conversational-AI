@@ -1,0 +1,60 @@
+{
+  "chain_types": {
+    "slow_burn_injection": {
+      "count": 75,
+      "held_out": false,
+      "layers": [
+        "L1",
+        "L3"
+      ]
+    },
+    "rag_agent_hijack": {
+      "count": 75,
+      "held_out": false,
+      "layers": [
+        "L2",
+        "L4"
+      ]
+    },
+    "exfil_after_probe": {
+      "count": 75,
+      "held_out": false,
+      "layers": [
+        "L1",
+        "L5"
+      ]
+    },
+    "poisoned_rag_exfil": {
+      "count": 75,
+      "held_out": true,
+      "layers": [
+        "L2",
+        "L4",
+        "L5"
+      ]
+    },
+    "full_chain": {
+      "count": 75,
+      "held_out": true,
+      "layers": [
+        "L1",
+        "L2",
+        "L3",
+        "L4",
+        "L5"
+      ]
+    }
+  },
+  "n_benign": 200,
+  "total": 575,
+  "total_attack": 375,
+  "test_samples": 112,
+  "train_samples": 463,
+  "held_out_samples": 150,
+  "mining_samples": 425,
+  "held_out_chain_types": [
+    "poisoned_rag_exfil",
+    "full_chain"
+  ],
+  "seed": 42
+}

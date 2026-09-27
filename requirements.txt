@@ -1,0 +1,16 @@
+# SENTINEL — Pinned Production Dependencies
+# Exact versions frozen for reproducibility (paper artifact requirement).
+# Do NOT use >= ranges for any dependency used in evaluation.
+
+fastapi==0.136.3
+uvicorn[standard]==0.46.0
+httpx==0.28.1
+sentence-transformers==5.6.0
+scikit-learn==1.9.0
+numpy==2.4.4
+python-dotenv==1.2.2
+pydantic==2.13.3
+pypdf==6.14.2
+python-multipart==0.0.27
+Pillow==12.2.0
+torch==2.12.1

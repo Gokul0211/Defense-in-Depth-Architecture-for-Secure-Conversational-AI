@@ -1,0 +1,6 @@
+# Downloaded / cached third-party data -- never committed (see the root .gitignore
+# for the third-party corpora directories). Our own benchmarks ARE committed:
+# sentinel_bench (DIDA-Bench), phase4_benchmark, custom_l3, custom_l5,
+# split_bench (v1), split_bench_v2, split_bench_v2_train and split_bench_s2.
+cache/
+per_turn_cache/

@@ -1,0 +1,65 @@
+{
+  "kind": "PatternJointTierFusion",
+  "min_samples": 20,
+  "pattern_log_odds": {
+    "tier1_regex|tier2_semantic|tier3_prompt_guard": 0.3746934494414107,
+    "tier1_regex|tier2_semantic|tier3_prompt_guard|tier4_judge": -0.3364722366212129,
+    "tier1_regex": 6.0
+  },
+  "models": {
+    "tier1_regex|tier2_semantic|tier3_prompt_guard": {
+      "tier2_semantic": {
+        "a": -0.11524306342982278,
+        "b": 1.272786229862202,
+        "n_fit": 27
+      },
+      "tier3_prompt_guard": {
+        "a": -0.34591361286223565,
+        "b": 1.9807770243134317,
+        "n_fit": 27
+      }
+    },
+    "tier1_regex|tier2_semantic|tier3_prompt_guard|tier4_judge": {
+      "tier2_semantic": {
+        "a": -0.4235317544386181,
+        "b": 0.2357919012759633,
+        "n_fit": 72
+      },
+      "tier3_prompt_guard": {
+        "a": -0.3379033929625451,
+        "b": 0.21828747993163897,
+        "n_fit": 72
+      },
+      "tier4_judge": {
+        "a": -2.3070142115563037,
+        "b": 4.135706797175084,
+        "n_fit": 72
+      }
+    }
+  },
+  "fallback": {
+    "prior_log_odds": 0.10724553035359759,
+    "calibrations": {
+      "tier1_regex": {
+        "a": -0.06528712491131429,
+        "b": 1.8415286840442942,
+        "n_fit": 112
+      },
+      "tier2_semantic": {
+        "a": -0.634009065105132,
+        "b": 1.316608471373355,
+        "n_fit": 99
+      },
+      "tier3_prompt_guard": {
+        "a": -0.35280805760334966,
+        "b": 2.036863314892381,
+        "n_fit": 99
+      },
+      "tier4_judge": {
+        "a": -2.3070142115563037,
+        "b": 4.135706797175084,
+        "n_fit": 72
+      }
+    }
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "total_pii": 200,
+  "total_clean": 300,
+  "total_canary": 50,
+  "total": 550,
+  "test_samples": 110,
+  "train_samples": 440,
+  "seed": 42
+}

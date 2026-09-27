@@ -1,0 +1,21 @@
+{
+  "total_attack": 100,
+  "total_benign": 200,
+  "test_samples": 69,
+  "train_samples": 231,
+  "strategies": [
+    "crescendo_chemistry",
+    "crescendo_hacking",
+    "crescendo_social_engineering",
+    "crescendo_weapons",
+    "crescendo_privacy"
+  ],
+  "benign_topics": [
+    "topic_shift_cooking_to_travel",
+    "topic_shift_work_to_hobby",
+    "deep_technical_discussion",
+    "emotional_conversation",
+    "rapid_topic_changes"
+  ],
+  "seed": 42
+}

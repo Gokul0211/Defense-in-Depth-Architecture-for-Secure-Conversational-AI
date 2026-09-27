@@ -1,0 +1,30 @@
+{
+  "artifact": "l1_tier_fusion.json",
+  "artifact_sha256": "ebd48f0b4081cbbe0bb79531708a59a45f02b4ef29e0a288507c93cd278a08d3",
+  "frozen_at": "2026-09-19T01:43:54",
+  "train_corpus": "sentinel_bench",
+  "train_source_file": "eval_L1_sentinel_bench_20260918_192729.json",
+  "train_source_sha256": "2885134b4f7b3fc8e68334d495d72afa25f501eefde7ddabdba48ee9d6cca399",
+  "n_train": 112,
+  "n_malicious": 59,
+  "n_benign": 53,
+  "availability_patterns": {
+    "tier1_regex|tier2_semantic|tier3_prompt_guard": 27,
+    "tier1_regex|tier2_semantic|tier3_prompt_guard|tier4_judge": 72,
+    "tier1_regex": 13
+  },
+  "patterns_with_joint_model": [
+    "tier1_regex|tier2_semantic|tier3_prompt_guard",
+    "tier1_regex|tier2_semantic|tier3_prompt_guard|tier4_judge"
+  ],
+  "patterns_falling_back_to_base_rate": [
+    "tier1_regex"
+  ],
+  "min_samples": 20,
+  "held_out_corpora": [
+    "wildjailbreak",
+    "alpaca",
+    "tensortrust"
+  ],
+  "held_out_rationale": "WildJailbreak carries every downstream held-out claim (cross-corpus AUROC and the conformal benign stress test), so it is excluded from fitting. Alpaca is the conformal calibration set and is likewise never fitted on."
+}

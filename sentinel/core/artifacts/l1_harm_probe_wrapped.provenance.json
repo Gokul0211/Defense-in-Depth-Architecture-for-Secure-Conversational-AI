@@ -1,0 +1,40 @@
+{
+ "schema": 1,
+ "artifact": "l1_harm_probe_wrapped.json",
+ "frozen_at": "2026-09-22T22:53:46",
+ "purpose": "harm probe with hard negatives AND wrapper augmentation, so it reads the payload through jailbreak framing",
+ "embedding_model": "sentence-transformers/all-MiniLM-L6-v2",
+ "embedding_revision": "8b3219a92973c328a8e22fadcfa821b5dc75636a",
+ "dim": 384,
+ "fit_harmful_corpus": "jailbreakbench (+wrapper augmentation)",
+ "fit_harmful_sha256": "146d04bdcab8070e097e688911e7df83d96070a93e67e421935a28454e33988f",
+ "n_harmful": 300,
+ "fit_benign_corpora": [
+  "or-bench-hard-1k (+wrappers)",
+  "alpaca rows 500-4500 (+wrappers)"
+ ],
+ "fit_benign_sha256": {
+  "orbench": "13750d1eb4bed42ac299758db7c36c1adbfb61fa6075e06c5d2850de4018630a",
+  "alpaca": "8132c2728da7b443aab1bfd8eb2044f05e366f1499d0e64c9598ec671b1bc8e8"
+ },
+ "n_benign": 15957,
+ "n_wrappers": 8,
+ "wraps_per_sample": 2,
+ "wrapper_control_mean_score": 0.022171748227484234,
+ "never_fitted_on": [
+  "wildjailbreak",
+  "notinject",
+  "sentinel_bench",
+  "tensortrust",
+  "bipia_local",
+  "alpaca rows 0-500 (calibrates L1_WARN_THRESHOLD)"
+ ],
+ "C": 0.01,
+ "warn_quantile": 0.99,
+ "block_quantile": 0.999,
+ "warn_threshold": 0.7340979881343692,
+ "block_threshold": 0.9700558932819638,
+ "intercept": -5.9376013614475935,
+ "seed": 20260922,
+ "artifact_sha256": "aa2333f4362f04b36a1e46118032808ad9699ac6af3befe47ea84b7ac18f9b6b"
+}

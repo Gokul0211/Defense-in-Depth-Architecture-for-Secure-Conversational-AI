@@ -1,0 +1,46 @@
+{
+  "stats": {
+    "k=2": {
+      "accepted": 170,
+      "attempts": 200,
+      "duplicates_skipped": 6,
+      "acceptance_rate": 0.85,
+      "top_rejection_reasons": [
+        [
+          "L3",
+          24
+        ]
+      ]
+    },
+    "k=3": {
+      "accepted": 170,
+      "attempts": 179,
+      "duplicates_skipped": 9,
+      "acceptance_rate": 0.9497,
+      "top_rejection_reasons": []
+    },
+    "benign": {
+      "accepted": 340,
+      "attempts": 346,
+      "duplicates_skipped": 6,
+      "acceptance_rate": 0.9827,
+      "rejection_reasons": []
+    }
+  },
+  "epsilon": 0.05,
+  "theta_lo": 0.15,
+  "seed": 909,
+  "eligible_layers": [
+    "L1",
+    "L2",
+    "L3"
+  ],
+  "combinatorial_capacity": {
+    "benign": 8640,
+    "k=2": 69984,
+    "k=3": 1152
+  },
+  "n_unique_texts": 680,
+  "l1_llm_judge_enabled_during_generation": false,
+  "l1_tier_fusion_enabled_during_generation": false
+}

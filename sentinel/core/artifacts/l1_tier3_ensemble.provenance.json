@@ -1,0 +1,28 @@
+{
+ "artifact": "l1_tier3_ensemble.json",
+ "frozen_at": "2026-09-22T18:27:51",
+ "purpose": "benign-quantile reference so Prompt Guard and PIGuard can be averaged on one axis; see this module's docstring",
+ "fit_benign_corpus": "alpaca rows 500-4500",
+ "fit_benign_source": "sentinel\\eval\\data\\cache\\alpaca\\test\\samples.jsonl",
+ "fit_benign_sha256": "8132c2728da7b443aab1bfd8eb2044f05e366f1499d0e64c9598ec671b1bc8e8",
+ "n_benign": 4000,
+ "disjoint_from": "alpaca rows 0-500, which conformal_l1_eval.py uses to calibrate L1_WARN_THRESHOLD",
+ "never_fitted_on": [
+  "notinject",
+  "sentinel_bench",
+  "tensortrust",
+  "wildjailbreak",
+  "bipia_local"
+ ],
+ "models": {
+  "prompt_guard": "meta-llama/Prompt-Guard-86M (jailbreak head)",
+  "piguard": "leolee99/PIGuard (injection head, ACL 2025, arXiv:2410.22770)"
+ },
+ "combination": "unweighted mean of the two quantile transforms; max() was measured and rejected (sentinel_bench 0.9506 -> 0.8287)",
+ "seed": 20260922,
+ "raw_p99": {
+  "prompt_guard_jailbreak": 0.00016312490770360407,
+  "piguard_injection": 0.3678026100993075
+ },
+ "artifact_sha256": "6a1c7e45450f67761e305ed3b53045fed171a5c87a54d9f1c373326c53f03aa3"
+}

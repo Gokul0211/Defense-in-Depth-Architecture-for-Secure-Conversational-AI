@@ -1,0 +1,97 @@
+# =====================================================================
+# DIDA -- what is NOT pushed.
+# The repo ships the code (sentinel/, dashboard/, main.py), its configs and
+# requirements, README.md and results.md. Everything else stays local.
+# =====================================================================
+
+# --- Secrets ----------------------------------------------------------
+.env
+.env.*
+!.env.example
+
+# --- Python / tooling artefacts ---------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# --- Virtual environments ---------------------------------------------
+venv/
+env/
+.venv/
+.venv-*/
+ENV/
+
+# --- IDEs, OS, assistant state -----------------------------------------
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+.claude/
+CLAUDE.md
+
+# --- Tests (not published) ----------------------------------------------
+tests/
+test/
+test_*.py
+*_test.py
+pytest.ini
+requirements-dev.txt
+
+# --- Paper sources and submission material -------------------------------
+paper/
+*.zip
+
+# --- Scratch work, experiment logs and one-off scripts -------------------
+scratch/
+*.log
+*.out
+*.sqlite3
+*.db
+*.txt
+!requirements.txt
+!requirements-eval.txt
+*.jsonl
+!sentinel/eval/data/**/*.jsonl
+text_attack_test.json
+l4_real_eval_results.json
+calibrate_l2_*.py
+check_llm_guard*.py
+generate_test_assets.py
+l4_ds_eval.py
+l4_find_threshold.py
+
+# --- Markdown notes: every .md except the README and the results log ------
+*.md
+!README.md
+!results.md
+!sentinel/eval/data/README.md
+!sentinel/eval/PHASE4_PROTOCOL.md
+
+# --- Evaluation artefacts (large, regenerable; results.md is the record) --
+sentinel/eval/results/*
+!sentinel/eval/results/LEDGER.jsonl
+sentinel/eval/data/cache/
+sentinel/eval/data/per_turn_cache/
+# third-party corpora and real-user conversations: not redistributed
+sentinel/eval/data/agentleak/
+sentinel/eval/data/injecagent/
+sentinel/eval/data/bipia_local/
+sentinel/eval/data/benign_mt/
+sentinel/eval/data/benign_pipeline_arm/
+# generator scratch variants of SPLIT-Bench (v1, v2, S2 and the v2 training corpus are kept)
+sentinel/eval/data/split_bench_v2_fa/
+sentinel/eval/data/split_bench_v2_fa2/
+sentinel/eval/data/split_bench_s2/progress.json
+
+# stray file created by a shell quoting slip
+'
+# contains verbatim WildChat turns (real user text): not redistributed, see README
+sentinel/eval/data/split_bench_s2/all.jsonl

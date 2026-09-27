@@ -1,0 +1,37 @@
+{
+  "buckets": {
+    "single_vector_injection": {
+      "n_malicious": 40,
+      "n_benign": 40,
+      "n_vectors_intent": 1,
+      "held_out": false
+    },
+    "two_vector_rag_tool": {
+      "n_malicious": 50,
+      "n_benign": 50,
+      "n_vectors_intent": 2,
+      "held_out": false
+    },
+    "three_vector_rag_drift_tool": {
+      "n_malicious": 50,
+      "n_benign": 50,
+      "n_vectors_intent": 3,
+      "held_out": true
+    },
+    "four_vector_chain": {
+      "n_malicious": 40,
+      "n_benign": 40,
+      "n_vectors_intent": 4,
+      "held_out": true
+    },
+    "sub_threshold_slow_burn": {
+      "n_malicious": 50,
+      "n_benign": 50,
+      "n_vectors_intent": 3,
+      "held_out": true
+    }
+  },
+  "total": 460,
+  "seed": 4242,
+  "pilot_n": null
+}
