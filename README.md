@@ -1,6 +1,9 @@
 <div align="center">
 
-# 🛡️ DIDA
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/logo/dida-logo-dark.svg">
+  <img alt="DIDA: Defense-in-Depth Architecture" src="assets/logo/dida-logo-light.svg" width="520">
+</picture>
 
 ### Defense-in-Depth Architecture for Secure Conversational AI
 
