@@ -19,6 +19,7 @@
 [What it does](#what-it-does) ·
 [Results](#results) ·
 [The research](#research) ·
+[Contributions A–H](#contributions) ·
 [Architecture](#architecture) ·
 [Quick start](#quick-start) ·
 [Reproduce](#reproduce)
@@ -127,6 +128,50 @@ Short answer: **not the way the industry assumes.**
 | 6 | **More layers can mean more places to hide** | 66.7–85.2% of DIDA's headroom is undefended against a distributed attacker (37.4% on the third-party stack) |
 
 The math is classical: decision fusion, and Vovk and Wang's e-merging. The contribution is turning it into **checks an engineer can run on a real guardrail stack**, and measuring two stacks against them.
+
+---
+
+<a id="contributions"></a>
+
+## 🧬 What sets DIDA apart: contributions A–H
+
+Most guardrail projects ship detectors. DIDA also ships the machinery to **prove what a stack of detectors can and cannot catch**, and to measure it. These eight pieces are what you won't find in an off-the-shelf guardrail toolkit. The letters match the code and the released artifacts.
+
+### Cross-layer mechanisms
+
+| | Contribution | What it does | Measured |
+|:---:|---|---|---|
+| **A** | **Taint-propagation graph** | Turns a session into a provenance graph (turns → retrieved chunks → tool arguments) and propagates trust along it: `taint(u,v) = 1 − w·(1 − trust(u))`. Flags high-impact calls fed by low-trust content even when no single layer fired. | Fires on exactly the same 7 held-out real attack sessions as the hand-coded RAG-plus-agent rule: it generalizes the rule rather than replacing it *(earlier configuration)* |
+| **B** | **Cost-aware sequential triage** | Runs layers as a Wald sequential test (SPRT) and stops as soon as the evidence is decisive, instead of always paying for all five layers. | Accuracy 0.9554, precision 1.0, recall 0.9153, 0 false positives; attacks are decided after **~3.4 of 5 layers** *(earlier configuration)* |
+| **C** | **Correlation-pattern mining** | Mines attack-chain patterns from labeled cross-layer event sequences (PrefixSpan-style) instead of hand-writing rules. | Recall **1.0000** on attack-chain types never seen in training (0.8841 on known types), FPR 0.0667 *(earlier configuration)* |
+| **D** | **Conformal risk control for false positives** | Sets each threshold with split-conformal calibration on benign data, so the false-positive rate carries a distribution-free guarantee: `k = ⌈(n+1)(1−α)⌉`. | Holds on fresh same-source traffic (0/500 at α = 0.01) and is **shown to break** under shift (14.8% on WildJailbreak's benign set). The failure is reported, not hidden |
+
+### The theory and the measurement kit
+
+| | Contribution | What it does | Measured |
+|:---:|---|---|---|
+| **E** | **Detectability bound** | Proves that any detector reading only threshold crossings has **zero power** against an attacker who keeps every layer sub-threshold, and turns that into a prediction you can check (\|U\| = 0 on a certified corpus). | The correlation engine fired **0 times** on 510 certified attacks; the one detector that "beat" the bound turned out to be reading a lower threshold, exactly as the corollary says |
+| **F** | **Anytime-valid e-value fusion** | Fuses layer scores across layers and turns with e-values: false alarms stay controlled under *any* dependence between layers, at any stopping time. | Recovers exactly the best single layer (Jaccard **1.0000** on both corpora), proving the price of validity. Assuming independence instead catches **10/107**, 9 of which no single layer catches |
+| **G** | **SPLIT-Bench, certified sub-threshold corpora** | Generates attack sessions with a **machine-checked certificate** that every layer stays under its threshold while ≥ k layers carry real signal. Certificates are re-verified at import. | 680 sessions (v1) and 510 (v2) against DIDA, plus 447 (SPLIT-S2) against a third-party stack. Hardening DIDA made **0 of 4,080** three-layer attacks certifiable |
+| **H** | **Threshold-aware adversary and capacity sweep** | Models the attacker who knows every threshold and computes how much attack signal the stack lets them hide (*effective capacity*). | Every budget up to the capacity (3.002) fits under all thresholds; the first that doesn't is 3.040. 66.7–85.2% of that capacity is undefended. A fusion-aware variant is still certified at a 0.72 rate |
+
+> **Why this matters:** A–D are the cross-layer tricks people usually reach for. E–H explain where each one stops: three of the four reduce to a single layer on certified attacks, exactly as E predicts. That gives you a way to test *your own* guardrail stack before trusting it.
+
+<details>
+<summary><b>Where each contribution lives in the code</b></summary>
+
+| | Code |
+|:---:|---|
+| A | `sentinel/core/taint_graph.py` |
+| B | `sentinel/core/sequential_triage.py`, `sentinel/eval/sprt_eval.py` |
+| C | `sentinel/core/pattern_mining.py`, `sentinel/eval/pattern_mining_eval.py` |
+| D | `sentinel/core/conformal_risk_control.py`, `sentinel/eval/conformal_l1_eval.py` |
+| E | `SENTINEL_CONTRIBUTION_E_THEORY.md`, `sentinel/eval/run_phase4_ablation.py` |
+| F | `sentinel/core/evidence_fusion.py`, `sentinel/eval/eprocess_eval.py` |
+| G | `sentinel/eval/split_bench.py`, `sentinel/eval/second_stack.py` |
+| H | `sentinel/eval/split_attack.py` |
+
+</details>
 
 ---
 
