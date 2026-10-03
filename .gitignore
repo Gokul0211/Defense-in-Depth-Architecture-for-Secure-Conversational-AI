@@ -95,3 +95,7 @@ sentinel/eval/data/split_bench_s2/progress.json
 '
 # contains verbatim WildChat turns (real user text): not redistributed, see README
 sentinel/eval/data/split_bench_s2/all.jsonl
+
+# legacy UI, kept locally only
+old_frontend/
+skills-lock.json

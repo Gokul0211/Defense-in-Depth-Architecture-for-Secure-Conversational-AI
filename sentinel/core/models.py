@@ -2,6 +2,7 @@
 SENTINEL Core Models — All dataclasses for threat events, sessions, and layer results.
 """
 
+import time
 from dataclasses import dataclass, field
 from typing import Optional, Any
 
@@ -120,11 +121,15 @@ class ThreatEvent:
     explanation: dict = field(default_factory=dict)
     turn: Optional[int] = None  # Turn number for L3 events
     note: Optional[str] = None  # Human-readable note
+    # Unix epoch seconds at creation. `timestamp` is a display string (HH:MM:SS) with
+    # no date, so clients sort and age events by `ts`.
+    ts: float = field(default_factory=time.time)
 
     def to_dict(self) -> dict:
         return {
             "event_id": self.event_id,
             "timestamp": self.timestamp,
+            "ts": self.ts,
             "session_id": self.session_id,
             "layer": self.layer,
             "threat_type": self.threat_type,

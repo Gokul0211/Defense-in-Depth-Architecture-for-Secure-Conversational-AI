@@ -20,7 +20,7 @@ calibration.
 
 Severity is bounded and is stated so the fix is not oversold:
 `threat_class` is consumed only for REPORTING — `app.py`'s `dominant_type`
-and finding strings, `demo_scenarios`' labels — while every block/allow
+and finding strings, the demo replays' labels — while every block/allow
 decision reads `score` against WARN/BLOCK. This changes what a report says,
 never what the system does.
 

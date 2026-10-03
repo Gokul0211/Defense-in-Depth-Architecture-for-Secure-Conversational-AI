@@ -15,6 +15,10 @@ CANARY_TOKEN = f"SENTINEL-CANARY-{uuid.uuid4().hex}"
 # Server
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "8080"))
+# Browser origins allowed to call the API (comma-separated). Defaults to the local
+# Next.js frontend; set to "*" to allow any origin (credentials are then disabled).
+CORS_ORIGINS = [o.strip() for o in os.getenv(
+    "DIDA_CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(",") if o.strip()]
 
 # LLM Backend
 LLM_BACKEND = os.getenv("LLM_BACKEND", "https://api.groq.com/openai/v1/chat/completions")
@@ -235,7 +239,7 @@ LLM_JUDGE_REASONING_EFFORT = os.getenv("LLM_JUDGE_REASONING_EFFORT", "low").stri
 # The fused labels are in fact BETTER on benign, but "happens to look
 # better" is not a calibration and is not claimed as one. Severity is
 # bounded: `threat_class` is consumed only for REPORTING — app.py's
-# dominant_type and finding strings, demo_scenarios' labels — while every
+# dominant_type and finding strings, the demo replays' labels — while every
 # block/allow decision reads `score` against WARN/BLOCK. So this changes
 # what a report says, never what the system does.
 #

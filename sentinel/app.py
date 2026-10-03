@@ -1,9 +1,9 @@
 """
-SENTINEL Unified App — Single FastAPI server that serves:
-  - /v1/chat/completions (LLM proxy)
-  - /ws/events (WebSocket for real-time dashboard)
-  - /sentinel/* (REST API — sessions, events, demo triggers, reset, chat)
-  - / (Dashboard UI — static files)
+DIDA unified app. One FastAPI server that serves:
+  - /v1/chat/completions (OpenAI-compatible LLM proxy through all five layers)
+  - /ws/events (WebSocket: live threat events, session updates, stats)
+  - /sentinel/* (REST API: sessions, events, scans, demo scenarios, config)
+  - / (legacy dashboard, until the Next.js frontend in web/ replaces it)
 """
 
 import uuid
@@ -30,14 +30,19 @@ from sentinel.layers.layer4_agentic import audit_tool_call
 from sentinel.layers.layer5_output import layer5_scan_output
 from sentinel.core.correlation_engine import blocking_rules, check_correlations, reset_correlation_state
 from sentinel.core.sensitive_value_extractor import track_sensitive_values
-from sentinel.demo_scenarios import run_scenario, SCENARIOS
+from sentinel.demo import run_scenario, SCENARIOS, scenario_list
+from sentinel.core import verdicts
+from sentinel.config import CORS_ORIGINS
 
-app = FastAPI(title="SENTINEL", version="0.1.0")
+app = FastAPI(title="DIDA", version="0.1.0")
 
+# The API authenticates nothing with cookies, so credentials stay off. With
+# allow_credentials=True and "*", Starlette reflects ANY origin back, which let any
+# website make credentialed calls; the allow-list comes from DIDA_CORS_ORIGINS.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=CORS_ORIGINS,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -73,15 +78,49 @@ async def _json_body(request: Request) -> dict:
     return body
 
 
+def _legacy_ui_dir() -> str | None:
+    """Where the legacy HTML dashboard lives, if this checkout has it.
+
+    The Next.js frontend in web/ replaces it; the old UI is kept locally in
+    old_frontend/ and is not part of the published repo, so its absence must not
+    stop the API from starting (StaticFiles raises on a missing directory).
+    """
+    import os
+    for candidate in (os.getenv("DIDA_LEGACY_UI_DIR", ""), "old_frontend/static", "dashboard/static"):
+        if candidate and os.path.isfile(os.path.join(candidate, "index.html")):
+            return candidate
+    return None
+
+
+_LEGACY_UI_DIR = _legacy_ui_dir()
+
+
 @app.api_route("/", methods=["GET", "HEAD"])
 async def serve_dashboard():
-    """Serve the dashboard index.html."""
-    return FileResponse("dashboard/static/index.html")
+    """Serve the legacy dashboard when present; otherwise point at the API docs."""
+    if _LEGACY_UI_DIR:
+        return FileResponse(f"{_LEGACY_UI_DIR}/index.html")
+    return {"service": "dida", "docs": "/docs", "health": "/health"}
 
 @app.get("/health")
 async def health():
-    """Uptime check endpoint — used by Render/cron-job.org to keep the service warm."""
-    return {"status": "ok", "service": "sentinel", "version": "0.1.0"}
+    """Uptime check (also used by Render/cron-job.org to keep the service warm).
+
+    `capabilities` tells a client which optional paths can actually run, so a UI can
+    disable them honestly instead of failing: booleans only, never key material.
+    """
+    import sentinel.config as _cfg
+    from sentinel.layers.layer1_steg import PIL_AVAILABLE
+    return {
+        "status": "ok",
+        "service": "dida",
+        "version": app.version,
+        "capabilities": {
+            "llm_chat": bool(_cfg.LLM_API_KEY),
+            "l1_judge": bool(_cfg.L1_LLM_JUDGE_ENABLED and _cfg.LLM_API_KEY_POOL),
+            "image_scan": bool(PIL_AVAILABLE),
+        },
+    }
 
 
 @app.get("/sentinel/download-zip")
@@ -101,8 +140,9 @@ async def download_zip():
         raise HTTPException(status_code=404, detail="Zip file not generated on server yet. Please run the zip creation tool.")
 
 
-# Mount static files AFTER the root route
-app.mount("/static", StaticFiles(directory="dashboard/static"), name="static")
+# Mount the legacy UI's static files AFTER the root route, only if they exist.
+if _LEGACY_UI_DIR:
+    app.mount("/static", StaticFiles(directory=_LEGACY_UI_DIR), name="static")
 
 
 # ---------------------------------------------------------------------------
@@ -119,7 +159,7 @@ def _terminated_response(session) -> Response:
     """A session a BLOCKED correlation rule has terminated refuses every later request."""
     return Response(
         content=json.dumps({
-            "error": f"Session terminated by SENTINEL correlation rule(s): {session.termination_reason}",
+            "error": f"Session terminated by DIDA correlation rule(s): {session.termination_reason}",
             "threat_score": 1.0,
             "severity": "CRITICAL",
         }),
@@ -371,7 +411,7 @@ async def proxy_completions(request: Request):
         chain.append({
             "layer": "L1",
             "severity": score_to_severity(l1_result.score),
-            "finding": f"Input Scanner ({'Tier 1 regex' if l1_result.tier_used == 1 else 'Tier 2 semantic'}): {l1_result.threat_class}",
+            "finding": f"Input Scanner ({verdicts.l1_tier_label(l1_result.tier_used)}): {l1_result.threat_class}",
             "evidence": l1_result.reason,
             # Classified on the RESCALED score so this per-layer verdict
             # agrees with the combined_score decision above (3B.2); the
@@ -441,7 +481,7 @@ async def proxy_completions(request: Request):
     if action == "BLOCKED":
         return Response(
             content=json.dumps({
-                "error": f"Request blocked by SENTINEL. Reason: {reason}",
+                "error": f"Request blocked by DIDA. Reason: {reason}",
                 "threat_score": combined_score,
                 "severity": severity,
             }),
@@ -470,7 +510,7 @@ async def proxy_completions(request: Request):
     if not LLM_API_KEY:
         return Response(
             content=json.dumps({
-                "choices": [{"message": {"role": "assistant", "content": "[SENTINEL: No GROQ_API_KEY configured.]"}, "index": 0, "finish_reason": "stop"}],
+                "choices": [{"message": {"role": "assistant", "content": "[DIDA: No GROQ_API_KEY configured.]"}, "index": 0, "finish_reason": "stop"}],
                 "model": "sentinel-no-key",
             }),
             media_type="application/json",
@@ -512,7 +552,7 @@ async def proxy_completions(request: Request):
         corr_block = blocking_rules(await check_correlations(session_id))
         if corr_block and l5_result.score < BLOCK_THRESHOLD:
             return Response(
-                content=json.dumps({"error": f"Response blocked by SENTINEL correlation rule(s): {'+'.join(corr_block)}",
+                content=json.dumps({"error": f"Response blocked by DIDA correlation rule(s): {'+'.join(corr_block)}",
                                     "threat_class": "CORRELATION"}),
                 status_code=403,
                 media_type="application/json",
@@ -535,7 +575,7 @@ async def proxy_completions(request: Request):
             await threat_bus.emit(l5_event)
             await check_correlations(session_id)
             return Response(
-                content=json.dumps({"error": "Response blocked by SENTINEL L5.", "threat_class": l5_result.threat_class}),
+                content=json.dumps({"error": "Response blocked by DIDA L5.", "threat_class": l5_result.threat_class}),
                 status_code=403,
                 media_type="application/json",
                 headers={"X-Sentinel-Risk-Level": severity},
@@ -585,9 +625,8 @@ async def scan_image_steg(file: UploadFile = File(...)):
 
     session_id = f"steg_{uuid.uuid4().hex[:6]}"
 
-    # Emit a threat event so the dashboard lights up
-    severity = "CRITICAL" if result["is_malicious"] else ("MEDIUM" if result["chi_score"] > 0.5 else "CLEAN")
-    action = "BLOCKED" if result["is_malicious"] else "ALLOWED"
+    # Severity, action and chain are derived from the scan result (sentinel.core.verdicts).
+    verdict = verdicts.steg_verdict(result, file.filename)
 
     event = ThreatEvent(
         event_id=f"evt_{uuid.uuid4().hex[:8]}",
@@ -595,22 +634,11 @@ async def scan_image_steg(file: UploadFile = File(...)):
         session_id=session_id,
         layer="L1",
         threat_type="IMAGE_STEG" if result["is_malicious"] else "IMAGE_CLEAN",
-        severity=severity,
-        threat_score=max(result["chi_score"], result["l1_score"]),
-        action=action,
+        severity=verdict["severity"],
+        threat_score=verdict["score"],
+        action=verdict["action"],
         evidence={"l1_steg": result},
-        explanation={
-            "summary": result["reason"],
-            "chain": [
-                {"layer": "L1", "severity": "LOW", "finding": f"Image received: {file.filename}", "action": "SCAN"},
-                {"layer": "L1", "severity": "MEDIUM" if result["payload_found"] else "CLEAN",
-                 "finding": f"LSB chi-square suspicion: {result['chi_score']:.2f}", "action": "ANALYZE"},
-                {"layer": "L1", "severity": severity,
-                 "finding": result["reason"],
-                 "action": action,
-                 "evidence": f"Decoded: '{result['decoded_text'][:80]}'" if result["decoded_text"] else "No payload"},
-            ]
-        },
+        explanation={"summary": result["reason"], "chain": verdict["chain"]},
         note=result["reason"][:60],
     )
     await threat_bus.emit(event)
@@ -623,15 +651,66 @@ async def scan_image_steg(file: UploadFile = File(...)):
     }
 
 
+@app.post("/sentinel/l1/scan")
+async def scan_l1_text(request: Request):
+    """Run L1 (and its harm head) on raw text, without calling an LLM.
+
+    Body: {"text": str, "session_id"?: str, "harm_head"?: bool = true}. The verdict
+    uses the same shared-axis rule as /sentinel/chat's input step. A WARN or BLOCK
+    verdict is also emitted as a ThreatEvent.
+    """
+    body = await _json_body(request)
+    text = body.get("text", "")
+    if not isinstance(text, str) or not text.strip():
+        raise HTTPException(status_code=422, detail="'text' must be a non-empty string.")
+    session_id = body.get("session_id") or f"l1scan_{uuid.uuid4().hex[:6]}"
+    harm_head = bool(body.get("harm_head", True))
+
+    l1_result = await layer1_check(text, harm_head=harm_head)
+    verdict = verdicts.input_verdict(l1_result=l1_result)
+
+    if verdict["action"] != "ALLOWED":
+        await threat_bus.emit(ThreatEvent(
+            event_id=f"evt_{uuid.uuid4().hex[:8]}",
+            timestamp=datetime.now().strftime("%H:%M:%S"),
+            session_id=session_id,
+            layer="L1",
+            threat_type=l1_result.threat_class,
+            severity=verdict["severity"],
+            threat_score=verdict["score"],
+            action=verdict["action"],
+            evidence={"l1": l1_result.to_dict()},
+            explanation={"summary": l1_result.reason, "chain": verdict["chain"]},
+            note=l1_result.reason[:60],
+        ))
+
+    return {
+        "session_id": session_id,
+        "action": verdict["action"],
+        "severity": verdict["severity"],
+        "shared_score": verdict["score"],
+        "chain": verdict["chain"],
+        "l1": l1_result.to_dict(),
+    }
+
+
 @app.get("/sentinel/sessions")
 async def list_sessions():
     """Return list of active session summaries."""
+    def _last_ts(s):
+        last = s.events[-1] if s.events else None
+        return getattr(last, "ts", None)
+
     return [
         {
             "session_id": s.session_id,
             "risk": s.risk,
             "overall": s.overall,
             "turn_count": len(s.turns),
+            "event_count": len(s.events),
+            "last_event_ts": _last_ts(s),
+            "terminated": s.terminated,
+            "termination_reason": s.termination_reason,
         }
         for s in threat_bus.sessions.values()
     ]
@@ -639,23 +718,29 @@ async def list_sessions():
 
 @app.get("/sentinel/sessions/{session_id}/explain")
 async def explain_session(session_id: str):
-    """Explainability API for compliance and auditing."""
+    """Explanation of a session's latest decision, built only from its recorded events."""
     if session_id not in threat_bus.sessions:
         raise HTTPException(status_code=404, detail="Session not found or no events recorded.")
-    
+
     state = threat_bus.sessions[session_id]
     if not state.events:
         raise HTTPException(status_code=404, detail="Session not found or no events recorded.")
-        
+
     last_event = state.events[-1]
     event_dict = last_event.to_dict() if hasattr(last_event, 'to_dict') else last_event
-    
+    explanation = event_dict.get("explanation", {}) or {}
+
     return {
+        "session_id": session_id,
         "decision": event_dict.get("action", "UNKNOWN"),
         "primary_reason": event_dict.get("threat_type", "UNKNOWN"),
+        "layer": event_dict.get("layer"),
+        "threat_score": event_dict.get("threat_score"),
         "evidence": event_dict.get("evidence", {}),
-        "human_readable": event_dict.get("explanation", {}).get("summary", ""),
-        "regulatory_reference": "RBI IT Framework 6.4.2 — Input Validation Controls"
+        "human_readable": explanation.get("summary", ""),
+        "chain": explanation.get("chain", []),
+        "terminated": state.terminated,
+        "termination_reason": state.termination_reason,
     }
 
 @app.get("/sentinel/sessions/{session_id}/events")
@@ -668,39 +753,62 @@ async def get_session(session_id: str):
 
 
 @app.get("/sentinel/events")
-async def get_events(severity: str = None, limit: int = 50):
-    """Return filtered event log."""
-    events = threat_bus.events[-limit:]
+async def get_events(severity: str = None, layer: str = None, action: str = None, limit: int = 50):
+    """Return the most recent events, filtered first and then limited."""
+    from sentinel.config import MAX_STORED_EVENTS
+    limit = max(1, min(int(limit), MAX_STORED_EVENTS))
+    events = threat_bus.events
     if severity:
         events = [e for e in events if e.severity == severity]
-    return [e.to_dict() for e in events]
+    if layer:
+        events = [e for e in events if e.layer == layer]
+    if action:
+        events = [e for e in events if e.action == action]
+    return [e.to_dict() for e in events[-limit:]]
+
+
+@app.get("/sentinel/config/thresholds")
+async def get_thresholds():
+    """Live warn/block thresholds per layer, from the running configuration."""
+    return verdicts.thresholds()
 
 
 _demo_rate: dict[str, float] = defaultdict(float)
+DEMO_COOLDOWN_SECONDS = 5.0
+
+
+@app.get("/sentinel/demo")
+async def list_demos():
+    """Available demo scenarios: live replays of real benchmark items (sentinel/demo/items)."""
+    return {"cooldown_seconds": DEMO_COOLDOWN_SECONDS, "scenarios": scenario_list()}
 
 
 @app.post("/sentinel/demo/{scenario_id}")
 async def trigger_demo(scenario_id: str, request: Request, background_tasks: BackgroundTasks):
-    """Trigger a demo attack scenario with IP rate limiting."""
-    ip = request.client.host if request.client else "unknown"
-    now = time.time()
-    if now - _demo_rate[ip] < 5.0:
-        raise HTTPException(status_code=429, detail="Rate limit: one demo per 5 seconds")
-    _demo_rate[ip] = now
-
+    """Trigger a demo scenario, rate limited per client IP."""
     if scenario_id not in SCENARIOS:
         raise HTTPException(status_code=404, detail=f"Unknown scenario: {scenario_id}")
+
+    ip = request.client.host if request.client else "unknown"
+    now = time.time()
+    if now - _demo_rate[ip] < DEMO_COOLDOWN_SECONDS:
+        raise HTTPException(status_code=429,
+                            detail=f"Rate limit: one demo per {DEMO_COOLDOWN_SECONDS:.0f} seconds")
+    _demo_rate[ip] = now
 
     async def _chat_broadcast(msg):
         """Broadcast a chat message to all WebSocket clients."""
         payload = json.dumps({"type": "CHAT_MESSAGE", "payload": msg})
         await threat_bus._broadcast(payload)
 
-    background_tasks.add_task(run_scenario, scenario_id, _chat_broadcast)
+    session_id = f"demo_{uuid.uuid4().hex[:6]}"
+    background_tasks.add_task(run_scenario, scenario_id, _chat_broadcast, session_id)
     return {
         "status": "started",
         "scenario": scenario_id,
         "name": SCENARIOS[scenario_id]["name"],
+        "session_id": session_id,
+        "layers": SCENARIOS[scenario_id]["layers"],
     }
 
 
@@ -737,7 +845,7 @@ async def chat_send(request: Request):
     if _s.terminated:
         return {
             "session_id": session_id, "blocked": True,
-            "response": "I can't help with that — session terminated by SENTINEL.",
+            "response": "I can't help with that. This session was terminated by DIDA.",
             "threat_score": 1.0, "severity": "CRITICAL", "action": "BLOCKED",
             "explanation": {"summary": f"Session terminated by correlation rule(s): {_s.termination_reason}", "chain": []},
         }
@@ -799,7 +907,7 @@ async def chat_send(request: Request):
         chain.append({
             "layer": "L1",
             "severity": score_to_severity(l1_result.score),
-            "finding": f"Input Scanner ({'Tier 1 regex' if l1_result.tier_used == 1 else 'Tier 2 semantic'}): {l1_result.threat_class}",
+            "finding": f"Input Scanner ({verdicts.l1_tier_label(l1_result.tier_used)}): {l1_result.threat_class}",
             "evidence": l1_result.reason,
             # Classified on the RESCALED score so this per-layer verdict
             # agrees with the combined_score decision above (3B.2); the
@@ -861,11 +969,11 @@ async def chat_send(request: Request):
     blocked = action == "BLOCKED"
     
     if blocked:
-        session.chat_history.append({"role": "assistant", "content": "I can't help with that — request terminated by SENTINEL."})
+        session.chat_history.append({"role": "assistant", "content": "I can't help with that. The request was blocked by DIDA."})
         return {
             "session_id": session_id,
             "blocked": True,
-            "response": "I can't help with that — request terminated by SENTINEL.",
+            "response": "I can't help with that. The request was blocked by DIDA.",
             "threat_score": combined_score,
             "severity": severity,
             "action": action,
@@ -898,7 +1006,7 @@ async def chat_send(request: Request):
                 detail=f"LLM Backend Service unavailable: {str(e)[:80]}"
             )
     else:
-        llm_response = "[SENTINEL: No GROQ_API_KEY configured. Add it to .env to get real responses.]"
+        llm_response = "[DIDA: No GROQ_API_KEY configured. Add it to .env to get real responses.]"
 
     # L5 Output Scan on real LLM response
     l5_result, sanitized_response = await layer5_scan_output(
@@ -913,10 +1021,10 @@ async def chat_send(request: Request):
     # BLOCKED verdict redacts it exactly as an L5 block would (R-002).
     corr_block = [] if l5_result.score >= BLOCK_THRESHOLD else blocking_rules(await check_correlations(session_id))
     if corr_block:
-        session.chat_history.append({"role": "assistant", "content": "[REDACTED BY SENTINEL CORRELATION]"})
+        session.chat_history.append({"role": "assistant", "content": "[REDACTED BY DIDA CORRELATION]"})
         return {
             "session_id": session_id, "blocked": True,
-            "response": "[REDACTED BY SENTINEL CORRELATION]",
+            "response": "[REDACTED BY DIDA CORRELATION]",
             "threat_score": max(combined_score, l5_result.score), "severity": "CRITICAL", "action": "BLOCKED",
             "explanation": {"summary": f"Correlation rule(s) {'+'.join(corr_block)}", "chain": chain},
         }
@@ -947,11 +1055,11 @@ async def chat_send(request: Request):
         await threat_bus.emit(l5_event)
         await check_correlations(session_id)
         
-        session.chat_history.append({"role": "assistant", "content": "[REDACTED BY SENTINEL LAYER 5]"})
+        session.chat_history.append({"role": "assistant", "content": "[REDACTED BY DIDA LAYER 5]"})
         return {
             "session_id": session_id,
             "blocked": True,
-            "response": "[REDACTED BY SENTINEL LAYER 5]",
+            "response": "[REDACTED BY DIDA LAYER 5]",
             "threat_score": l5_result.score,
             "severity": l5_severity,
             "action": "BLOCKED",
@@ -979,34 +1087,30 @@ async def rag_ingest(request: Request):
 
     result = await layer2_ingest(text, source)
 
-    # If quarantined, emit a live ThreatEvent so the dashboard lights up
-    if result.get("quarantined"):
-        session_id = f"rag_ingest_{uuid.uuid4().hex[:6]}"
-        event = ThreatEvent(
-            event_id=f"evt_{uuid.uuid4().hex[:8]}",
-            timestamp=datetime.now().strftime("%H:%M:%S"),
-            session_id=session_id,
-            layer="L2",
-            threat_type="KNOWLEDGE_POISONING",
-            severity="HIGH",
-            threat_score=1.0 - result["metadata"]["trust_score"],
-            action="QUARANTINED",
-            evidence={"l2": result["metadata"]},
-            explanation={
-                "summary": result["reason"],
-                "chain": [{
-                    "layer": "L2",
-                    "severity": "HIGH",
-                    "finding": f"RAG chunk quarantined: trust_score={result['metadata']['trust_score']:.2f}, density={result['metadata']['instruction_density']:.2f}",
-                    "evidence": result["reason"],
-                    "action": "QUARANTINE"
-                }]
-            },
-            note=result["reason"][:60]
-        )
-        await threat_bus.emit(event)
+    # Quarantined or review-flagged chunks emit a live ThreatEvent. Score and severity
+    # are the chunk's score on the shared axis of the bin that scored it.
+    if result.get("quarantined") or result.get("review_flagged"):
+        await _emit_l2_chunk_event(result, source, f"rag_ingest_{uuid.uuid4().hex[:6]}")
 
     return result
+
+
+async def _emit_l2_chunk_event(result: dict, source: str, session_id: str):
+    verdict = verdicts.l2_ingest_verdict(result, source)
+    event = ThreatEvent(
+        event_id=f"evt_{uuid.uuid4().hex[:8]}",
+        timestamp=datetime.now().strftime("%H:%M:%S"),
+        session_id=session_id,
+        layer="L2",
+        threat_type="KNOWLEDGE_POISONING" if result.get("quarantined") else "CHUNK_FLAGGED_FOR_REVIEW",
+        severity=verdict["severity"],
+        threat_score=verdict["score"],
+        action=verdict["action"],
+        evidence={"l2": result.get("metadata", {})},
+        explanation={"summary": result.get("reason", ""), "chain": verdict["chain"]},
+        note=result.get("reason", "")[:60],
+    )
+    await threat_bus.emit(event)
 
 
 @app.post("/sentinel/rag/upload")
@@ -1040,45 +1144,11 @@ async def rag_upload_pdf(file: UploadFile = File(...), source: str = Form(defaul
     for chunk_text in raw_chunks:
         res = await layer2_ingest(chunk_text, source=chunk_src)
         results.append(res)
-        # Emit threat event for quarantined chunks
-        if res.get("quarantined"):
-            session_id = f"rag_pdf_{uuid.uuid4().hex[:6]}"
-            event = ThreatEvent(
-                event_id=f"evt_{uuid.uuid4().hex[:8]}",
-                timestamp=datetime.now().strftime("%H:%M:%S"),
-                session_id=session_id,
-                layer="L2",
-                threat_type="KNOWLEDGE_POISONING",
-                severity="HIGH",
-                threat_score=1.0 - res["metadata"]["trust_score"],
-                action="QUARANTINED",
-                evidence={"l2": res["metadata"]},
-                explanation={"summary": res["reason"], "chain": [{"layer": "L2", "finding": "Chunk quarantined from PDF upload", "action": "QUARANTINE"}]},
-                note=res["reason"][:60]
-            )
-            await threat_bus.emit(event)
-        elif res.get("review_flagged"):
-            # Previously silent: a review-flagged chunk (moderate trust,
-            # held for human review, NOT part of the retrievable collection)
-            # produced no event and wasn't counted anywhere — indistinguishable
-            # from a fully-trusted chunk in both the dashboard and this
-            # endpoint's response. Surfaced at MEDIUM severity, distinct from
-            # the HIGH severity used for outright quarantine.
-            session_id = f"rag_pdf_{uuid.uuid4().hex[:6]}"
-            event = ThreatEvent(
-                event_id=f"evt_{uuid.uuid4().hex[:8]}",
-                timestamp=datetime.now().strftime("%H:%M:%S"),
-                session_id=session_id,
-                layer="L2",
-                threat_type="CHUNK_FLAGGED_FOR_REVIEW",
-                severity="MEDIUM",
-                threat_score=1.0 - res["metadata"]["trust_score"],
-                action="FLAGGED",
-                evidence={"l2": res["metadata"]},
-                explanation={"summary": res["reason"], "chain": [{"layer": "L2", "finding": "Chunk flagged for manual review from PDF upload", "action": "FLAG_FOR_REVIEW"}]},
-                note=res["reason"][:60]
-            )
-            await threat_bus.emit(event)
+        # Quarantined and review-flagged chunks both surface as events (a
+        # review-flagged chunk is held out of the retrievable collection, so it
+        # must not look like a trusted one), scored on the shared axis.
+        if res.get("quarantined") or res.get("review_flagged"):
+            await _emit_l2_chunk_event(res, chunk_src, f"rag_pdf_{uuid.uuid4().hex[:6]}")
 
     quarantined = sum(1 for r in results if r.get("quarantined"))
     review_flagged = sum(1 for r in results if r.get("review_flagged"))
