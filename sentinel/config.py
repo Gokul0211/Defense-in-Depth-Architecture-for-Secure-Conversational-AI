@@ -494,6 +494,13 @@ PIPELINE_FUSION = os.getenv("PIPELINE_FUSION", "off").strip().lower()
 
 # Retrieval relevance floor (B-3). 0.0 = off (shipped behaviour).
 L2_RETRIEVAL_MIN_SIMILARITY = float(os.getenv("L2_RETRIEVAL_MIN_SIMILARITY", "0.0"))
+# /sentinel/chat only: a retrieved knowledge-base chunk reaches the MODEL's prompt when its
+# cosine similarity to the user's message is at least this. Retrieval itself still returns
+# the top-k whatever the similarity (above), and L2 still validates every one of them; this
+# only decides which admitted chunks are relevant enough to show the model. Not calibrated
+# on a benchmark: a demo default, chosen by measuring related vs unrelated pairs.
+CHAT_RAG_MIN_SIMILARITY = float(os.getenv("CHAT_RAG_MIN_SIMILARITY", "0.25"))
+CHAT_RAG_MAX_CHARS = int(os.getenv("CHAT_RAG_MAX_CHARS", "3000"))   # per chunk, in the prompt
 
 # Doc-axis counterpart, a THREAT cutoff. Unset (default) -> the Mondrian WARN anchor
 # of the output's content-type bin, i.e. flagged exactly when the store routes the

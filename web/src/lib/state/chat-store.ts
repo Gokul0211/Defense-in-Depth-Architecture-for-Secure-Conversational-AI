@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { api, ApiError, OfflineError, TimeoutError } from "@/lib/api/client";
-import type { ChatResult, ChatStage } from "@/lib/api/types";
+import type { ChatResult, ChatStage, KbChunk } from "@/lib/api/types";
 
 export interface ChatMsg {
   id: string;
@@ -21,6 +21,14 @@ type ChatStore = {
   last: ChatResult | null;
   send: (text: string) => Promise<void>;
   newChat: () => void;
+  /** The knowledge base the chat retrieves from. It lives on the backend and is shared by every session. */
+  kb: KbChunk[];
+  kbBusy: boolean;
+  kbNote: { tone: "ok" | "hot" | "error"; text: string } | null;
+  refreshKb: () => Promise<void>;
+  addDoc: (text: string, source: string) => Promise<void>;
+  addPdf: (file: File) => Promise<void>;
+  tamper: (chunkId: string) => Promise<void>;
 };
 
 const newId = () => Math.random().toString(36).slice(2, 10);
@@ -56,4 +64,43 @@ export const useChat = create<ChatStore>((set, get) => ({
     }
   },
   newChat: () => set({ sessionId: newSession(), messages: [], phase: "idle", stages: null, last: null }),
+
+  kb: [],
+  kbBusy: false,
+  kbNote: null,
+  refreshKb: async () => {
+    try { const r = await api.ragChunks(); set({ kb: r.chunks }); } catch (e) { set({ kbNote: { tone: "error", text: errorText(e) } }); }
+  },
+  addDoc: async (text, source) => {
+    if (!text.trim() || get().kbBusy) return;
+    set({ kbBusy: true, kbNote: null });
+    try {
+      const r = await api.ingest(text, source) as { quarantined?: boolean; review_flagged?: boolean; reason?: string };
+      set({ kbNote: r.quarantined ? { tone: "hot", text: `Quarantined, so the model will never see it. ${r.reason ?? ""}` }
+        : r.review_flagged ? { tone: "hot", text: `Held for review, so it is not retrievable. ${r.reason ?? ""}` }
+          : { tone: "ok", text: "Admitted. Questions that match it will now retrieve it." } });
+    } catch (e) { set({ kbNote: { tone: "error", text: errorText(e) } }); }
+    await get().refreshKb();
+    set({ kbBusy: false });
+  },
+  addPdf: async (file) => {
+    if (get().kbBusy) return;
+    set({ kbBusy: true, kbNote: null });
+    try {
+      const r = await api.upload(file) as { chunks_ingested?: number; chunks_quarantined?: number; chunks_review_flagged?: number };
+      const q = r.chunks_quarantined ?? 0, f = r.chunks_review_flagged ?? 0;
+      set({ kbNote: { tone: q || f ? "hot" : "ok", text: `${r.chunks_ingested ?? 0} chunks scored: ${(r.chunks_ingested ?? 0) - q - f} admitted, ${q} quarantined, ${f} held for review.` } });
+    } catch (e) { set({ kbNote: { tone: "error", text: errorText(e) } }); }
+    await get().refreshKb();
+    set({ kbBusy: false });
+  },
+  tamper: async (chunkId) => {
+    set({ kbBusy: true, kbNote: null });
+    try {
+      await api.tamper(chunkId);
+      set({ kbNote: { tone: "hot", text: "The stored text was edited. Its signature no longer matches, so retrieval will quarantine it. Ask a question that matches it." } });
+    } catch (e) { set({ kbNote: { tone: "error", text: errorText(e) } }); }
+    await get().refreshKb();
+    set({ kbBusy: false });
+  },
 }));

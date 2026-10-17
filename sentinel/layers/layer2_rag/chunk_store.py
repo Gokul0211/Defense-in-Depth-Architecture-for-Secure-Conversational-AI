@@ -327,11 +327,11 @@ def retrieve_and_validate(query: str, top_k: int = 3, min_similarity: float | No
     if min_similarity is None:
         import sentinel.config as _c
         min_similarity = float(getattr(_c, "L2_RETRIEVAL_MIN_SIMILARITY", 0.0))
-    results = [item for sim, item in scored[:top_k] if sim >= min_similarity]
+    results = [(sim, item) for sim, item in scored[:top_k] if sim >= min_similarity]
 
     validated_chunks = []
 
-    for chunk_data in results:
+    for similarity, chunk_data in results:
         chunk_id = chunk_data["chunk_id"]
         text = chunk_data["text"]
         metadata = chunk_data["metadata"]
@@ -379,6 +379,7 @@ def retrieve_and_validate(query: str, top_k: int = 3, min_similarity: float | No
                 "doc_axis": doc_axis,
                 "findings": findings,
                 "blocked": True,
+                "similarity": similarity,
             })
             continue
 
@@ -391,6 +392,7 @@ def retrieve_and_validate(query: str, top_k: int = 3, min_similarity: float | No
             "doc_axis": doc_axis,
             "findings": findings,
             "blocked": False,
+            "similarity": similarity,
         })
 
     return validated_chunks

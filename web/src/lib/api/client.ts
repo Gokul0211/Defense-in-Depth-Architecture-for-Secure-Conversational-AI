@@ -1,4 +1,4 @@
-import type { ChatResult, DemoList, Health, SessionState, SessionSummary, ThreatEvent, Thresholds } from "./types";
+import type { ChatResult, DemoList, KbChunk, Health, SessionState, SessionSummary, ThreatEvent, Thresholds } from "./types";
 
 export const API_URL = (process.env.NEXT_PUBLIC_DIDA_API_URL ?? "http://localhost:8080").replace(/\/$/, "");
 export const WS_URL = API_URL.replace(/^http/, "ws") + "/ws/events";
@@ -56,6 +56,8 @@ export const api = {
   session: (id: string) => request<SessionState>(`/sentinel/sessions/${encodeURIComponent(id)}/events`),
   l1Scan: (text: string, harmHead = true) => request<Record<string, unknown>>("/sentinel/l1/scan", { json: { text, harm_head: harmHead } }),
   ingest: (text: string, source = "playground") => request<Record<string, unknown>>("/sentinel/rag/ingest", { json: { text, source } }),
+  ragChunks: () => request<{ chunks: KbChunk[] }>("/sentinel/rag/chunks"),
+  tamper: (id: string) => request<{ success: boolean; message: string }>(`/sentinel/rag/tamper/${encodeURIComponent(id)}`, { method: "POST" }),
   upload: (file: File) => { const f = new FormData(); f.append("file", file); return request<Record<string, unknown>>("/sentinel/rag/upload", { form: f }); },
   toolCall: (body: Record<string, unknown>) => request<Record<string, unknown>>("/sentinel/agent/tool_call", { json: body }),
   toolResponse: (response: string, session_id?: string) => request<Record<string, unknown>>("/sentinel/agent/tool_response", { json: { response, session_id } }),

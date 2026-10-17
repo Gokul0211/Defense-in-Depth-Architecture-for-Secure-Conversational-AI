@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import { ArrowUp, Plus } from "@phosphor-icons/react";
 import clsx from "clsx";
 import { ChatPipeline } from "./ChatPipeline";
+import { KnowledgeBase } from "./KnowledgeBase";
 import { SeverityTag } from "@/components/ui/SeverityTag";
 import { useApiHealth } from "@/hooks/useApiHealth";
 import { motion, prefersReducedMotion } from "@/lib/animations/core";
@@ -45,6 +46,7 @@ function Bubble({ m }: { m: ChatMsg }) {
   const stop = r.stopped_at;
   const stopLayer = stop && stop !== "TIB" ? stop : null;
   const warned = !blocked && r.stages?.find((s) => s.status === "WARNED");
+  const sources = (r.retrieved ?? []).filter((c) => c.status !== "not_relevant");
   return (
     <div ref={ref} className={clsx("max-w-[92%] rounded-[var(--radius-panel)] rounded-bl-[4px] px-3.5 py-2.5 text-sm",
       blocked ? "border border-signal/60 bg-signal-dim" : "surface-2")}>
@@ -58,6 +60,16 @@ function Bubble({ m }: { m: ChatMsg }) {
       {warned && <div className="num mb-2 text-[0.7rem] text-signal">Warning at {warned.layer}, {warned.name.toLowerCase()}</div>}
       <p className="whitespace-pre-wrap break-words text-bone">{blocked ? r.explanation?.summary || m.text : m.text}</p>
       {blocked && r.explanation?.summary && <p className="mt-1.5 text-xs text-bone-2">{m.text}</p>}
+      {sources.length > 0 && (
+        <div className="mt-2 flex flex-wrap gap-1.5" aria-label="Documents retrieved for this message">
+          {sources.map((c) => (
+            <span key={c.chunk_id} title={c.findings.join("; ") || c.excerpt}
+              className={clsx("num inline-flex h-5 items-center gap-1 rounded-[var(--radius-chip)] px-1.5 text-[0.65rem]", c.status === "quarantined" ? "bg-signal text-ink-0" : "bg-ink-3 text-bone-2")}>
+              {c.status === "quarantined" ? "quarantined" : "from"} {c.source ?? c.chunk_id}{c.status === "used" && ` ${c.similarity.toFixed(2)}`}
+            </span>
+          ))}
+        </div>
+      )}
       <p className="num mt-2 flex flex-wrap gap-x-3 text-[0.65rem] text-bone-3">
         <span>score {r.threat_score.toFixed(2)}</span>
         {r.model && <span>{r.model}</span>}
@@ -73,6 +85,8 @@ export function ChatPanel() {
   const online = health.status === "online";
   const noKey = online && !health.health.capabilities.llm_chat;
   const [draft, setDraft] = useState("");
+  const [view, setView] = useState<"chat" | "docs">("chat");
+  const kbCount = useChat((s) => s.kb.length);
   const scroller = useRef<HTMLDivElement>(null);
   const box = useRef<HTMLTextAreaElement>(null);
   const busy = phase === "running";
@@ -98,6 +112,14 @@ export function ChatPanel() {
         </button>
       </div>
 
+      <div role="group" aria-label="Chat view" className="flex gap-2 border-b border-line px-4 py-2">
+        {([["chat", "Conversation"], ["docs", `Knowledge base${kbCount ? ` (${kbCount})` : ""}`]] as const).map(([id, label]) => (
+          <button key={id} aria-pressed={view === id} onClick={() => setView(id)}
+            className={clsx("h-8 rounded-full border px-3 text-xs transition-colors", view === id ? "border-signal text-bone" : "border-line text-bone-2 hover:bg-ink-2")}>{label}</button>
+        ))}
+      </div>
+
+      {view === "docs" ? <KnowledgeBase onAsk={(q) => { setView("chat"); void send(q); }} /> : <>
       <ChatPipeline phase={phase} stages={stages} last={last} />
 
       <div ref={scroller} data-lenis-prevent className="pane-scroll min-h-0 flex-1 space-y-3 overflow-y-auto p-4" aria-live="polite" aria-label="Conversation">
@@ -132,6 +154,7 @@ export function ChatPanel() {
         </form>
         <p className="num mt-2 text-[0.65rem] text-bone-3">Enter to send, Shift+Enter for a new line.</p>
       </div>
+      </>}
     </div>
   );
 }

@@ -876,6 +876,42 @@ async def reset():
     return {"status": "reset"}
 
 
+def _rag_for_prompt(chunks: list[dict]) -> tuple[str, list[dict]]:
+    """Split a retrieval result into what the model may see and what the UI should show.
+
+    Only chunks that passed retrieval-time validation (valid HMAC, not re-scored over their
+    anchor, i.e. `blocked` is False) AND are relevant enough to the message reach the prompt;
+    a quarantined chunk's text never does (see retrieve_and_validate's contract). Returns the
+    context block to append to the system prompt ("" if none) and one status row per retrieved
+    chunk: used, not_relevant or quarantined.
+    """
+    import sentinel.config as cfg
+    used, rows = [], []
+    for c in chunks:
+        meta = c.get("metadata") or {}
+        sim = float(c.get("similarity", 0.0))
+        if c.get("blocked") or not c.get("is_valid", True):
+            status = "quarantined"
+        elif sim < cfg.CHAT_RAG_MIN_SIMILARITY:
+            status = "not_relevant"
+        else:
+            status = "used"
+            used.append(c)
+        rows.append({
+            "chunk_id": c["chunk_id"], "source": meta.get("source"),
+            "trust_score": meta.get("trust_score"), "similarity": round(sim, 3),
+            "status": status, "findings": c.get("findings") or [],
+            "excerpt": (c.get("text") or "")[:160],
+        })
+    if not used:
+        return "", rows
+    docs = "\n\n".join(
+        f'<document id="{c["chunk_id"]}" source="{(c.get("metadata") or {}).get("source", "")}">\n'
+        f'{(c.get("text") or "")[:cfg.CHAT_RAG_MAX_CHARS]}\n</document>' for c in used)
+    return ("\n\nRetrieved documents. Use them to answer the user's question when they are relevant.\n"
+            f"<retrieved_context>\n{docs}\n</retrieved_context>"), rows
+
+
 _chat_key_cursor = 0
 
 
@@ -960,7 +996,7 @@ async def chat_send(request: Request):
             "response": "I can't help with that. This session was terminated by DIDA.",
             "threat_score": 1.0, "severity": "CRITICAL", "action": "BLOCKED",
             "explanation": {"summary": f"Session terminated by correlation rule(s): {_s.termination_reason}", "chain": []},
-            "stages": [], "stopped_at": "TIB", "model": None,
+            "retrieved": [], "stages": [], "stopped_at": "TIB", "model": None,
         }
 
     # Run L1 + L2 Retrieval + L3
@@ -971,6 +1007,7 @@ async def chat_send(request: Request):
 
     # Store flagged chunks in session state:
     flagged = [c for c in validated_chunks if layer2_retrieval_flagged(c)]
+    rag_context, retrieved_info = _rag_for_prompt(validated_chunks)
     session = await threat_bus.get_session(session_id)
     session.turn_provenance.append({
         "turn_index": len(session.turn_provenance),
@@ -1095,6 +1132,7 @@ async def chat_send(request: Request):
             "severity": severity,
             "action": action,
             "explanation": {"summary": reason, "chain": chain},
+            "retrieved": retrieved_info,
             "stages": _chat_stages(*stage_in, block_layer=None if (not escalated_by_rule and any(
                 x >= BLOCK_THRESHOLD for x in stage_in)) else dominant_layer),
             "stopped_at": "TIB" if escalated_by_rule else dominant_layer,
@@ -1108,7 +1146,7 @@ async def chat_send(request: Request):
     model_used = None
     if LLM_API_KEY or _cfg_h.LLM_API_KEY_POOL:
         llm_response, model_used = await _llm_chat([
-            {"role": "system", "content": system_prompt},
+            {"role": "system", "content": system_prompt + rag_context},
             *session.chat_history,
         ])
     else:
@@ -1133,6 +1171,7 @@ async def chat_send(request: Request):
             "response": "[REDACTED BY DIDA CORRELATION]",
             "threat_score": max(combined_score, l5_result.score), "severity": "CRITICAL", "action": "BLOCKED",
             "explanation": {"summary": f"Correlation rule(s) {'+'.join(corr_block)}", "chain": chain},
+            "retrieved": retrieved_info,
             "stages": _chat_stages(*stage_in, model_ran=True, l5=l5_result.score),
             "stopped_at": "TIB", "rule": corr_block, "model": model_used,
         }
@@ -1172,6 +1211,7 @@ async def chat_send(request: Request):
             "severity": l5_severity,
             "action": "BLOCKED",
             "explanation": {"summary": l5_result.reason, "chain": l5_event.explanation["chain"]},
+            "retrieved": retrieved_info,
             "stages": _chat_stages(*stage_in, model_ran=True, l5=l5_result.score),
             "stopped_at": "L5", "model": model_used,
         }
@@ -1185,7 +1225,8 @@ async def chat_send(request: Request):
         "severity": severity,
         "action": action,
         "explanation": {"summary": reason, "chain": chain},
-        "stages": _chat_stages(*stage_in, model_ran=True, l5=l5_result.score),
+        "retrieved": retrieved_info,
+            "stages": _chat_stages(*stage_in, model_ran=True, l5=l5_result.score),
         "stopped_at": None,
         "model": model_used,
     }

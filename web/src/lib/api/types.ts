@@ -117,4 +117,26 @@ export interface ChatResult {
   stopped_at: string | null;
   rule?: string[] | null;
   model: string | null;
+  retrieved?: RetrievedChunk[];
+}
+
+/** One chunk the backend retrieved for a chat message. `used` chunks were shown to the model. */
+export interface RetrievedChunk {
+  chunk_id: string;
+  source: string | null;
+  trust_score: number | null;
+  similarity: number;
+  status: "used" | "not_relevant" | "quarantined";
+  findings: string[];
+  excerpt: string;
+}
+
+/** A knowledge-base chunk from GET /sentinel/rag/chunks (embeddings are stripped by the backend). */
+export interface KbChunk {
+  chunk_id: string;
+  text: string;
+  metadata: { source?: string; trust_score?: number; document_threat?: { threat?: number; available?: boolean; bin?: string } };
+  quarantined: boolean;
+  review_flagged: boolean;
+  reason: string;
 }
