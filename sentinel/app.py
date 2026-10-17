@@ -13,6 +13,7 @@ from datetime import datetime
 
 import time
 from collections import defaultdict
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Response, BackgroundTasks, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
@@ -34,7 +35,50 @@ from sentinel.demo import run_scenario, SCENARIOS, scenario_list
 from sentinel.core import verdicts
 from sentinel.config import CORS_ORIGINS
 
-app = FastAPI(title="DIDA", version="0.1.0")
+def _warm_models() -> None:
+    """Load the layers' lazily-created models once, off the request path.
+
+    The first scan after a start used to spend 10-60 s loading Prompt Guard, PIGuard, the
+    embedding model and the harm guard inside the request, so a browser client with a normal
+    timeout reported the backend as unreachable. Every loader is the layer's own
+    lazy singleton, so this changes no result. Set DIDA_WARMUP=0 to skip it.
+    """
+    import logging
+    import os
+    log = logging.getLogger("dida.warmup")
+    if os.getenv("DIDA_WARMUP", "1") == "0":
+        return
+    t0 = time.time()
+
+    def step(name, fn):
+        try:
+            fn()
+        except Exception as e:  # a missing optional model must not stop the API
+            log.warning("warm-up skipped %s: %s", name, str(e)[:120])
+
+    from sentinel.core.embedding import get_model
+    from sentinel.core.safety_guard import safety_score_prompt
+    from sentinel.layers import layer1 as _l1
+    from sentinel.layers.layer1_tier3 import _get_piguard
+    from sentinel.layers.layer2_rag.document_threat import document_threat_score
+    step("embedding model", lambda: get_model().encode(["warm-up"]))
+    step("prompt guard", _l1._get_prompt_guard)
+    step("piguard", _get_piguard)
+    step("harm guard", lambda: safety_score_prompt("warm-up"))
+    step("document scorer", lambda: document_threat_score("warm-up text. " * 60))
+    log.info("model warm-up finished in %.1fs", time.time() - t0)
+
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    warm = asyncio.create_task(asyncio.to_thread(_warm_models))
+    try:
+        yield
+    finally:
+        warm.cancel()
+
+
+app = FastAPI(title="DIDA", version="0.1.0", lifespan=_lifespan)
 
 # The API authenticates nothing with cookies, so credentials stay off. With
 # allow_credentials=True and "*", Starlette reflects ANY origin back, which let any

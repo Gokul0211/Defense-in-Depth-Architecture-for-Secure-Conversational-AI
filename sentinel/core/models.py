@@ -204,7 +204,10 @@ class SessionState:
             "events": [e.to_dict() if hasattr(e, 'to_dict') else e for e in self.events],
             "l1_max": self.l1_max,
             "l2_findings": self.l2_findings,
-            "l2_flagged_chunks": self.l2_flagged_chunks,
+            # Embeddings are 384 floats per chunk and every client receives this dict on each
+            # SESSION_UPDATE; no consumer reads them, so they stay server-side.
+            "l2_flagged_chunks": [{k: v for k, v in c.items() if k != "embedding"} if isinstance(c, dict) else c
+                                  for c in self.l2_flagged_chunks],
             "l3_current": self.l3_current,
             "l4_calls": self.l4_calls,
             "l5_scores": self.l5_scores,
