@@ -48,6 +48,9 @@ LLM_API_KEY_POOL = [
 # qwen/qwen3.*-* families). Defaulting to the smallest currently-served
 # model in the same "fast/cheap" tier the old default targeted.
 LLM_MODEL_OVERRIDE = os.getenv("LLM_MODEL_OVERRIDE", "openai/gpt-oss-20b")
+# Tried in order when the provider rejects LLM_MODEL_OVERRIDE as retired or unknown (the
+# /sentinel/chat path); comma-separated. Check GET https://api.groq.com/openai/v1/models.
+LLM_FALLBACK_MODELS = [m.strip() for m in os.getenv("LLM_FALLBACK_MODELS", "openai/gpt-oss-120b").split(",") if m.strip()]
 
 # Decision Thresholds
 BLOCK_THRESHOLD = float(os.getenv("BLOCK_THRESHOLD", "0.85"))

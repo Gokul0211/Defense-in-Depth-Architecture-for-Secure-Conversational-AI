@@ -100,3 +100,21 @@ export interface DemoScenario {
 export interface DemoList { cooldown_seconds: number; scenarios: DemoScenario[] }
 
 export type ConnectionState = "connecting" | "live" | "disconnected";
+
+export type ChatStageKey = "L1" | "L2" | "L3" | "LLM" | "L5";
+export interface ChatStage { layer: ChatStageKey; name: string; score: number | null; status: "PASSED" | "WARNED" | "BLOCKED" | "SKIPPED" }
+
+/** Response of POST /sentinel/chat. `stopped_at` is a layer, "TIB" for a cross-layer rule, or null when nothing stopped it. */
+export interface ChatResult {
+  session_id: string;
+  blocked: boolean;
+  response: string;
+  threat_score: number;
+  severity: string;
+  action: ActionKey | string;
+  explanation: { summary?: string; chain?: ExplanationChainItem[] };
+  stages: ChatStage[];
+  stopped_at: string | null;
+  rule?: string[] | null;
+  model: string | null;
+}

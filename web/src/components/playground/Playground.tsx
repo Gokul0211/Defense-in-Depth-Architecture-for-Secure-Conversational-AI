@@ -61,7 +61,7 @@ export function Playground() {
     try {
       let res: Record<string, unknown>;
       const sid = `pg_${Date.now().toString(36)}`;
-      if (t === "chat") res = await api.chat(value);
+      if (t === "chat") res = await api.chat(value) as unknown as Record<string, unknown>;
       else if (t === "ingest") res = await api.ingest(value, "playground");
       else if (t === "toolcall") { let parameters: unknown; try { parameters = JSON.parse(value); } catch { throw new Error("Parameters must be valid JSON."); } res = await api.toolCall({ tool_name: tool, parameters, history: ask.trim() ? [{ role: "user", content: ask }] : [], reasoning_trace: "", session_id: sid }); }
       else if (t === "toolresp") res = await api.toolResponse(value, sid);

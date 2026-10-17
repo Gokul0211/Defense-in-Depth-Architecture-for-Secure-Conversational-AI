@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from "react";
 import { EventStream } from "./EventStream";
 import { SessionList } from "./SessionList";
 import { DetailPanel } from "./DetailPanel";
+import { ChatPanel } from "./ChatPanel";
 import { Radar } from "./Radar";
 import { Tabs, TabPanel } from "@/components/ui/Tabs";
 import { useConsole } from "@/lib/state/console-store";
@@ -20,7 +21,7 @@ const PEEK = 112;   // px of the sheet visible when collapsed
 export function MobileConsole({ events, clock, dead, scripted }: { events: ThreatEvent[]; clock: () => number; dead: boolean; scripted: Set<string> }) {
   const sheet = useRef<HTMLDivElement>(null);
   const radar = useRef<HTMLDivElement>(null);
-  const [tab, setTab] = useState<"stream" | "sessions" | "detail">("stream");
+  const [tab, setTab] = useState<"stream" | "sessions" | "detail" | "chat">("stream");
   const [heights, setHeights] = useState({ H: 600, mid: 0, closed: 0 });
   const pos = useRef(0);          // current translateY
   const selectedId = useConsole((s) => s.selectedEventId);
@@ -59,6 +60,9 @@ export function MobileConsole({ events, clock, dead, scripted }: { events: Threa
   // selecting an event opens the detail view
   useEffect(() => { if (selectedId) { setTab("detail"); if (pos.current > heights.mid) snapTo(heights.mid); } /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [selectedId]);
 
+  // the chat needs the room: open the sheet fully when its tab is picked
+  useEffect(() => { if (tab === "chat" && pos.current > 20) snapTo(0); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [tab]);
+
   // blocked events: a small physical cue
   useEffect(() => useConsole.subscribe((st, prev) => {
     const e = st.lastEvent; if (!e || e === prev.lastEvent || e.action !== "BLOCKED") return;
@@ -88,10 +92,11 @@ export function MobileConsole({ events, clock, dead, scripted }: { events: Threa
           ) : <p className="mt-3 text-sm text-bone-3">No events yet</p>}
         </div>
         <div className="min-h-0 flex-1 overflow-hidden border-t border-line" style={{ touchAction: "pan-y" }}>
-          <Tabs tabs={[{ id: "stream", label: "Stream" }, { id: "sessions", label: "Sessions" }, { id: "detail", label: "Detail" }]} active={tab} onChange={(x) => setTab(x as typeof tab)} label="Feed" className="flex h-full min-h-0 flex-col">
+          <Tabs tabs={[{ id: "stream", label: "Stream" }, { id: "sessions", label: "Sessions" }, { id: "detail", label: "Detail" }, { id: "chat", label: "Chat" }]} active={tab} onChange={(x) => setTab(x as typeof tab)} label="Feed" className="flex h-full min-h-0 flex-col">
             <TabPanel id="stream" active={tab} className="min-h-0 flex-1"><EventStream scripted={scripted} /></TabPanel>
             <TabPanel id="sessions" active={tab} className="pane-scroll min-h-0 flex-1 overflow-auto"><SessionList /></TabPanel>
             <TabPanel id="detail" active={tab} className="pane-scroll min-h-0 flex-1 overflow-auto"><DetailPanel /></TabPanel>
+            <TabPanel id="chat" active={tab} className="min-h-0 flex-1"><ChatPanel /></TabPanel>
           </Tabs>
         </div>
       </div>

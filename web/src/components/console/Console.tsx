@@ -8,6 +8,7 @@ import { Radar } from "./Radar";
 import { Timeline } from "./Timeline";
 import { LayerSparks } from "./LayerSparks";
 import { MobileConsole } from "./MobileConsole";
+import { ChatPanel } from "./ChatPanel";
 import { useIsDesktop } from "@/hooks/useIsDesktop";
 import { Tabs, TabPanel } from "@/components/ui/Tabs";
 import { InlineError } from "@/components/ui/InlineError";
@@ -23,7 +24,7 @@ export function Console() {
   const replayTs = useConsole((s) => s.replayTs);
   const setReplay = useConsole((s) => s.setReplayTs);
   const desktop = useIsDesktop();
-  const [left, setLeft] = useState<"stream" | "sessions">("stream");
+  const [left, setLeft] = useState<"stream" | "sessions" | "chat">("stream");
   const [mobile, setMobile] = useState<"feed" | "detail">("feed");
   const [scripted, setScripted] = useState<Set<string>>(new Set());
   const [announce, setAnnounce] = useState("");
@@ -86,9 +87,10 @@ export function Console() {
             {(["feed", "detail"] as const).map((p) => <button key={p} role="tab" aria-selected={mobile === p} onClick={() => setMobile(p)} className={clsx("h-11 flex-1 text-sm", mobile === p ? "border-b-2 border-signal text-bone" : "text-bone-3")}>{p === "feed" ? "Feed" : "Detail"}</button>)}
           </div>
           <section aria-label="Event feed" className={clsx("surface-1 min-h-0 flex-col overflow-hidden lg:order-1 lg:flex", mobile === "feed" ? "flex" : "hidden")}>
-            <Tabs tabs={[{ id: "stream", label: "Stream" }, { id: "sessions", label: "Sessions" }]} active={left} onChange={(x) => setLeft(x as "stream" | "sessions")} label="Feed" className="flex min-h-0 flex-1 flex-col">
+            <Tabs tabs={[{ id: "stream", label: "Stream" }, { id: "sessions", label: "Sessions" }, { id: "chat", label: "Chat" }]} active={left} onChange={(x) => setLeft(x as "stream" | "sessions" | "chat")} label="Feed" className="flex min-h-0 flex-1 flex-col">
               <TabPanel id="stream" active={left} className="min-h-0 flex-1"><EventStream scripted={scripted} /></TabPanel>
               <TabPanel id="sessions" active={left} className="pane-scroll min-h-0 flex-1 overflow-auto"><SessionList /></TabPanel>
+              <TabPanel id="chat" active={left} className="min-h-0 flex-1"><ChatPanel /></TabPanel>
             </Tabs>
           </section>
           <section aria-label="Inspector" className={clsx("surface-1 pane-scroll min-h-0 overflow-auto lg:order-3 lg:block", mobile === "detail" ? "block" : "hidden")}><DetailPanel /></section>

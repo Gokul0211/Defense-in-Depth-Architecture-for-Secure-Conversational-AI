@@ -1,4 +1,4 @@
-import type { DemoList, Health, SessionState, SessionSummary, ThreatEvent, Thresholds } from "./types";
+import type { ChatResult, DemoList, Health, SessionState, SessionSummary, ThreatEvent, Thresholds } from "./types";
 
 export const API_URL = (process.env.NEXT_PUBLIC_DIDA_API_URL ?? "http://localhost:8080").replace(/\/$/, "");
 export const WS_URL = API_URL.replace(/^http/, "ws") + "/ws/events";
@@ -60,6 +60,6 @@ export const api = {
   toolCall: (body: Record<string, unknown>) => request<Record<string, unknown>>("/sentinel/agent/tool_call", { json: body }),
   toolResponse: (response: string, session_id?: string) => request<Record<string, unknown>>("/sentinel/agent/tool_response", { json: { response, session_id } }),
   outputScan: (response: string, system_prompt = "", session_id?: string) => request<Record<string, unknown>>("/sentinel/output/scan", { json: { response, system_prompt, session_id } }),
-  chat: (message: string, session_id?: string) => request<Record<string, unknown>>("/sentinel/chat", { json: { content: message, session_id }, timeoutMs: 60000 }),
+  chat: (message: string, session_id?: string) => request<ChatResult>("/sentinel/chat", { json: { content: message, session_id }, timeoutMs: 60000 }),
   scanImage: (file: File) => { const f = new FormData(); f.append("file", file); return request<Record<string, unknown>>("/sentinel/l1/scan-image", { form: f }); },
 };
