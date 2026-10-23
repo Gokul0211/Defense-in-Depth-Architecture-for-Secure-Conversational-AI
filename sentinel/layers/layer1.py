@@ -215,6 +215,51 @@ def try_decode_hex(text: str) -> str | None:
             pass
     return None
 
+_MAX_DECODE_CANDIDATES = 32
+
+
+def _decoded_candidates(text: str) -> list[tuple[str, str]]:
+    """(kind, decoded) for EVERY decodable base64 / hex span in `text` (L1_DECODE_ALL_CANDIDATES).
+
+    try_decode_base64 / try_decode_hex return the FIRST span that decodes to printable text, so a
+    harmless leading blob ("aGVsbG8gd29ybGQ=" = "hello world") hid every later one from Tier 1.
+    Capped at _MAX_DECODE_CANDIDATES spans per kind so a long token-heavy input stays cheap."""
+    out = []
+    for kind, pattern, decode in (
+            ("Base64", r'\b[A-Za-z0-9+/]{8,}={0,2}\b',
+             lambda c: base64.b64decode(c + "=" * (-len(c) % 4)).decode("utf-8", errors="strict")),
+            ("Hex", r'\b[0-9a-fA-F]{8,}\b',
+             lambda c: bytes.fromhex(c).decode("utf-8", errors="strict"))):
+        n = 0
+        for match in re.finditer(pattern, text):
+            if n >= _MAX_DECODE_CANDIDATES:
+                break
+            try:
+                s = decode(match.group(0))
+            except Exception:
+                continue
+            if len(s) > 4 and all(32 <= ord(c) < 127 or c in '\r\n\t' for c in s):
+                out.append((kind, s))
+                n += 1
+    return out
+
+
+def _tier1_reason(text: str) -> str | None:
+    """Why Tier 1 fires on `text` (raw or normalized), or None. One place for the regex list and
+    the spoofed-control-channel markers (core/control_spoof.py, L1_SPOOF_MARKERS)."""
+    normalized = normalize(text)
+    for pattern in TIER1_COMPILED:
+        if pattern.search(text) or pattern.search(normalized):
+            return f"Matched pattern: {pattern.pattern[:40]}"
+    import sentinel.config as _cfg
+    if getattr(_cfg, "L1_SPOOF_MARKERS", False):
+        from sentinel.core.control_spoof import spoof_markers
+        marks = spoof_markers(text)
+        if marks:
+            return f"Spoofed control-channel marker ({', '.join(marks)})"
+    return None
+
+
 def try_decode_rot13(text: str) -> str | None:
     try:
         decoded_str = codecs.encode(text, 'rot_13')
@@ -625,83 +670,106 @@ async def _harm_head(text: str) -> tuple[float | None, str | None]:
     return float(g), "guard"
 
 
-async def layer1_check(text: str, harm_head: bool = True) -> L1Result:
+_FIELD_RE = re.compile(r"'((?:[^'\\]|\\.)*)'|\"((?:[^\"\\]|\\.)*)\"")
+_MIN_FIELD_WORDS = 6
+
+
+def tool_output_fields(text: str) -> list[str]:
+    """The prose a TOOL OUTPUT carries (RCA 2 F-T3, config.L1_TOOL_OUTPUT_TIER3="fields").
+
+    Tool outputs are mostly serialised structures -- "['general', 'random', 'private']",
+    "{'message': 'Password updated.'}", "[Message(sender='Bob', body='...')]". Tier 3 (Prompt Guard x PIGuard)
+    saturates at ~0.99 on such short structured strings, so /sentinel/agent/tool_response withheld 19 benign
+    AgentDojo outputs (14 Slack tasks) in RCA 2 -- a channel list among them. What can carry an instruction to
+    the agent is the PROSE inside the structure, so Tier 3 reads each quoted string of >= _MIN_FIELD_WORDS
+    words; plain prose outputs are read whole. An output with no prose has nothing for Tier 3 to read."""
+    t = text or ""
+    s = t.lstrip()
+    structured = s[:1] in "[{(" or bool(re.match(r"^[A-Za-z_]\w*\(", s))
+    if not structured:
+        return [t] if len(re.findall(r"\w+", t)) >= _MIN_FIELD_WORDS else []
+    out = []
+    for m in _FIELD_RE.finditer(t):
+        f = (m.group(1) if m.group(1) is not None else m.group(2) or "").replace("\\n", "\n").replace("\\'", "'")
+        if len(re.findall(r"\w+", f)) >= _MIN_FIELD_WORDS:
+            out.append(f)
+    return out
+
+
+async def layer1_check(text: str, harm_head: bool = True, source: str = "user") -> L1Result:
     """
     Run four-tier injection classification on user input text, plus -- when
     L1_HARM_HEAD="separate" and `harm_head` -- the harm-intent head, attached as
     `harm_score` and never fused into `score` (R-020). Callers scoring third-party text
     (L2 documents, tool outputs) pass harm_head=False: nobody reads it there and it costs a
     0.6B forward per call.
+
+    `source` (RCA 2 F-T3): "tool_output" makes Tier 3 read the output's prose fields only
+    (see tool_output_fields); every other tier and every other source is unchanged.
     """
-    result = await _layer1_injection_check(text)
+    result = await _layer1_injection_check(text, source=source)
     import sentinel.config as cfg
     if harm_head and getattr(cfg, "L1_HARM_HEAD", "off") == "separate":
         result.harm_score, result.harm_source = await _harm_head(text)
+        # RCA 2 F-H1: name the category of a flagged request, so the alert can be routed (or thresholded)
+        # per category by a written policy instead of one global tau. Only for prompts at/over tau.
+        if (result.harm_score is not None and result.harm_score >= getattr(cfg, "L1_HARM_TAU", 1.0)
+                and getattr(cfg, "L1_HARM_REPORT_CATEGORY", False)):
+            from sentinel.core.safety_guard import harm_category_prompt
+            result.harm_category = harm_category_prompt(text)
     return result
 
 
-async def _layer1_injection_check(text: str) -> L1Result:
+async def _layer1_injection_check(text: str, source: str = "user") -> L1Result:
     """
     Run four-tier injection classification on user input text.
     Returns L1Result with score, threat class, explanation, and each
     tier's own pre-fusion score (see `tier_scores`).
     """
-    # Check for obfuscated injections first
-    decoded_b64 = try_decode_base64(text)
-    if decoded_b64:
-        normalized_b64 = normalize(decoded_b64)
-        for pattern in TIER1_COMPILED:
-            if pattern.search(decoded_b64) or pattern.search(normalized_b64):
-                return L1Result(
-                    score=0.92,
-                    threat_class="OBFUSCATED_INJECTION",
-                    confidence=0.92,
-                    reason=f"Base64 obfuscated injection: {decoded_b64}",
-                    tier_used=1,
-                    tier_scores=_tier_scores(tier1=1.0),
-                )
-
-    decoded_hex = try_decode_hex(text)
-    if decoded_hex:
-        normalized_hex = normalize(decoded_hex)
-        for pattern in TIER1_COMPILED:
-            if pattern.search(decoded_hex) or pattern.search(normalized_hex):
-                return L1Result(
-                    score=0.92,
-                    threat_class="OBFUSCATED_INJECTION",
-                    confidence=0.92,
-                    reason=f"Hex obfuscated injection: {decoded_hex}",
-                    tier_used=1,
-                    tier_scores=_tier_scores(tier1=1.0),
-                )
-
-    decoded_rot1 = try_decode_rot13(text)
-    if decoded_rot1:
-        normalized_rot1 = normalize(decoded_rot1)
-        for pattern in TIER1_COMPILED:
-            if pattern.search(decoded_rot1) or pattern.search(normalized_rot1):
-                return L1Result(
-                    score=0.92,
-                    threat_class="OBFUSCATED_INJECTION",
-                    confidence=0.92,
-                    reason=f"ROT13 obfuscated injection: {decoded_rot1}",
-                    tier_used=1,
-                    tier_scores=_tier_scores(tier1=1.0),
-                )
-
-    normalized = normalize(text)
-    
-    # Tier 1: regex fast path
-    for pattern in TIER1_COMPILED:
-        if pattern.search(text) or pattern.search(normalized):
+    # Check for obfuscated injections first. Every decodable span is checked when
+    # L1_DECODE_ALL_CANDIDATES is on; off reproduces the first-span-only behaviour.
+    import sentinel.config as _cfg1
+    if getattr(_cfg1, "L1_DECODE_ALL_CANDIDATES", False):
+        decoded = _decoded_candidates(text)
+    else:
+        decoded = [(k, s) for k, s in (("Base64", try_decode_base64(text)), ("Hex", try_decode_hex(text))) if s]
+    rot = try_decode_rot13(text)
+    if rot:
+        decoded.append(("ROT13", rot))
+    for kind, plain in decoded:
+        if _tier1_reason(plain):
             return L1Result(
                 score=0.92,
-                threat_class="INJECTION",
+                threat_class="OBFUSCATED_INJECTION",
                 confidence=0.92,
-                reason=f"Matched pattern: {pattern.pattern[:40]}",
+                reason=f"{kind} obfuscated injection: {plain}",
                 tier_used=1,
                 tier_scores=_tier_scores(tier1=1.0),
             )
+
+    # Tier 1: regex fast path (+ spoofed control-channel markers, L1_SPOOF_MARKERS)
+    tier1_reason = _tier1_reason(text)
+    # TOOL OUTPUTS ADDRESSED TO THE AI (RCA 2 fix validation, config.L1_TOOL_OUTPUT_ADDRESSEE). Text in a tool's
+    # output that addresses the AI system ("<INFORMATION> This is an important message ...", "###(system_message)",
+    # "Ignore your previous instructions") is an indirect injection by definition. F-T3 stopped Tier 3 from
+    # saturating on structured outputs (19 benign withholdings -> 0), which also removed the accidental
+    # withholding of injected outputs; the STRONG addressee cue is the principled signal for this source
+    # (0/616 benign AgentDojo windows, 0/57 benign sink values; RCA 2 m02).
+    if not tier1_reason and source == "tool_output":
+        import sentinel.config as _cfga
+        if getattr(_cfga, "L1_TOOL_OUTPUT_ADDRESSEE", False):
+            from sentinel.core.addressee import addressee_cues
+            if addressee_cues(text)[0] > 0:
+                tier1_reason = "Tool output addresses the AI system (STRONG addressee cue)"
+    if tier1_reason:
+        return L1Result(
+            score=0.92,
+            threat_class="INJECTION",
+            confidence=0.92,
+            reason=tier1_reason,
+            tier_used=1,
+            tier_scores=_tier_scores(tier1=1.0),
+        )
 
     # Tier 2: semantic similarity
     #
@@ -745,19 +813,26 @@ async def _layer1_injection_check(text: str) -> L1Result:
     prompt_guard = _get_prompt_guard()
     if prompt_guard is not None:
         try:
-            pg_result = prompt_guard.predict(text)
-            pg_score = pg_result.score
-            # Tier 3 classifier selection (2026-09-22). `L1_TIER3_MODE` defaults to
-            # "prompt_guard", where `tier3_score` returns its input unchanged — so
-            # the shipped path is byte-identical and pays nothing. The other modes
-            # publish on THIS SAME axis by construction (they map back through
-            # Prompt Guard's own benign quantiles), so `L1_WARN_THRESHOLD` and the
-            # judge band below keep meaning what they were calibrated to mean.
-            # See layer1_tier3.py for why that mapping is the load-bearing part.
             from sentinel.config import L1_TIER3_MODE
-            if L1_TIER3_MODE != "prompt_guard":
-                from sentinel.layers.layer1_tier3 import tier3_score
-                pg_score = tier3_score(text, pg_raw=pg_score)
+            import sentinel.config as _cfg3
+            if source == "tool_output" and getattr(_cfg3, "L1_TOOL_OUTPUT_TIER3", "whole") == "fields":
+                fields = tool_output_fields(text)
+            else:
+                fields = [text]
+            pg_score = 0.0
+            for field in fields:
+                fs = prompt_guard.predict(field).score
+                # Tier 3 classifier selection (2026-09-22). `L1_TIER3_MODE` defaults to
+                # "prompt_guard", where `tier3_score` returns its input unchanged — so
+                # the shipped path is byte-identical and pays nothing. The other modes
+                # publish on THIS SAME axis by construction (they map back through
+                # Prompt Guard's own benign quantiles), so `L1_WARN_THRESHOLD` and the
+                # judge band below keep meaning what they were calibrated to mean.
+                # See layer1_tier3.py for why that mapping is the load-bearing part.
+                if L1_TIER3_MODE != "prompt_guard":
+                    from sentinel.layers.layer1_tier3 import tier3_score
+                    fs = tier3_score(field, pg_raw=fs)
+                pg_score = max(pg_score, fs)
             if pg_score > max_sim:
                 pg_reason = f"Prompt Guard flagged this text (score={pg_score:.2f})"
         except Exception as e:

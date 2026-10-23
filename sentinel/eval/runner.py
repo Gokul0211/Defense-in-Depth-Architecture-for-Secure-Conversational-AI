@@ -181,6 +181,14 @@ def _evaluate_l2_ingest(text: str) -> LayerResult:
     quarantined = result.get("quarantined", False) if isinstance(result, dict) else False
     trust_score = result.get("metadata", {}).get("trust_score", 0.5) if isinstance(result, dict) else 0.5
     raw_score = 1.0 - trust_score if not quarantined else 0.9
+    # RCA 2 fix validation (m04): a QUARANTINED chunk's raw score was the constant 0.9 -- a legacy-axis number. On the
+    # short-document axis (anchors 0.999712 / 0.999933) 0.9 rescales BELOW WARN, so every quarantined document was
+    # reported as allowed (DIDA-Bench document-level recall 0/37 while the store quarantined 37/37). The chunk's own
+    # threat, which the store already raised to the bin's BLOCK anchor when it quarantined it, is used instead.
+    if quarantined and isinstance(result, dict):
+        from sentinel.config import l2_block_threshold_for
+        _m = result.get("metadata", {}) or {}
+        raw_score = max(raw_score, 1.0 - trust_score, l2_block_threshold_for(_m))
 
     # Publish on the SHARED decision axis (2026-09-20). L2's raw score was
     # compared directly against WARN_THRESHOLD = 0.50 while its own
@@ -696,6 +704,35 @@ def _default_layer_threshold(layer: str | None = None) -> float:
 # Evaluation orchestration
 # ---------------------------------------------------------------------------
 
+# Attack types whose payload sits in the retrieved document (DIDA-Bench generator, generate_sentinel_bench.py).
+_DOCUMENT_ATTACKS = {"rag_agent_hijack", "poisoned_rag_exfil", "full_chain"}
+
+
+def _l2_document_level(dataset) -> bool:
+    import sentinel.config as cfg
+    if not getattr(cfg, "L2_EVAL_DOCUMENT_LEVEL", False):
+        return False
+    from sentinel.eval.pipeline_sim import parse_sample_text
+    return any(parse_sample_text(s.text).documents for s in dataset.samples[:50])
+
+
+def _l2_document_samples(samples: list) -> list:
+    """One EvalSample per extracted document, with a DOCUMENT label (see run_layer_evaluation)."""
+    from dataclasses import replace
+    from sentinel.eval.pipeline_sim import parse_sample_text
+    out = []
+    for s in samples:
+        docs = parse_sample_text(s.text).documents
+        if not docs:
+            continue
+        if s.label == "malicious" and s.attack_type not in _DOCUMENT_ATTACKS:
+            continue                      # the attack is in the user turns: not an L2 sample
+        for k, d in enumerate(docs):
+            out.append(replace(s, text=d, sample_id=f"{s.sample_id}#doc{k}",
+                               metadata={**(s.metadata or {}), "l2_document_level": True}))
+    return out
+
+
 def run_layer_evaluation(
     layer: str,
     dataset_name: str,
@@ -729,6 +766,17 @@ def run_layer_evaluation(
     if not dataset.samples:
         logger.error(f"No samples loaded for {dataset_name}")
         return {"error": "no samples"}
+
+    # DOCUMENT-LEVEL L2 (RCA 2 F-E2, config.L2_EVAL_DOCUMENT_LEVEL). L2 scores retrieved documents, but on
+    # composite corpora (sentinel_bench / DIDA-Bench) it used to receive the WHOLE sample -- user turns,
+    # "[Document]", "[User Query]" -- against SESSION labels, so 22 of 59 attack samples had no document at
+    # all and 6 of the 9 historical "catches" were among them (RCA 2 §E: 0.1525 is not a document metric).
+    # Here every document is its own sample: malicious only when its sample's attack lives in the document,
+    # benign documents from benign samples; samples whose attack is turn-borne contribute no L2 sample.
+    if layer == "L2" and _l2_document_level(dataset):
+        dataset.samples = _l2_document_samples(dataset.samples)
+        logger.info(f"  L2 document-level: {len(dataset.samples)} documents "
+                    f"({sum(s.label == 'malicious' for s in dataset.samples)} malicious)")
 
     logger.info(f"  {dataset.summary()}")
 
@@ -1271,6 +1319,11 @@ async def run_pipeline_evaluation(dataset_name: str = "sentinel_bench", limit: i
             "sample_id": sample.sample_id, "label": sample.label, "attack_type": sample.attack_type,
             "correlation_fired": result.correlation_fired, "final_decision": result.final_decision,
             "layer_scores": result.layer_scores, "latency_ms": result.latency_ms,
+            # v3 (2026-10-18): the continuous evidence the decision axis discards (interface sites
+            # 4, 6, 7: L4/L5 confidence, an UNFLAGGED document's threat) and the per-turn L1/L3,
+            # persisted so score fusion can be re-analysed from the artifact without a re-run.
+            "layer_confidence": getattr(result, "layer_confidence", {}),
+            "per_turn_layer_scores": getattr(result, "per_turn_layer_scores", []),
         })
 
     error_rate = error_count / total if total else 0.0
@@ -1551,19 +1604,33 @@ Examples:
         dataset = load_dataset(dataset_name, limit=args.limit)
         malicious_samples = [(s.sample_id, s.text) for s in dataset.samples if s.label == "malicious"]
 
+        # SUCCESS = THE DEPLOYED DECISION (RCA 2 F-E3, config.REDTEAM_SUCCESS="deployed"). The historical
+        # metric called an attack "detected" when max(layer scores) >= 0.5 -- not what the pipeline does: it
+        # ignored correlation BLOCKs and L4 enforcement and counted a WARN (forwarded) as a catch. An attack
+        # is now caught only when the simulated pipeline BLOCKs it; "max_layer" reproduces the old metric.
+        import sentinel.config as _rcfg
+        success_mode = getattr(_rcfg, "REDTEAM_SUCCESS", "max_layer")
+
         async def _pipeline_max_score(text: str) -> float:
             result = await simulate_pipeline(text)
+            if success_mode == "deployed":
+                return 1.0 if result.final_decision == "BLOCK" else 0.0
             return max(result.layer_scores.values())
 
         paraphraser = LLMParaphraser() if args.redteam_paraphraser == "llm" else RuleBasedParaphraser()
 
         threshold = args.threshold if args.threshold is not None else _default_layer_threshold()
+        if success_mode == "deployed":
+            threshold = 0.5               # the scorer is binary (1.0 = BLOCK)
         try:
             results = asyncio.run(run_red_team_evaluation(
                 samples=malicious_samples, scorer_fn=_pipeline_max_score,
                 detection_threshold=threshold, max_iterations=args.redteam_max_iterations,
                 paraphraser=paraphraser,
             ))
+            from sentinel.eval.run_config import config_snapshot
+            results.setdefault("meta", {}).update({"config": config_snapshot(),
+                                                   "success_definition": success_mode})
         except Exception as e:
             logger.error(f"Red-team evaluation failed with an unrecoverable error: {e}")
             results = {"error": f"Red-team evaluation failed: {e}", "meta": {"dataset": dataset_name}}

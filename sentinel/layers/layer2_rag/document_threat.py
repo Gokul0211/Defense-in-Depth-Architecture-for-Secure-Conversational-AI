@@ -152,10 +152,32 @@ def segment_document(text: str) -> list[str]:
     return out
 
 
+# CREDENTIAL ACCESS, not credential VOCABULARY (v3 code review, config.L2_DANGER_CREDENTIAL_STRICT).
+# The family above is case-insensitive with no word boundary on API_KEY|SECRET|TOKEN, so it fired on
+# "secretary of state", "a secret ballot", "tokens of appreciation", "word_tokenize": 8.9 % of the
+# benign pipeline arm's documents and 4 % of WildChat code answers carried +0.25 for it -- and the
+# prose bin's WARN anchor (0.250618) sat exactly on that floor (scratch/rca/v3/d03). Kept: reading
+# the environment / key files / password databases, SECRET / TOKEN / API_KEY as code IDENTIFIERS
+# (upper-case constant style, case-sensitive), and a credential being ASSIGNED. Every BIPIA code
+# attack string the old family matched is still matched (6/6 on the train split; the test split has
+# none either way, d02).
+_CREDENTIAL_STRICT = re.compile(
+    r"(os\.environ|\bgetenv\b|\.ssh/|\bid_rsa\b|\.aws/credentials|/etc/passwd|/etc/shadow|\.netrc\b|"
+    r"\b[A-Z0-9_]*(?:API_KEY|SECRET|TOKEN|PASSWORD|PASSWD)[A-Z0-9_]*\b|"
+    r"(?i:\b(?:password|passwd|api_key|secret_key|access_token)\s*[=:]\s*\S))")
+
+
+def _danger_families() -> dict:
+    import sentinel.config as cfg
+    if getattr(cfg, "L2_DANGER_CREDENTIAL_STRICT", False):
+        return {**_DANGEROUS_CODE_FAMILIES, "credential": _CREDENTIAL_STRICT}
+    return _DANGEROUS_CODE_FAMILIES
+
+
 def dangerous_code_score(text: str) -> float:
     """Fraction of dangerous-operation families present, in [0, 1]."""
-    return sum(1 for rx in _DANGEROUS_CODE_FAMILIES.values()
-               if rx.search(text)) / len(_DANGEROUS_CODE_FAMILIES)
+    fams = _danger_families()
+    return sum(1 for rx in fams.values() if rx.search(text)) / len(fams)
 
 
 def _benign_prob(text: str) -> float | None:

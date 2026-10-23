@@ -533,10 +533,16 @@ async def layer3_check(session_id: str, user_input: str) -> L3Result:
     # "replace" also treats the cipher PREAMBLE (the mapping header and the "X - Y" pair lines of a
     # session that declared a mapping) as structure, not content: without this, the running max
     # over turns would keep the preamble's production score and undo the replacement.
+    # A header counts as preamble only while it is SHORT (config.L3_PREAMBLE_MAX_WORDS; every tom-gibbs
+    # header is 20-29 words): any turn merely containing "mapping" and "substitut" used to be zeroed,
+    # so a harmful request could ride along with those two words (v3 code review). Pair lines are
+    # short by construction (extract_mapping_pair caps them at 8 words).
+    max_words = int(getattr(_cfg, "L3_PREAMBLE_MAX_WORDS", 0) or 0)
+    is_header = looks_like_mapping_header(user_input) and (max_words <= 0 or len(user_input.split()) <= max_words)
     if (getattr(_cfg, "L3_DECODED_GUARD", False) and getattr(_cfg, "L3_DECODED_GUARD_MODE", "max") == "replace"
             and getattr(_cfg, "L3_CONTENT_SIGNAL", "anchors") != "guard"
             and session_id in session_word_mappings
-            and (looks_like_mapping_header(user_input) or extract_mapping_pair(user_input) is not None)):
+            and (is_header or extract_mapping_pair(user_input) is not None)):
         score = 0.0
 
     # Build reason string

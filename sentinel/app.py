@@ -18,7 +18,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Response, BackgroundTasks, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 import httpx
 
 from sentinel.config import BLOCK_THRESHOLD, WARN_THRESHOLD, L1_WARN_THRESHOLD, L1_BLOCK_THRESHOLD, l1_warn_threshold, l3_warn_threshold, l3_block_threshold, pipeline_decision, l2_tool_response_flagged, LLM_BACKEND, LLM_API_KEY, LLM_MODEL_OVERRIDE, CANARY_TOKEN
@@ -41,12 +41,17 @@ def _warm_models() -> None:
     The first scan after a start used to spend 10-60 s loading Prompt Guard, PIGuard, the
     embedding model and the harm guard inside the request, so a browser client with a normal
     timeout reported the backend as unreachable. Every loader is the layer's own
-    lazy singleton, so this changes no result. Set DIDA_WARMUP=0 to skip it.
+    lazy singleton, so this changes no result.
+
+    OPT-IN (DIDA_WARMUP=1), and main.py opts in for the real server. It used to default ON for
+    every app start, including a test's in-process TestClient: the thread was still materialising
+    weights when the client shut the app down, and Windows killed the test process with an access
+    violation (2026-10-18, full suite exit 139). Imports and tests never warm now.
     """
     import logging
     import os
     log = logging.getLogger("dida.warmup")
-    if os.getenv("DIDA_WARMUP", "1") == "0":
+    if os.getenv("DIDA_WARMUP", "0") != "1":
         return
     t0 = time.time()
 
@@ -71,11 +76,20 @@ def _warm_models() -> None:
 
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
-    warm = asyncio.create_task(asyncio.to_thread(_warm_models))
+    import os
+    warm = None
+    if os.getenv("DIDA_WARMUP", "0") == "1":
+        warm = asyncio.create_task(asyncio.to_thread(_warm_models))
     try:
         yield
     finally:
-        warm.cancel()
+        if warm is not None:
+            # a worker thread cannot be cancelled: wait for it rather than tearing the app down
+            # under a half-loaded model
+            try:
+                await asyncio.wait_for(asyncio.shield(warm), timeout=120)
+            except Exception:                                        # noqa: BLE001
+                pass
 
 
 app = FastAPI(title="DIDA", version="0.1.0", lifespan=_lifespan)
@@ -577,6 +591,20 @@ async def proxy_completions(request: Request):
             detail=f"LLM Backend Service unavailable: {str(e)[:80]}"
         )
 
+    # --- L4 on the reply's tool calls (RCA 2 F-A0, config.PROXY_AUDIT_TOOL_CALLS) ---
+    # The proxy used to scan only message.content: a tool call the model emitted reached the client
+    # unaudited, so L4 ran only if the client separately called /sentinel/agent/tool_call. Every call in
+    # the reply is now audited with the same L4 and correlation check as that endpoint; a refused call is
+    # stripped from the reply (or the reply is refused, PROXY_TOOL_CALL_ACTION="block").
+    import sentinel.config as _pcfg
+    if getattr(_pcfg, "PROXY_AUDIT_TOOL_CALLS", False):
+        await _authz_prepare(messages, body.get("tools") or [], session_id)
+        audited = await _audit_reply_tool_calls(resp, messages, session_id)
+        if isinstance(audited, Response):
+            return audited
+        if audited is not None:
+            resp = audited                # the reply with refused calls stripped; L5 still scans it
+
     # --- L5: Scan actual LLM output ---
     llm_text = ""
     try:
@@ -652,6 +680,125 @@ async def proxy_completions(request: Request):
 # ---------------------------------------------------------------------------
 #  REST API — /sentinel/*
 # ---------------------------------------------------------------------------
+
+class _JsonReply:
+    """Minimal stand-in for the upstream httpx response after the proxy edited its JSON."""
+
+    def __init__(self, data: dict, status_code: int):
+        self._data, self.status_code = data, status_code
+        self.content = json.dumps(data).encode("utf-8")
+
+    def json(self):
+        return self._data
+
+
+_AUTHZ_RECORDED: dict = {}
+
+
+async def _authz_prepare(messages: list, tools: list, session_id: str) -> None:
+    """Action authorization (config.L4_AUTHZ, ARCHITECTURE_NEXT.md v2 step 1) on the proxy path: feed the lineage
+    store every tool result in the conversation (once per tool_call_id, with the name and arguments of the call
+    that produced it) and register the intent contract for the current user text -- generated from the user's
+    turns and the request's tool schema only (L4_AUTHZ_CONTRACT=llm; otherwise L4's lexicon is used)."""
+    import sentinel.config as cfg
+    if not getattr(cfg, "L4_AUTHZ", False):
+        return
+    from sentinel.layers.layer4_agentic.authz import record_tool_output, set_contract, llm_contract
+    utext = "\n".join(str(m.get("content") or "") for m in messages
+                      if m.get("role") == "user" and isinstance(m.get("content"), str))
+    calls, seen = {}, _AUTHZ_RECORDED.setdefault(session_id, set())
+    for m in messages:
+        for c in (m.get("tool_calls") or []) if m.get("role") == "assistant" else []:
+            fn = c.get("function") or {}
+            try:
+                args = json.loads(fn.get("arguments") or "{}")
+            except Exception:                                         # noqa: BLE001
+                args = {"arg0": fn.get("arguments")}
+            calls[c.get("id")] = (fn.get("name", ""), args if isinstance(args, dict) else {"arg0": args})
+        if m.get("role") == "tool" and m.get("tool_call_id") not in seen and m.get("tool_call_id") in calls:
+            name, args = calls[m["tool_call_id"]]
+            record_tool_output(session_id, name, args, m.get("content") or "", utext)
+            seen.add(m["tool_call_id"])
+    if getattr(cfg, "L4_AUTHZ_CONTRACT", "lexicon") == "llm" and tools:
+        specs = [{"name": (t.get("function") or {}).get("name", ""),
+                  "description": (t.get("function") or {}).get("description", ""),
+                  "params": list(((t.get("function") or {}).get("parameters") or {}).get("properties", {}))}
+                 for t in tools if isinstance(t, dict)]
+        c = await llm_contract(utext, [x for x in specs if x["name"]])
+        if c is not None:
+            set_contract(session_id, utext, c)
+
+
+async def _audit_reply_tool_calls(resp, messages: list, session_id: str):
+    """L4 on every tool call in an upstream chat-completions reply (RCA 2 F-A0).
+
+    Returns None when the reply carries no tool call, a 403 Response when a call is refused and
+    PROXY_TOOL_CALL_ACTION == "block", else a _JsonReply with refused calls removed and a notice
+    appended to the message content. Arguments that are not valid JSON are audited as one string."""
+    import sentinel.config as cfg
+    try:
+        data = resp.json()
+        msg = data["choices"][0]["message"]
+    except Exception:
+        return None
+    calls = msg.get("tool_calls") or []
+    if not calls:
+        return None
+    session = await threat_bus.get_session(session_id)
+    history = [{"role": m.get("role"), "content": m.get("content") if isinstance(m.get("content"), str) else ""}
+               for m in messages if m.get("role") in ("user", "assistant")]
+    kept, refused = [], []
+    for c in calls:
+        fn = (c.get("function") or {}) if isinstance(c, dict) else {}
+        name = fn.get("name", "")
+        raw = fn.get("arguments", "")
+        try:
+            params = json.loads(raw) if isinstance(raw, str) and raw.strip() else (raw or {})
+            if not isinstance(params, dict):
+                params = {"arg0": params}
+        except Exception:
+            params = {"arg0": raw}
+        if session.terminated:
+            refused.append((name, "session terminated by a correlation rule"))
+            continue
+        r = await audit_tool_call(name, params, None, session_id, history,
+                                  flagged_chunks=getattr(session, "l2_flagged_chunks", []))
+        session.l4_calls.append({**r.to_dict(), "tool_name": name, "parameters": params})
+        corr = blocking_rules(await check_correlations(session_id))
+        if r.should_execute and not corr:
+            if isinstance(c, dict):     # call-bound decision for an executing ToolGate (sentinel/enforce)
+                c["x_dida_decision"] = _decision_token(session_id, "user", name, params, {"should_execute": True})
+            kept.append(c)
+            continue
+        why = r.reason if not corr else f"correlation rule(s) {'+'.join(corr)}"
+        refused.append((name, why))
+        await threat_bus.emit(ThreatEvent(
+            event_id=f"evt_{uuid.uuid4().hex[:8]}",
+            timestamp=datetime.now().strftime("%H:%M:%S"),
+            session_id=session_id, layer="L4", threat_type=r.threat_class,
+            severity=score_to_severity(max(r.score, 0.85)), threat_score=r.score, action="BLOCKED",
+            evidence={"l4": r.to_dict(), "tool_name": name, "source": "proxy_reply"},
+            explanation={"summary": why, "chain": [{"layer": "L4", "finding": f"Tool call refused: {name}",
+                                                    "evidence": why, "action": "BLOCK"}]},
+            note=f"proxy refused tool call {name}"[:60]))
+    if not refused:
+        # nothing refused, but the kept calls now carry their decision tokens: return the edited reply, not the
+        # upstream one (2026-10-23, tests/test_enforcement_e2e.py)
+        return _JsonReply(data, resp.status_code)
+    if getattr(cfg, "PROXY_TOOL_CALL_ACTION", "strip") == "block":
+        return Response(content=json.dumps({"error": "Tool call refused by DIDA L4.",
+                                            "refused": [n for n, _ in refused]}),
+                        status_code=403, media_type="application/json",
+                        headers={"X-Sentinel-Risk-Level": "HIGH"})
+    notice = "[DIDA withheld tool call(s): " + "; ".join(f"{n} ({w[:120]})" for n, w in refused) + "]"
+    msg["tool_calls"] = kept or None
+    if not kept:
+        msg.pop("tool_calls", None)
+        if data["choices"][0].get("finish_reason") == "tool_calls":
+            data["choices"][0]["finish_reason"] = "stop"
+    msg["content"] = ((msg.get("content") or "") + ("\n\n" if msg.get("content") else "") + notice)
+    return _JsonReply(data, resp.status_code)
+
 
 @app.post("/sentinel/l1/scan-image")
 async def scan_image_steg(file: UploadFile = File(...)):
@@ -1389,9 +1536,35 @@ async def intercept_tool_call(request: Request):
     corr_block = blocking_rules(await check_correlations(session_id))
     out = result.to_dict()
     if corr_block:
-        out.update(should_execute=False, correlation_block=corr_block,
+        out.update(should_execute=False, correlation_block=corr_block, requires_confirmation=False,
                    reason=f"Correlation rule(s) {'+'.join(corr_block)}: {out.get('reason', '')}")
+    out["decision_token"] = _decision_token(session_id, body.get("principal") or "user", tool_name, parameters, out)
     return out
+
+
+def _decision_token(session_id: str, principal: str, tool: str, params: dict, verdict: dict) -> str | None:
+    """Signed, call-bound decision for sentinel.enforce.ToolGate (allow / confirm; a block gets none)."""
+    import sentinel.config as cfg
+    from sentinel.enforce import issue_decision
+    dec = "allow" if verdict.get("should_execute") else ("confirm" if verdict.get("requires_confirmation") else None)
+    if dec is None:
+        return None
+    return issue_decision(session_id, principal, tool, params or {}, dec, ttl_s=cfg.DIDA_DECISION_TTL_S,
+                          key=cfg.DIDA_DECISION_KEY.encode())
+
+
+@app.post("/sentinel/agent/approve")
+async def agent_approve(request: Request):
+    """The user confirms a `confirm` decision. Returns an approval bound to that exact call (same arguments, same
+    principal); a ToolGate accepts the pair, and refuses it for any modified call."""
+    import sentinel.config as cfg
+    from sentinel.enforce import approve, GateRefused
+    body = await _json_body(request)
+    try:
+        a = approve(body.get("decision_token", ""), body.get("principal") or "user", key=cfg.DIDA_DECISION_KEY.encode())
+    except GateRefused as e:
+        return JSONResponse({"approved": False, "invariant": e.invariant, "reason": e.reason}, status_code=400)
+    return {"approved": True, "approval": a}
 
 @app.post("/sentinel/agent/tool_response")
 async def agent_tool_response(request: Request):
@@ -1404,7 +1577,7 @@ async def agent_tool_response(request: Request):
     session_id = body.get("session_id", str(uuid.uuid4()))
     
     # Run Tier 1 and Tier 2 injection scan on the tool output
-    l1_result = await layer1_check(response_text, harm_head=False)
+    l1_result = await layer1_check(response_text, harm_head=False, source="tool_output")
 
     # Also route tool-response text through L2 (InjecAgent-calibrated gap fix):
     # previously this endpoint never called ingest_chunk() on tool-response
@@ -1415,6 +1588,15 @@ async def agent_tool_response(request: Request):
     session = await threat_bus.get_session(session_id)
     if l2_tool_response_flagged(l2_chunk["metadata"]):
         session.l2_flagged_chunks.append(l2_chunk)
+
+    # Action authorization (config.L4_AUTHZ): the lineage store needs to know WHICH tool produced this output and
+    # with what arguments -- optional fields, so existing integrations are unchanged.
+    import sentinel.config as _acfg
+    if getattr(_acfg, "L4_AUTHZ", False) and body.get("tool_name"):
+        from sentinel.layers.layer4_agentic.authz import record_tool_output
+        utext = "\n".join(str(t.get("content", "")) for t in (body.get("history") or []) if t.get("role") == "user")
+        record_tool_output(session_id, body["tool_name"], body.get("parameters") or {},
+                           body.get("response_json", response_text), utext)
 
     # Track candidate sensitive values seen in this tool response — feeds
     # L5's provenance-based leak check. Regardless of trust_score/flagged

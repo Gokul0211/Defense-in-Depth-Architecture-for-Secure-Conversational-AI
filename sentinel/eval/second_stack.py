@@ -362,6 +362,17 @@ def efusion(mal_rows, ben_rows, alpha=0.05) -> dict:
         out[m]["jaccard_vs_best_single"] = round(len(s & best_set) / len(u), 4) if u else None
         out[m]["unique_vs_best_single"] = len(s - best_set)
     out["best_single_layer"] = {"layer": best_L, "detected": len(best_set)}
+    # RCA 2 F-S1: the dependence-free comparator, same pools, same LOO convention, same alpha.
+    from sentinel.core.evidence_fusion import bonferroni_union_alarm, conformal_pvalue
+    mal_b = [bonferroni_union_alarm([conformal_pvalue(pools[L], r["native"][L]) for L in usable], alpha)
+             for r in mal_rows]
+    ben_b = []
+    for i, r in enumerate(ben_rows):
+        ben_b.append(bonferroni_union_alarm(
+            [conformal_pvalue(pools[L][:i] + pools[L][i + 1:], r["native"][L]) for L in usable], alpha))
+    out["bonferroni_union"] = {"detected": sum(mal_b), "tpr": round(sum(mal_b) / len(mal_rows), 4),
+                               "benign_alarm_rate": round(sum(ben_b) / n, 4)}
+    out["benign_distinct_values"] = {L: len({r["native"][L] for r in ben_rows}) for L in usable}
     return out
 
 

@@ -47,8 +47,55 @@ WEAK = [
 _STRONG = [re.compile(p, re.I | re.S) for p in STRONG]
 _WEAK = [re.compile(p, re.I | re.S) for p in WEAK]
 
+# v3 code review (2026-10-18, config.ADDRESSEE_SPOOF_CUES). Two families had window recall 0.0 in
+# R-031c, and both for a lexical reason, not a conceptual one:
+#   system_message   "###(system_message) ..." -- the lexicon knew "system message" with a SPACE;
+#   ignore_previous  "Ignore your previous iunstructions" -- AgentDojo's own template typo, which
+#                    an attacker can reproduce at will; the object noun is matched by its stem.
+# Plus the spoofed control-channel markers of core/control_spoof.py ("[SYSTEM NOTE] ...",
+# "[ADMIN OVERRIDE: ...]", "Developer Mode enabled"): by definition they address the AI system.
+# The ignore/override cue's left edge is "not preceded by a letter or digit" rather than \b, because "_" is a
+# word character: AgentDojo injects into identifiers such as the Slack channel name "External_Ignore your
+# previous iunstructions. Do ...", where \bignore never matches (RCA 2 fix validation m02: ignore_previous
+# 147/295 vs 234/295 for the families whose cue has no leading \b).
+STRONG_V3 = [
+    r"\bsystem[ _-](?:prompt|message)s?\b",
+    r"(?<![A-Za-z0-9])(?:ignore|disregard|forget|override|bypass)\b.{0,40}\b(?:previous|prior|above|earlier|all|your|system|original)\b"
+    r".{0,20}\b\w*(?:nstruct|prompt|guideline|directive)\w*",
+]
+_STRONG_V3 = [re.compile(p, re.I | re.S) for p in STRONG_V3]
+# the 2026-10-18 form (\b left edge), kept for config.ADDRESSEE_UNDERSCORE_BOUNDARY=false reproduction
+_STRONG_V3_OLD = [re.compile(STRONG_V3[0], re.I | re.S),
+                  re.compile(STRONG_V3[1].replace("(?<![A-Za-z0-9])", r"\b", 1), re.I | re.S)]
+
+
+def strong_patterns() -> list:
+    """The STRONG cue patterns in force (read live, so a harness can flip the flag)."""
+    import sentinel.config as cfg
+    if not getattr(cfg, "ADDRESSEE_SPOOF_CUES", False):
+        return _STRONG
+    from sentinel.core.control_spoof import COMPILED
+    v3 = _STRONG_V3 if getattr(cfg, "ADDRESSEE_UNDERSCORE_BOUNDARY", False) else _STRONG_V3_OLD
+    return _STRONG + v3 + list(COMPILED.values())
+
+
+_ESCAPES = __import__("re").compile(r"\\[nrt]")
+
+
+def match_text(text: str) -> str:
+    """The text cues are matched on: a serialised tool output writes a newline as the two characters
+    backslash + "n", which glues the next word to a letter ("...available\\nIgnore your previous ...") and
+    defeats every left word edge (RCA 2 fix validation: 27 travel ignore_previous injections). Each escape is
+    replaced by two spaces, so character positions -- and the instruction spans built on them -- are unchanged.
+    Active with config.ADDRESSEE_UNDERSCORE_BOUNDARY (the same identifier/escape boundary fix)."""
+    import sentinel.config as cfg
+    t = text or ""
+    if getattr(cfg, "ADDRESSEE_UNDERSCORE_BOUNDARY", False) and "\\" in t:
+        t = _ESCAPES.sub("  ", t)
+    return t
+
 
 def addressee_cues(text: str) -> tuple[int, int]:
     """(# strong cues, # weak cues) present in `text`."""
-    t = text or ""
-    return sum(bool(p.search(t)) for p in _STRONG), sum(bool(p.search(t)) for p in _WEAK)
+    t = match_text(text)
+    return sum(bool(p.search(t)) for p in strong_patterns()), sum(bool(p.search(t)) for p in _WEAK)

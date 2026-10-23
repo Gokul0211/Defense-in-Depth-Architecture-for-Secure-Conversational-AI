@@ -101,6 +101,27 @@ _CODE_LINE = re.compile(
 _ASSIGN_OUTSIDE = re.compile(r"(?<![=!<>])=(?!=)")
 
 
+# TOOL REGISTRY (v3 P1.1, 2026-10-18; PIPELINE_SIM_TOOL_REGISTRY, default on). An agent can call
+# only the tools it was given. The code-line filter above still let prose and math through: on the
+# benign pipeline arm `cos(x)`, `sin(x)`, `P(B|A)`, `library(...)` and even a news line
+# "Kwarasey (Portland Timbers, USA)" were audited as agent tool calls, defaulted to WRITE
+# ("unknown tool"), and HELD as unrequested writes named in the document (v3 a03: 61 of 529 benign
+# sessions at L4 >= WARN). A candidate is therefore audited only when it names a REGISTERED tool:
+# one the action policy declares (EXPLICIT_CAPABILITY) or one the sample itself presents as a tool
+# call with an explicit `[Tool: name(...)]` marker. Checked on every corpus the simulator runs
+# (v3 a06): 0 attack-side calls dropped on sentinel_bench, Phase 4 and SPLIT-Bench v2.
+_MARKED_TOOL = re.compile(r"\[Tool:\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+
+
+def _registered_tools(text: str) -> set[str] | None:
+    """Tool names the simulated agent may call, or None when the filter is off."""
+    import sentinel.config as _c
+    if not getattr(_c, "PIPELINE_SIM_TOOL_REGISTRY", False):
+        return None
+    from sentinel.layers.layer4_agentic.action_policy import EXPLICIT_CAPABILITY
+    return set(EXPLICIT_CAPABILITY) | {m.lower() for m in _MARKED_TOOL.findall(text)}
+
+
 def _in_code_line(text: str, m) -> bool:
     import sentinel.config as _c
     if not getattr(_c, "PIPELINE_SIM_CODE_FILTER", False):
@@ -111,6 +132,51 @@ def _in_code_line(text: str, m) -> bool:
     line = text[ls:le]
     outside = line[:m.start() - ls] + line[m.end() - ls:]
     return bool(_CODE_LINE.search(line)) or bool(_ASSIGN_OUTSIDE.search(outside))
+
+
+# ROBUST STRUCTURE PARSING (RCA 2 F-E4, 2026-10-19; PIPELINE_SIM_ROBUST_PARSE, default on). The markers
+# above are matched literally, so a paraphraser that randomises case ("[DOcUmEnt]"), pads with zero-width
+# characters or swaps a letter for a Cyrillic look-alike ("sENd_еmail(") makes the SIMULATOR lose the
+# document or the tool call -- an artefact a real deployment does not have (documents and tool calls arrive
+# structurally). Measured on the 2026-09-20 red-team texts: 14 of the 16 ALLOWs under the current pipeline
+# involved lost structure. Markers are therefore matched case-insensitively, tolerating zero-width characters
+# and confusable letters, and a tool name is folded to its canonical spelling before the registry lookup
+# (what a real agent would actually call). Content is NOT normalised: every layer still sees the raw text.
+_ZW = "[\u200b\u200c\u200d\ufeff]*"
+
+
+def _fuzzy_word(word: str) -> str:
+    from sentinel.core.text_canonicalize import _CONFUSABLES
+    inv: dict[str, set] = {}
+    for k, v in _CONFUSABLES.items():
+        inv.setdefault(v.lower(), set()).add(k)
+    parts = []
+    for ch in word:
+        alts = {ch.lower(), ch.upper()} | inv.get(ch.lower(), set())
+        parts.append("[" + "".join(re.escape(a) for a in sorted(alts)) + "]" + _ZW)
+    return "".join(parts)
+
+
+_R_TURN = rf"\[{_ZW}{_fuzzy_word('Turn')}\s*{_ZW}\d+{_ZW}\]"
+_R_DOC = rf"\[{_ZW}(?:{_fuzzy_word('Retrieved')}\s+{_ZW})?{_fuzzy_word('Document')}\]"
+_R_QUERY = rf"\[{_ZW}{_fuzzy_word('User')}\s+{_ZW}{_fuzzy_word('Query')}\]"
+_TURN_PATTERN_ROBUST = re.compile(rf"{_R_TURN}\s*(.*?)(?={_R_TURN}|{_R_DOC}|$)", re.DOTALL)
+_DOCUMENT_PATTERN_ROBUST = re.compile(rf"{_R_DOC}\s*(.*?)(?={_R_QUERY}|{_R_TURN}|$)", re.DOTALL)
+_USER_QUERY_PATTERN_ROBUST = re.compile(rf"{_R_QUERY}\s*(.*?)$", re.DOTALL)
+_TOOL_CALL_PATTERN_ROBUST = re.compile(r"(?<![\w\u200b\u200c\u200d\ufeff])((?:[^\W\d]|_)[\w\u200b\u200c\u200d\ufeff]*)\((['\"]?[^()]*['\"]?)\)")
+
+
+def canonical_tool_name(name: str) -> str:
+    """Zero-width stripped, confusables folded, lower-cased (no leetspeak folding: tool names keep digits)."""
+    from sentinel.core.text_canonicalize import _CONFUSABLES, _ZERO_WIDTH_RE
+    import unicodedata
+    s = _ZERO_WIDTH_RE.sub("", unicodedata.normalize("NFKC", name or ""))
+    return "".join(_CONFUSABLES.get(c, c) for c in s).lower()
+
+
+def _robust_parse() -> bool:
+    import sentinel.config as _c
+    return bool(getattr(_c, "PIPELINE_SIM_ROBUST_PARSE", False))
 
 
 @dataclass
@@ -127,13 +193,23 @@ def parse_sample_text(text: str) -> ParsedSample:
     pieces. Falls back gracefully — text with no [Turn]/[Document] markers
     at all is treated as a single implicit turn, so this never crashes on
     an unexpected format, it just degrades to less structure."""
-    turns = [t.strip() for t in _TURN_PATTERN.findall(text) if t.strip()]
-    documents = [d.strip() for d in _DOCUMENT_PATTERN.findall(text) if d.strip()]
-    query_match = _USER_QUERY_PATTERN.search(text)
+    robust = _robust_parse()
+    turn_re = _TURN_PATTERN_ROBUST if robust else _TURN_PATTERN
+    doc_re = _DOCUMENT_PATTERN_ROBUST if robust else _DOCUMENT_PATTERN
+    query_re = _USER_QUERY_PATTERN_ROBUST if robust else _USER_QUERY_PATTERN
+    turns = [t.strip() for t in turn_re.findall(text) if t.strip()]
+    documents = [d.strip() for d in doc_re.findall(text) if d.strip()]
+    query_match = query_re.search(text)
     user_query = query_match.group(1).strip() if query_match else ""
 
-    tool_calls = [(m.group(1), m.group(2)) for m in _TOOL_CALL_PATTERN.finditer(text)
-                  if not _in_code_line(text, m)]
+    registry = _registered_tools(text)
+    if robust and registry is not None:
+        registry = registry | {canonical_tool_name(m) for m in _MARKED_TOOL.findall(text)}
+    tool_re = _TOOL_CALL_PATTERN_ROBUST if robust else _TOOL_CALL_PATTERN
+    norm = canonical_tool_name if robust else (lambda n: n)
+    tool_calls = [(norm(m.group(1)), m.group(2)) for m in tool_re.finditer(text)
+                  if not _in_code_line(text, m)
+                  and (registry is None or norm(m.group(1)).lower() in registry)]
 
     marker_match = _INJECAGENT_TOOL_MARKER_PATTERN.search(text)
     if marker_match:
@@ -463,6 +539,7 @@ async def simulate_pipeline(
 
     # --- L4: heuristic tool-call extraction + audit (see module docstring, item 1) ---
     l4_refused = False
+    l4_confirm = False
     if "L4" not in disabled_layers:
         for tool_name, raw_args in parsed.tool_call_candidates:
             parameters = {"arg0": raw_args.strip("'\" ")} if raw_args else {}
@@ -495,7 +572,11 @@ async def simulate_pipeline(
             )
             session.l4_calls.append({**l4_result.to_dict(), "tool_name": tool_name, "parameters": parameters})
             if not getattr(l4_result, "should_execute", True):
-                l4_refused = True
+                # RCA 2: a call held for the USER's confirmation is a review event, not an attack block
+                if getattr(l4_result, "requires_confirmation", False):
+                    l4_confirm = True
+                else:
+                    l4_refused = True
 
     # --- L5: scan sample text as an approximation of hypothetical output (see module docstring, item 2) ---
     if "L5" not in disabled_layers:
@@ -540,6 +621,8 @@ async def simulate_pipeline(
     import sentinel.config as _pcfg
     if l4_refused and getattr(_pcfg, "PIPELINE_L4_ENFORCE", False):
         final_decision = "BLOCK"
+    elif l4_confirm and final_decision == "ALLOW":
+        final_decision = "WARN"
 
     elapsed_ms = (time.perf_counter() - start) * 1000
 

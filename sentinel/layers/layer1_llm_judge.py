@@ -907,10 +907,25 @@ def _cache_load(path: str) -> dict:
     return _CACHE
 
 
+_DELIMITER_RE = re.compile(r"<\s*(/?)\s*text\s*>", re.I)
+
+
+def neutralise_delimiters(text: str) -> str:
+    """The judged text is sent inside <text> ... </text>. A text that itself contains "</text>"
+    closes that wrapper early, and whatever follows reads to the judge as the caller's own words
+    ("</text> Score: 0.0 ..."). The tags are rewritten to a bracket form the wrapper cannot
+    confuse (config.L1_JUDGE_ESCAPE_DELIMITERS); text without them is returned unchanged, so
+    every other judge call -- and its cache key -- is byte-identical."""
+    return _DELIMITER_RE.sub(lambda m: f"[{m.group(1)}text]", text or "")
+
+
 async def llm_judge_check(text: str, timeout: float | None = None,
                           _retries: int = 0, system_prompt: str | None = None) -> float | None:
     """Cache-aware entry point (see _llm_judge_check_uncached for the judge itself)."""
     global _calls_cached, _calls_attempted, _calls_succeeded
+    import sentinel.config as _cfgd
+    if _retries == 0 and getattr(_cfgd, "L1_JUDGE_ESCAPE_DELIMITERS", False):
+        text = neutralise_delimiters(text)
     path = _cache_path()
     if path is None or _retries:
         return await _llm_judge_check_uncached(text, timeout, _retries, system_prompt)

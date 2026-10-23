@@ -50,6 +50,19 @@ def _git_hash() -> str | None:
         return None
 
 
+def _addressee_model_tag() -> dict | None:
+    """Which frozen ADR artifact a run could use (type, creation date, gate), or None if absent."""
+    try:
+        import json
+        from pathlib import Path
+        p = Path(__file__).resolve().parents[1] / "core" / "artifacts" / "addressee_model.json"
+        art = json.loads(p.read_text(encoding="utf-8"))
+        return {"type": art.get("type"), "created": art.get("created"),
+                "gate_passed": (art.get("gate") or {}).get("passed")}
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
 def config_snapshot() -> dict:
     """
     Every setting that can move a reported number, read live from config at call
@@ -188,6 +201,56 @@ def config_snapshot() -> dict:
         "pipeline_sim_code_filter": g("PIPELINE_SIM_CODE_FILTER"),
         "pipeline_block_policy": g("PIPELINE_BLOCK_POLICY"),
         "pipeline_corroboration_k": g("PIPELINE_CORROBORATION_K"),
+        # 2026-10-18 flags (scratch/rca/v3/RCA_AND_PLAN.md) -- each can move a reported number
+        "pipeline_sim_tool_registry": g("PIPELINE_SIM_TOOL_REGISTRY"),
+        "l5_user_provenance": g("L5_USER_PROVENANCE"),
+        "l5_pii_validity": g("L5_PII_VALIDITY"),
+        "l2_adr": g("L2_ADR"),
+        "l2_adr_warn_threshold": g("L2_ADR_WARN_THRESHOLD"),
+        "l2_adr_block_threshold": g("L2_ADR_BLOCK_THRESHOLD"),
+        "l4_sink_context_adr_tau": g("L4_SINK_CONTEXT_ADR_TAU"),
+        "l4b_adr_tau": g("L4B_ADR_TAU"),
+        "addressee_model": _addressee_model_tag(),
+        # v3 code-review fixes (scratch/rca/v3/CODE_REVIEW.md), 2026-10-18
+        "l1_spoof_markers": g("L1_SPOOF_MARKERS"),
+        "addressee_spoof_cues": g("ADDRESSEE_SPOOF_CUES"),
+        "l2_spoof_markers": g("L2_SPOOF_MARKERS"),
+        "l1_decode_all_candidates": g("L1_DECODE_ALL_CANDIDATES"),
+        "l1_judge_escape_delimiters": g("L1_JUDGE_ESCAPE_DELIMITERS"),
+        "l3_preamble_max_words": g("L3_PREAMBLE_MAX_WORDS"),
+        "l4_sink_exact_identifiers": g("L4_SINK_EXACT_IDENTIFIERS"),
+        "l4_reasoning_flags_strict": g("L4_REASONING_FLAGS_STRICT"),
+        "l5_policy_phrase_match": g("L5_POLICY_PHRASE_MATCH"),
+        "l2_danger_credential_strict": g("L2_DANGER_CREDENTIAL_STRICT"),
+        # RCA 2 fixes (scratch/rca/v3/plan_fixing.md), 2026-10-19
+        "pipeline_sim_robust_parse": g("PIPELINE_SIM_ROBUST_PARSE"),
+        "agentdojo_replay_withhold": g("AGENTDOJO_REPLAY_WITHHOLD"),
+        "l2_eval_document_level": g("L2_EVAL_DOCUMENT_LEVEL"),
+        "redteam_success": g("REDTEAM_SUCCESS"),
+        "l1_tool_output_tier3": g("L1_TOOL_OUTPUT_TIER3"),
+        "proxy_audit_tool_calls": g("PROXY_AUDIT_TOOL_CALLS"),
+        "proxy_tool_call_action": g("PROXY_TOOL_CALL_ACTION"),
+        "l4_requested_lexicon_v2": g("L4_REQUESTED_LEXICON_V2"),
+        "l4_delegation_confirm": g("L4_DELEGATION_CONFIRM"),
+        "l4_hold_unrequested_communicate": g("L4_HOLD_UNREQUESTED_COMMUNICATE"),
+        "l4_data_sink_confirm": g("L4_DATA_SINK_CONFIRM"),
+        "l4_sink_context_span_end": g("L4_SINK_CONTEXT_SPAN_END"),
+        "l4_sink_context_span_max": g("L4_SINK_CONTEXT_SPAN_MAX"),
+        "l5_harm_check": g("L5_HARM_CHECK"),
+        "l5_harm_tau": g("L5_HARM_TAU"),
+        "l1_harm_report_category": g("L1_HARM_REPORT_CATEGORY"),
+        "addressee_underscore_boundary": g("ADDRESSEE_UNDERSCORE_BOUNDARY"),
+        "l1_tool_output_addressee": g("L1_TOOL_OUTPUT_ADDRESSEE"),
+        "l4_hold_unrequested_write": g("L4_HOLD_UNREQUESTED_WRITE"),
+        "l4_named_in_canonical": g("L4_NAMED_IN_CANONICAL"),
+        "l4_authz": g("L4_AUTHZ"),
+        "l4_authz_contract": g("L4_AUTHZ_CONTRACT"),
+        "l4_authz_contract_model": g("L4_AUTHZ_CONTRACT_MODEL"),
+        "l4_authz_contract_timeout_s": g("L4_AUTHZ_CONTRACT_TIMEOUT_S"),
+        "l4_authz_content_identifiers": g("L4_AUTHZ_CONTENT_IDENTIFIERS"),
+        "l4_authz_sensitive_egress": g("L4_AUTHZ_SENSITIVE_EGRESS"),
+        "l4_authz_transfer_confirm_above": g("L4_AUTHZ_TRANSFER_CONFIRM_ABOVE"),
+        "l4_authz_trust_policy_file": g("L4_AUTHZ_TRUST_POLICY_FILE"),
         "torch_threads": __import__("os").getenv("SENTINEL_TORCH_THREADS", "1"),
         # --- L4 / L5
         "l4_decision_threshold": g("L4_DECISION_THRESHOLD"),

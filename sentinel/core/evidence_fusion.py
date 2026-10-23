@@ -240,6 +240,27 @@ def ville_threshold(alpha: float) -> float:
     return 1.0 / alpha
 
 
+def conformal_pvalue(benign_scores: list[float], score: float) -> float:
+    """Right-tail conformal p-value with the (n+1) correction (the same one calibrate_evalue_threshold uses)."""
+    n = len(benign_scores)
+    return (1 + sum(1 for b in benign_scores if b >= score)) / (n + 1)
+
+
+def bonferroni_union_alarm(pvalues: list[float], alpha: float) -> bool:
+    """THE COMPARATOR EVERY FUSION CLAIM MUST BEAT (RCA 2 F-S1, 2026-10-19).
+
+    Alarm when ANY layer's conformal p-value is <= alpha / k. Valid under ANY dependence between
+    layers (union bound), uses no fitted weight and no independence assumption -- exactly the
+    properties claimed for the e-value merges. RCA 2 measured it on SPLIT-Bench v2's stored scores:
+    167/170 attacks at 3/340 benign LOO alarms, against the product merge's 102/170 at 0/340. A
+    fusion rule that does not beat this at the same alpha adds nothing over running the layers
+    side by side."""
+    k = len(pvalues)
+    if k == 0:
+        return False
+    return min(pvalues) <= alpha / k
+
+
 @dataclass
 class EProcess:
     """

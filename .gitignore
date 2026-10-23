@@ -99,3 +99,6 @@ sentinel/eval/data/split_bench_s2/all.jsonl
 # legacy UI, kept locally only
 old_frontend/
 skills-lock.json
+
+# ADR training corpus: derived from WildChat / WildGuardMix / Alpaca / XSum text, not redistributed
+sentinel/eval/data/addressee/

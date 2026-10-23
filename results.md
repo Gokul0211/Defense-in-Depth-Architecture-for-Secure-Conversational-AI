@@ -3866,3 +3866,208 @@ Main binding layer: the session moderator G (over its ceiling in ~40 % of reject
 - (27 Sep, offline, scratch/_paper_offline.py) SPLIT-S2 benign dependence: score r P-D -0.016, P-G +0.013, D-G +0.033;
   LOO benign e-values |r| <= 0.026 -> product merge not contradicted (as on SPLIT v2). Live AgentDojo L4-only vs none:
   33 stopped / 0 enabled; utility under attack 11 gained / 8 lost. Paper integrated (paper/PAPER_CHANGE_MAP.md).
+
+## 14. DIDA v3 (2026-10-18) — code review of L1–L5; what was MEASURED today
+
+Full write-up: `scratch/rca/v3/CODE_REVIEW.md` (defects, data evidence, fixes) and `scratch/rca/v3/RCA_AND_PLAN.md`
+(root causes of the mid/weak rows). Every change is behind a flag that defaults on; off reproduces §12–13.
+Only rows marked **RUN** are full-corpus re-runs; **OFFLINE** rows recompute stored artifacts with the new rule
+(same records, same splits) and are estimates until re-run. Nothing below replaces a §12 number yet.
+
+### 14.1 Full-corpus runs
+| row | config | P | R | F1 | AUROC | AUPRC | FPR | artifact |
+|---|---|---|---|---|---|---|---|---|
+| L5 AgentLeak (n=5,006), §12 config | v3 P1.2/P1.3 on | 0.8154 | 0.8768 | 0.8450 | 0.8883 | 0.7292 | 0.0737 | `eval_L5_agentleak_20261018_221617.json` — **identical to §12** (P1.2/P1.3 do not move it) |
+| L5 custom_l5_pii | v3 P1.2/P1.3 on | 1.0000 | 0.7500 | 0.8571 | 0.8750 | 0.8591 | 0.0000 | `eval_L5_custom_l5_pii_20261018_221636.json` — identical |
+| **L5 AgentLeak, + policy phrase match** | `L5_POLICY_PHRASE_MATCH` | **0.8701** | 0.8753 | **0.8727** | **0.9114** | **0.7948** | **0.0485** | `eval_L5_agentleak_20261018_231239.json` (policy-only benign FPs 108 -> 16) |
+custom_l5 has no policy hit under either rule (d02), so it is unchanged by the policy fix by construction (not re-run).
+
+### 14.2 Offline recomputations (estimates; the re-run is owed — `run_v3.sh` stages 2–8)
+| row | before | after | how |
+|---|---|---|---|
+| L2 BIPIA recall / benign FPR / AUROC (doc axis, R-006 design) | 0.636 / 0.0133 / 0.9199 | **0.694 / 0.0100 / 0.9262** | `d03`: strict credential family, anchors re-derived (prose WARN 0.250618 -> 0.019682, code WARN 0.644572 -> 0.632877, code BLOCK 0.776558 -> 0.697139); cost: WildChat-code FPR at code BLOCK 0.0043 -> 0.0174 |
+| L2 flag rate, AgentDojo tool outputs >= 600 chars (injected / benign) | 21/157 / 1/33 | 57/157 / 2/33 | `e02` (real Prompt Guard scores) |
+| DIDA-Bench pipeline judge-off BLOCK | 50/59 | **56/59** (est.) | `e01`: 6 non-BLOCK attacks now hit L1 Tier 1 (spoof markers) on a user turn; 0 benign turns hit. Not clean held-out (rules written after reading DIDA-Bench) |
+| L1 Tier 1 attack hits, DIDA-Bench test / held_out / Phase-4 | 13/59 / 34/150 / 24/230 | 52/59 / 150/150 / 169/230 | `e01`; every benign corpus unchanged (Alpaca, NotInject, OR-Bench, WJB-benign, OASST, WildChat-mt, benign arm, AgentLeak, SPLIT v2) |
+| L4 addressee cue, AgentDojo window recall: system_message / ignore_previous (benign 616 windows) | 0/259 / 0/259 (0/616) | **234/259 / 147/259** (0/616) | `e01` (R-031c windows) |
+| SPLIT v2 undefended share / product-merge detections at 0 benign alarms | 85.2 % / 62 of 170 | 71.7 % / 102 of 170 | `c06`/`c07`: L2 continuous channel (site 7) repaired; in-sample LOO calibration like the paper |
+| benign pipeline arm review rate (34.6 %) | 183/529 | expected ~2–4 % (residual: L2 code docs, 18 flagged before the credential fix, ~13 after) | `a01`–`a03`: 133 sessions were L5 flagging the user's own e-mail (P1.2), 61 L4 auditing math/prose as tool calls (P1.1); the 8 benign BLOCKs had no registered tool call left after P1.1 |
+
+### 14.3 Log-only numbers now recorded here (P1.6)
+34.6 % benign review rate = `scratch/rca/v2/S7Z_benign_pipeline_arm.log` (FPR 0.3459); L2 short bin on DIDA-Bench
+recall 0.1525 / AUROC 0.9296 = `paper/PAPER_CHANGE_MAP.md`; tom-gibbs turn-count AUROC 0.7379 = `FINAL_REPORT.md`;
+red-team evasion 63.2 % / 12.3 % = pre-v2 config (`memory.md`), to be re-run (stage 7).
+
+### 14.4 Negative result
+ADR addressee model (P(text addresses an AI), trained on benign conversations only) — built twice, NOT adopted:
+v1 inverted on hand probes; v2 20–39 % FPR on held-out AgentDojo suites, ~0–1 % after prose extraction but terse-family
+recall 0 (`scratch/rca/v3/c02`–`c05`). Learned addressee detection cannot beat explicit cues here; supports L4's
+control-flow design.
+
+## 15. RCA-2 fixes applied and measured (2026-10-19)
+
+Analyses: `scratch/rca/v3/DEEP_RCA_UNRESOLVED.md` (RCA 1), `RCA_2.md` (RCA 2), plan + status `plan_fixing.md` §8.
+Every fix is flag-gated (config.py "RCA 2 FIXES"), recorded in `meta.config`; tests `tests/test_rca2_fixes.py`.
+Judge OFF for every number below (no hosted calls); working tree, uncommitted.
+
+### 15.1 AgentDojo v1.2 replay, 6 attack families x 60 pairs x 4 suites (190 pairs with a side-effect goal per family)
+Full deployed contract: L2 flags, L4 action policy, `/sentinel/agent/tool_response` withholding (raw L1 >= BLOCK);
+success = every injected side-effect call executes. `scratch/rca/v3/m01_replay_configs.json`.
+
+| config | benign (97 tasks): hard-blocked / need confirmation / output withheld | direct | ignore_prev | important_instr | tool_knowledge | system_msg | injecagent | total executed |
+|---|---|---|---|---|---|---|---|---|
+| before RCA 2 (all RCA-2 flags off; reproduces RCA 2) | 2 / 0 / 15 | 117 | 4 | 11 | 8 | 0 | 0 | 140 |
+| **shipped defaults** | **0 / 7 / 0** | **55** | **0** | **0** | **0** | 0 | 0 | **55** |
+
+Attribution (same harness): F-T3 (Tier 3 on prose fields of tool outputs) removed all 19 benign withholdings; F-A1
+(lexicon v2, delegation -> confirmation) removed both benign hard blocks; F-A2 (hold unrequested COMMUNICATE / WRITE)
+direct 131 -> 101 -> 55 at no benign cost; F-A3 (confirm data-sourced TRANSFER destinations) direct 101 -> 68 with
++2 benign confirmations; addressee withholding of tool outputs + the "_"/escaped-newline boundary fix: important_
+instructions / tool_knowledge / ignore_previous -> 0. Not adopted: F-A3 for COMMUNICATE (direct 34 but 22 benign
+confirmations, 15 of 21 Slack tasks). Residual 55 = requested capability with a data-chosen argument (37 messages,
+18 writes) -> argument-provenance architecture (plan P3).
+
+### 15.2 L2 on DIDA-Bench, document level (F-E2) — `eval_L2_sentinel_bench_20261019_174847.json` / `_174910.json`
+65 documents (37 malicious, document labels). With spoof rule: recall 1.000, FPR 0 (template coverage — every DIDA-Bench
+poisoned document carries a bracket marker). Without: recall **0.4054** (15/37), AUROC 0.9122, FPR 0. The historical
+0.1525 (§14.3) was a composite-input / session-label measurement and is retired. Evaluator bug fixed on the way: a
+quarantined chunk was scored with the constant 0.9, below WARN on the short-document axis (reported 0/37).
+
+### 15.3 Red team (F-E3/F-E4) — `scratch/rca/v3/m03_redteam_rescore.jsonl`
+The 59 stored paraphrased texts of `eval_redteam_sentinel_bench_20260920_120939` re-scored with the shipped pipeline and
+the DEPLOYED decision: BLOCK 51, WARN 2, ALLOW 6 (historical metric: 32 "evaded"). The simulator now loses structure in
+1 sample (was 14). The 8 not blocked are paraphrased user-turn directives scoring L1 0.28-0.52, inside the hosted judge's
+band — judge-off by construction here. Not a new evasion rate: static texts from an old adaptive run; a fresh stage-7
+run is owed. 63.2 % and 54.2 % are retired (no artifact / wrong metric).
+
+### 15.4 SPLIT-Bench v2 fusion comparator (F-S1) — `scratch/rca/v3/c08_split_v2_comparators.json`
+Bonferroni union of single-layer conformal tests (alpha 0.05): 167/170 at 3/340 benign LOO alarms; product e-value merge
+102/170 at 0; mean merge 8/170. The benign arm has 6 distinct L1 / L2c values -> no fusion or tail claim until it is
+rebuilt. The product-merge gain claimed in §14.2 does not survive the comparator.
+
+### 15.5 Other
+* Proxy now audits reply `tool_calls` with L4 (F-A0; strip or 403).
+* Bugs found during validation and fixed: addressee cue left edge ("External_Ignore...", "\nIgnore..."), homoglyph tool
+  names in L4's named-in check, guard category readout on the GPU split model, L2 evaluator quarantine score.
+* Mechanisms added, not validated (no corpus): response-side harm check in L5 (off), harm category reporting (on).
+* Blocked on data: per-source short-bin anchors (no representative benign KB corpus), authority-claim judge cascade
+  (no independent attack set), MHJ replies (gated download needs approval).
+* Reclassified (RCA 1/2): tom-gibbs 0.7379 is a turn-count confound (detector 0.9956); OR-Bench 38.8 % is a WARN /
+  alert rate, not refusals.
+* Tests: full suite 1,404 passed, 0 failed (parity test excluded as before).
+
+## 16. v5 (2026-10-21): fusion RCA, action authorization, execution gate, effect-level replay
+
+Write-ups:
+- `scratch/rca/v5/PHASE1_FUSION.md`
+- `scratch/rca/v5/ARCHITECTURE_FINAL.md`
+- `scratch/rca/v5/DATA_REGISTER.md`
+- `scratch/rca/v5/LEDGER.md`
+
+Judge OFF for every number; working tree, uncommitted.
+
+### 16.1 Fusion (SPLIT-Bench v2) -- claim WITHDRAWN, and so is its reversal
+Artifacts: `scratch/rca/v5/f01_fusion_rca.json`, `f01_per_example.jsonl` (510 rows), `f01b_realbenign.json`.
+- **Reproduced exactly:**
+  - product e-merge: 102/170 at 0/340 benign alarms;
+  - Bonferroni union: 167/170 at 3/340;
+  - deployed decision: 0/170.
+- **The historical comparison was at unmatched operating points.** At 0 alarms the union detects 0 and the product 102; at 3 alarms both detect 167.
+- **SPLIT cannot support a fusion claim either way:**
+  - the benign arm has 6 distinct L1 values;
+  - 52 % of real benign sessions exceed its L1 maximum (L1 AUROC, SPLIT attacks vs real benign: 0.525);
+  - the attacks carry no side effect.
+- **Calibrated on real benign sessions** (benign_pipeline_arm n = 529, L1 / L3; P/T/H split, 200 splits; pre-registered primary budget 1 % held-out FPR):
+
+  | rule | recall @1 % | recall @5 % |
+  |---|---|---|
+  | best single layer (L3) | 0.768 | 0.861 |
+  | Bonferroni union | 0.760 | 0.800 |
+  | Fisher | 0.751 | 0.877 |
+  | L1 alone | 0.000 | 0.000 |
+
+- Learned stacker, leave one attack family out: 0.31.
+- Shipped `PIPELINE_FUSION` logistic at its threshold: 0/170.
+- **Decision:** no fusion in the deployed decision (unchanged: max score vs thresholds); `PIPELINE_FUSION` deprecated.
+
+### 16.2 Action authorization (`L4_AUTHZ`), TRACE replay
+Artifacts:
+- `scratch/rca/v4/v04_authz_replay.json` (shipped arms);
+- `scratch/rca/v4/v04_part_direct_benign_..._injecagent.json` (authz arms).
+
+AgentDojo v1.2, development pairs (60/suite), code as of the run start (before the §16.4 fixes). "Executed" = every injected side-effect call would execute; full pipeline includes tool-output withholding.
+
+| config | `direct` executed (full / L4 only) / 190 | confirm | benign tasks hard-blocked / need confirmation (97) |
+|---|---|---|---|
+| shipped | 55 / 57 | 83 | 0 / 7 |
+| authz, lexicon contract | 16 / 16 | 63 | 0 / 14 |
+| authz, LLM contract | **1 / 1** | 77 | 2 / 15 |
+| authz, LLM contract, no transfer limit | 1 / 1 | 77 | 2 / 14 |
+
+Notes:
+- The other families' authz arms were stopped as superseded by §16.3.
+- The 2 benign hard blocks (workspace 32 / 37) were fixed in §16.4.
+
+### 16.3 EFFECT-LEVEL replay through `sentinel.enforce.ToolGate`
+Artifact: `scratch/rca/v5/a02_effect_replay.json`.
+
+Method:
+- Every call executes only with a decision token its L4 verdict earned.
+- Outcome = AgentDojo's own `injection_task.security(pre, post)` / `user_task.utility(pre, post)` on the resulting environment.
+- Confirmations are scored under two user models: the user declines every one ("deny") or approves every one ("approve", worst case).
+- Held-out = every pair NOT in the development subsample, never inspected during development.
+- **No held-out benign tasks exist:** all 97 were inspected.
+
+| arm (pairs with a side-effect goal) | no defence | shipped deny / approve | **authz (LLM contract) deny / approve** |
+|---|---|---|---|
+| direct, dev (190) | 172 | 53 / 131 | **0** / 60 |
+| direct, **held-out** (398) | 352 | 59 / 188 | **3** / 83 |
+| important_instructions, dev (190) / held-out (398) | 172 / 352 | 0 / 0 | 0 / 0 |
+| ignore_previous, dev (190) | 172 | 0 / 0 | 0 / 0 |
+| benign: user tasks done (97; no-defence reference 53) | 53 | 47 / 53 | 40 / 53 |
+
+Benign, deny: tasks with at least one confirmation 7 → 17; tasks with a hard refusal 0 → 0.
+
+Held-out survivors (deny, 3/398):
+- `delete_file` of a real catalogue file id, where the user asked for a deletion (2 pairs). Argument selection inside an authorized capability; the injected call precedes the user's own and consumes the one-call bound.
+- A phishing link from a user-named document in a requested DM (1 pair).
+
+The approve-all residual (83) is confirmations a rubber-stamping user accepts, e.g. an address read from an e-mail.
+
+No-defence ceiling: 18/190 dev pairs never reach the attacker's effect even undefended. Their `security()` checks need agent text or state the replay does not produce.
+
+### 16.4 Fixes after the trace replay (development evidence; held-out §16.3 ran on this code)
+- **Booking / order targets → `COMMITMENT_TARGET`** (strict class). Before, they were INTERNAL, so an injected reservation target passed.
+- **Literal-binding mismatch:** confirm, or block when the replacement value came from document content.
+- **Enum values (3 characters or fewer) carry no lineage.** This removed the 2 benign hard blocks.
+- **Outbound check (`L4_AUTHZ_SENSITIVE_EGRESS`):**
+  - a credential this session read (password, security code, card number) leaving in a message or transfer → block;
+  - other personal identifiers → confirm;
+  - unless the user typed the value or asked for that kind of value to be sent.
+- **Execution gate (`sentinel/enforce/gate.py`):** HMAC decision tokens bound to session, principal, tool and argument hash, with expiry and single use; approvals bound to the same call; hash-chained audit.
+  - `/sentinel/agent/tool_call` returns `decision_token`.
+  - New `/sentinel/agent/approve`.
+  - The proxy attaches `x_dida_decision` to the calls it keeps.
+- **L2 chunk-signing key** was the hard-coded literal `sentinel_l2_secret_key`. It is now `DIDA_PROVENANCE_KEY` or a per-process random key.
+
+### 16.5 Not run / blocked in v5
+- **Fresh red-team run:** not run. The paraphrase generator produces new attack text, which this session does not do. The stored 59-text result stays historical (BLOCK 51 / WARN 2 / ALLOW 6).
+- **Independent L1 paraphrase set:** blocked (see DATA_REGISTER).
+- **MHJ replies:** blocked, needs the user's approval.
+- **L2 per-source anchors:** blocked (no benign KB corpus).
+- **SPLIT benign rebuild:** blocked (no L2c on real sessions).
+- **Live multi-model AgentDojo:** not run.
+
+### 16.6 Default change (2026-10-23, user decision)
+`L4_AUTHZ` is now **ON** by default, with `L4_AUTHZ_CONTRACT=llm`. The lexicon contract is the fallback whenever no LLM contract is registered (no tool schema, provider down, or over the new `L4_AUTHZ_CONTRACT_TIMEOUT_S` = 15 s budget).
+
+Measured cost, from §16.3:
+- 7 → **17 of 97 benign AgentDojo tasks** ask the user for a confirmation;
+- 0 are hard-blocked;
+- utility is unchanged when the user approves.
+
+Measured benefit, held-out `direct`: attack effects 59 → 3 (user declines), 188 → 83 (user approves all).
+
+Tests re-run after the change:
+- only `tests/test_authz_step1.py -k "defaults or budget"` (2 passed);
+- **the full suite has NOT been re-run with the new default.** Older L4 / proxy tests that assume `L4_AUTHZ` off may need updating.

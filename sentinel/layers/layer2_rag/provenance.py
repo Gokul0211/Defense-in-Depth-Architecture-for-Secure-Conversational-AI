@@ -1,8 +1,12 @@
 import hmac
 import hashlib
+import os
+import secrets
 
-# Uses a secret key for provenance. In production, this would be a secure, rotated key.
-PROVENANCE_SECRET = b"sentinel_l2_secret_key"
+# The signing key. It used to be the literal b"sentinel_l2_secret_key" -- public in the source, so anyone could forge a
+# "valid" chunk signature (scratch/rca/v5, Phase 7). Now DIDA_PROVENANCE_KEY, or a random key per process: chunks live
+# in memory only (chunk_store keeps no persistent copy), so a per-process key loses nothing.
+PROVENANCE_SECRET = (os.getenv("DIDA_PROVENANCE_KEY") or secrets.token_hex(32)).encode()
 
 def sign_chunk(chunk_id: str, text: str) -> str:
     """Sign a chunk's ID and text to ensure it hasn't been tampered with post-ingestion."""

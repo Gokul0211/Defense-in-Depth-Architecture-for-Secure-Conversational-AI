@@ -22,7 +22,11 @@ def verify_policy(response: str) -> list[str]:
     violations = []
     out_pol = policy["output_policy"]
     resp_lower = response.lower()
-    
+
+    import sentinel.config as cfg
+    if getattr(cfg, "L5_POLICY_PHRASE_MATCH", False):
+        return _verify_policy_phrases(out_pol, resp_lower)
+
     # Check forbidden topics
     if "forbidden_topics" in out_pol:
         for topic in out_pol["forbidden_topics"]:
@@ -49,4 +53,28 @@ def verify_policy(response: str) -> list[str]:
                 if req["disclaimer"].lower() not in resp_lower:
                     violations.append(f"Missing required disclaimer for condition: {req['condition']}")
                     
+    return violations
+
+
+def _verify_policy_phrases(out_pol: dict, resp_lower: str) -> list[str]:
+    """verify_policy with WORD-level matching (config.L5_POLICY_PHRASE_MATCH, v3 code review).
+
+    The rule above tests every word as a SUBSTRING of the whole response: the condition
+    "interest rates" held for any text containing "interesting" and "demonstrates", and
+    "medical diagnosis" for any letter that says "medical" in one paragraph and "diagnosis" in
+    another. Here a disclaimer condition must occur as the PHRASE (whole words, any whitespace),
+    and a forbidden topic needs each of its keyword stems at the START of a word ("returns" still
+    matches "return", "guarantee" matches "guaranteed"; "rates" no longer matches "demonstrates").
+    Measured (scratch/rca/v3/d02): AgentLeak benign policy hits 121 -> 17, WildChat 8 -> 0."""
+    import re
+
+    violations = []
+    for topic in out_pol.get("forbidden_topics", []) or []:
+        keywords = [kw for kw in topic.split("_") if len(kw) > 3]
+        if keywords and all(re.search(rf"\b{re.escape(kw)}", resp_lower) for kw in keywords):
+            violations.append(f"Forbidden topic detected: {topic}")
+    for req in out_pol.get("required_disclaimers", []) or []:
+        cond = r"\s+".join(re.escape(w) for w in req["condition"].lower().split())
+        if cond and re.search(rf"\b{cond}\b", resp_lower) and req["disclaimer"].lower() not in resp_lower:
+            violations.append(f"Missing required disclaimer for condition: {req['condition']}")
     return violations

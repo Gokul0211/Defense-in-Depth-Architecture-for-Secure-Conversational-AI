@@ -264,6 +264,9 @@ class L1Result:
     # injections have P(unsafe) < 0.1), so neither may veto or inflate the other.
     harm_score: float | None = None
     harm_source: str | None = None       # "guard" | "judge" | None
+    # RCA 2 F-H1: the guard's own unsafe-content category when the harm head fires (config
+    # L1_HARM_REPORT_CATEGORY), so alerts can be routed / thresholded per category by policy.
+    harm_category: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -276,6 +279,7 @@ class L1Result:
             "safety_score": self.safety_score,
             "harm_score": self.harm_score,
             "harm_source": self.harm_source,
+            "harm_category": self.harm_category,
         }
 
 
@@ -394,9 +398,15 @@ class L4Result:
     # capability, whether the user requested the action, sink parameters and where each
     # came from. Empty under the legacy / source_trust ladders.
     action: dict = field(default_factory=dict)
+    # RCA 2 F-A1..F-A3 (2026-10-19): the call is held because it needs the USER'S approval (delegated
+    # authority, an unrequested message, a destination taken from third-party data) -- distinct from a
+    # hard block of an attack. should_execute is False either way; integrators can surface the
+    # confirmation instead of failing the task, and evaluations count the two apart.
+    requires_confirmation: bool = False
 
     def to_dict(self) -> dict:
         return {
+            "requires_confirmation": self.requires_confirmation,
             "action": self.action,
             "score": self.score,
             "threat_class": self.threat_class,
@@ -470,10 +480,13 @@ class L5Result:
     # violation count and provenance match ratio, all of which layer5.py
     # already computes and then collapses into a constant floor.
     confidence: float = 0.0
+    # RCA 2 F-L5: P(Unsafe) of the RESPONSE from the safety guard (config.L5_HARM_CHECK), None when off.
+    harm_score: float | None = None
 
     def to_dict(self) -> dict:
         return {
             "score": self.score,
+            "harm_score": self.harm_score,
             "leak_score": self.leak_score,
             "policy_score": self.policy_score,
             "provenance_best_ratio": self.provenance_best_ratio,

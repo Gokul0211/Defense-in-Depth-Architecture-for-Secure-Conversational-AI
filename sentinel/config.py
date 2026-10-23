@@ -477,6 +477,18 @@ L2_SHORT_DOC_JUDGE = os.getenv("L2_SHORT_DOC_JUDGE", "false").lower() == "true"
 L2_SHORT_DOC_JUDGE_BAND = (float(os.getenv("L2_SHORT_DOC_JUDGE_LO", "0.10")),
                            float(os.getenv("L2_SHORT_DOC_JUDGE_HI", "0.90")))
 
+# ADDRESSEE MODEL in L2 (v3 Phase 2; sentinel/core/addressee_model.py). "off" (shipped) | "short"
+# (third-party text < 600 chars) | "all". A SECOND, independent detector: the max-over-sentences
+# probability that the text addresses the AI, on its OWN benign-only anchors, mapped onto the
+# scoring bin's axis (its WARN -> the bin's WARN, its BLOCK -> the bin's BLOCK) and united with the
+# bin's score by max -- so the existing scorer, its anchors and every number measured on it are
+# unchanged when the flag is off, and a document is held when EITHER detector says so (union FPR
+# <= the sum of the two budgets). Anchors are derived on benign news paragraphs + benign AgentDojo
+# tool outputs, md5-even halves (scratch/rca/v3/c01_adr_anchors.py); unset -> ADR stays inert.
+L2_ADR = os.getenv("L2_ADR", "off").strip().lower()
+L2_ADR_WARN_THRESHOLD = float(os.environ["L2_ADR_WARN_THRESHOLD"]) if os.getenv("L2_ADR_WARN_THRESHOLD") else None
+L2_ADR_BLOCK_THRESHOLD = float(os.environ["L2_ADR_BLOCK_THRESHOLD"]) if os.getenv("L2_ADR_BLOCK_THRESHOLD") else None
+
 # app.py compares tool-output L2 RAW against WARN 0.50 (owed since 2026-09-20). True =
 # publish it on the shared axis via l2_shared_score. Off until measured on live traffic:
 # it moves live blocking (legacy anchor 0.3729 -> more WARNs; doc prose anchor 0.25 ->
@@ -490,6 +502,8 @@ L2_SHARED_AXIS = (os.getenv("L2_SHARED_AXIS", "").lower() == "true") or L2_SHARE
 # Deployable cross-layer SCORE fusion (core/pipeline_fusion.py): "off" (shipped) | "warn" |
 # "warn_block". Frozen logistic fitted on sentinel_bench mining_set, alarm anchors
 # split-conformal on the benign multi-layer arm (sentinel/eval/fit_pipeline_fusion.py).
+# DEPRECATED (2026-10-21, scratch/rca/v5/PHASE1_FUSION.md): at its shipped threshold it detects 0/170 SPLIT-v2
+# attacks, and no score-fusion rule beat the best single layer on real benign traffic. Kept for reproduction only.
 PIPELINE_FUSION = os.getenv("PIPELINE_FUSION", "off").strip().lower()
 
 # Retrieval relevance floor (B-3). 0.0 = off (shipped behaviour).
@@ -628,12 +642,28 @@ L2_BLOCK_THRESHOLD = float(os.getenv("L2_BLOCK_THRESHOLD", "0.600"))
 # BIPIA benign 0.0133 overall (code 0.06, 3/50), BIPIA malicious recall 0.636 (500,
 # disjoint from the scorer's dev set) -- vs the legacy L2 on the SAME samples at its own
 # anchor: recall 0.148 at FPR 0.040. Judge off; the doc axis never reads L1.
+#
+# RE-DERIVED 2026-10-18 (v3 code review, scratch/rca/v3/d03_l2_cred_anchor.py) -- THE PROSE ANCHOR
+# WAS SET BY A REGEX BUG. 0.250618 is a hair above 0.25, which is exactly what ONE of the four
+# dangerous-code families adds on its own (threat = 1 - (1-base)(1-0.25)). The `credential` family
+# was case-insensitive with no word boundary, so "secretary of state", "secret ballot" and "tokens
+# of appreciation" counted as credential access: 8.9 % of the benign pipeline arm's documents and
+# enough news articles that the alpha-0.05 quantile landed on that floor. With the family restricted
+# to credential ACCESS forms (L2_DANGER_CREDENTIAL_STRICT), the same records, the same md5 halves and
+# the same Mondrian rule give (the old figures reproduce exactly):
+#   prose WARN 0.250618 -> 0.019682   code WARN 0.644572 -> 0.632877   code BLOCK 0.776558 -> 0.697139
+#   BIPIA malicious recall 0.636 -> 0.694   BIPIA benign FPR 0.0133 -> 0.0100   AUROC 0.9199 -> 0.9262
+#   news held-out FPR 0.0234 -> 0.0201      WildChat-code held-out FPR (WARN) 0.0522 -> 0.0304
+#   cost: WildChat-code held-out FPR at the code BLOCK anchor 0.0043 -> 0.0174 (4 of 230)
+# The short bin's anchors are set by the AgentDojo tool-output source (0.9997, PIGuard-saturated),
+# where 1 of 115 outputs had a credential hit; they are kept and owe a re-derivation (R-026 re-run).
+L2_DANGER_CREDENTIAL_STRICT = os.getenv("L2_DANGER_CREDENTIAL_STRICT", "true").lower() == "true"
 L2_DOCUMENT_THREAT_WARN_THRESHOLD = float(
-    os.getenv("L2_DOCUMENT_THREAT_WARN_THRESHOLD", "0.250618"))
+    os.getenv("L2_DOCUMENT_THREAT_WARN_THRESHOLD", "0.019682" if L2_DANGER_CREDENTIAL_STRICT else "0.250618"))
 L2_DOCUMENT_THREAT_WARN_THRESHOLD_CODE = float(
-    os.getenv("L2_DOCUMENT_THREAT_WARN_THRESHOLD_CODE", "0.644572"))
+    os.getenv("L2_DOCUMENT_THREAT_WARN_THRESHOLD_CODE", "0.632877" if L2_DANGER_CREDENTIAL_STRICT else "0.644572"))
 L2_DOCUMENT_THREAT_BLOCK_THRESHOLD_CODE = float(
-    os.getenv("L2_DOCUMENT_THREAT_BLOCK_THRESHOLD_CODE", "0.776558"))
+    os.getenv("L2_DOCUMENT_THREAT_BLOCK_THRESHOLD_CODE", "0.697139" if L2_DANGER_CREDENTIAL_STRICT else "0.776558"))
 
 
 def _doc_axis(metadata: dict | None):
@@ -844,6 +874,25 @@ L5_PROVENANCE_MIN_IDENTIFIER_LEN = int(os.getenv("L5_PROVENANCE_MIN_IDENTIFIER_L
 # oldest-first retention, since earlier-ingested context is what a later
 # output is most likely to be leaking.
 MAX_TRACKED_SENSITIVE_VALUES = int(os.getenv("MAX_TRACKED_SENSITIVE_VALUES", "512"))
+
+# L5 CONTROL-CHANNEL PROVENANCE (v3 P1.2, 2026-10-18). A value the USER typed in their own turns
+# (the recipient they asked to e-mail, their own phone number) is not a disclosure when the reply
+# repeats it: it is not scored and not redacted. Values from third-party content or of unknown
+# origin are scored exactly as before. Measured on the benign pipeline arm (v3 a02): 260 of 260
+# e-mail "PII" findings in 133 of 529 benign sessions were the address the user had typed.
+# No effect on AgentLeak (its harness supplies no user turns).
+L5_USER_PROVENANCE = os.getenv("L5_USER_PROVENANCE", "true").lower() == "true"
+# Numeric PII must stand alone: a 12-16 digit run that is part of a decimal number or a URL/path
+# token is not an identifier (v3 a02: an "Aadhaar" inside a Google-Maps URL, a "card" in the digits
+# of sqrt(2)); card numbers must also pass the Luhn checksum. AgentLeak has no card/Aadhaar matches;
+# custom_l5's 5 card numbers all pass Luhn (v3 a05).
+L5_PII_VALIDITY = os.getenv("L5_PII_VALIDITY", "true").lower() == "true"
+# The output-policy verifier matched each word of a disclaimer CONDITION as a SUBSTRING anywhere in
+# the response ("interest" in "interesting", "rates" in "demonstrates"), so any long text tripped
+# "interest rates" / "medical diagnosis". With whole-word phrase matching (v3 code review, d02):
+# AgentLeak benign policy hits 121 -> 17 (108 of AgentLeak's 269 benign L5 false positives were
+# policy-only), WildChat 8 -> 0, Alpaca 5 -> 5 (genuine "medical diagnosis" phrases).
+L5_POLICY_PHRASE_MATCH = os.getenv("L5_POLICY_PHRASE_MATCH", "true").lower() == "true"
 
 # Layer 4 — Decision Threshold (InjecAgent-calibrated, additive ceiling)
 # Youden's J-optimal on audit_tool_call()'s final_score once tool-response
@@ -1300,6 +1349,15 @@ L4_SINK_CONTEXT_MODE = os.getenv("L4_SINK_CONTEXT_MODE", "cue_strong").strip().l
 # and which arguments are checked (sinks = destinations only; all_args = every argument of a
 # side-effect call). Defaults reproduce R-031b / the S3V runs.
 L4_SINK_CONTEXT_SPAN = os.getenv("L4_SINK_CONTEXT_SPAN", "block").strip().lower()        # adopted 2026-09-26 (R-031d)
+# L4_SINK_CONTEXT_MODE="adr" (v3): an argument value lies inside a sentence window the ADDRESSEE
+# model scores >= this tau (window level, benign sink windows only, R-031b protocol;
+# scratch/rca/v3/c02_l4_adr_windows.py), OR inside a strong-cue block as in cue_strong. Unset -> the
+# ADR half is inert and "adr" behaves exactly like cue_strong with span=block.
+L4_SINK_CONTEXT_ADR_TAU = float(os.environ["L4_SINK_CONTEXT_ADR_TAU"]) if os.getenv("L4_SINK_CONTEXT_ADR_TAU") else None
+# Live-agent tool outputs (sentinel/eval/agentdojo_live.py, config "dida_adr"): sentence windows the
+# ADDRESSEE model scores >= this tau are REDACTED (surgical), instead of withholding the whole
+# output when L1 reaches BLOCK. Window level, benign AgentDojo tool-output windows only.
+L4B_ADR_TAU = float(os.environ["L4B_ADR_TAU"]) if os.getenv("L4B_ADR_TAU") else None
 L4_SINK_CONTEXT_SCOPE = os.getenv("L4_SINK_CONTEXT_SCOPE", "all_args").strip().lower()
 # 2026-09-26 (off by default; see action_policy / pipeline_sim): hold unrequested sensitive reads
 # named by third-party content; and make the simulator BLOCK when L4 refuses execution, as app.py does.
@@ -1307,6 +1365,9 @@ L4_HOLD_SENSITIVE_READS = os.getenv("L4_HOLD_SENSITIVE_READS", "true").lower() =
 PIPELINE_L4_ENFORCE = os.getenv("PIPELINE_L4_ENFORCE", "true").lower() == "true"        # adopted 2026-09-26 (= app.py)
 # the simulator ignores `name(args)` found on a source-code line (see pipeline_sim._in_code_line)
 PIPELINE_SIM_CODE_FILTER = os.getenv("PIPELINE_SIM_CODE_FILTER", "true").lower() == "true"        # simulator bug fix 2026-09-26
+# The simulated agent may call only registered tools (pipeline_sim._registered_tools, v3 P1.1). Off
+# reproduces every run before 2026-10-18.
+PIPELINE_SIM_TOOL_REGISTRY = os.getenv("PIPELINE_SIM_TOOL_REGISTRY", "true").lower() == "true"        # simulator bug fix 2026-10-18
 # Under "action": ask the hosted judge (ACTION_ALIGNMENT_V1) whether a side-effect call the
 # lexicon could not match to the user's request is nevertheless authorised. Costs one
 # judge call per such call only.
@@ -1350,3 +1411,129 @@ def pipeline_decision(layer_scores: dict, rule_block: bool = False, rule_warn: b
 # How the guard enters L3's score in guard mode: "replace" (takes harm_alignment's
 # place and weight; geometry and escalation kept) or "guard_only". B-009 decides.
 L3_GUARD_COMBINE = os.getenv("L3_GUARD_COMBINE", "replace").strip().lower()
+
+# ---------------------------------------------------------------------------------------------
+# v3 CODE-REVIEW FIXES (2026-10-18; scratch/rca/v3/CODE_REVIEW.md). Every flag defaults ON; set it
+# to "false" to reproduce the behaviour of every run before 2026-10-18.
+# ---------------------------------------------------------------------------------------------
+# L1 Tier 1 + the addressee lexicon: spoofed control-channel markers (core/control_spoof.py).
+# Tier 1 matched only the bare "[SYSTEM]" tag; "[SYSTEM NOTE] ...", "[ADMIN OVERRIDE: ...]",
+# "###(system_message)", "Developer Mode enabled" went through.
+L1_SPOOF_MARKERS = os.getenv("L1_SPOOF_MARKERS", "true").lower() == "true"
+ADDRESSEE_SPOOF_CUES = os.getenv("ADDRESSEE_SPOOF_CUES", "true").lower() == "true"
+# L2: a THIRD-PARTY document that impersonates the control channel is quarantined (threat raised to
+# its bin's BLOCK anchor). Data has no business carrying a system / admin message to the assistant.
+L2_SPOOF_MARKERS = os.getenv("L2_SPOOF_MARKERS", "true").lower() == "true"
+# L1: every base64 / hex candidate is decoded and checked, not only the first decodable one (an
+# attacker could lead with a harmless blob). Capped per input.
+L1_DECODE_ALL_CANDIDATES = os.getenv("L1_DECODE_ALL_CANDIDATES", "true").lower() == "true"
+# L1 judge: the judged text is wrapped in <text> ... </text>; a text containing "</text>" closed the
+# wrapper and could address the judge directly. The tags inside the text are neutralised.
+L1_JUDGE_ESCAPE_DELIMITERS = os.getenv("L1_JUDGE_ESCAPE_DELIMITERS", "true").lower() == "true"
+# L3 (decoded-guard "replace" mode): only a SHORT cipher-preamble turn is treated as structure and
+# zeroed. Before, any turn containing the words "mapping" and "substitut" in a cipher session scored
+# 0 -- a harmful request could hide behind them. Every tom-gibbs header is 20-29 words. 0 = no bound
+# (the behaviour before 2026-10-18).
+L3_PREAMBLE_MAX_WORDS = int(os.getenv("L3_PREAMBLE_MAX_WORDS", "40"))
+# L4: an IDENTIFIER sink value (address, IBAN, URL, phone, id) counts as user-supplied only when it
+# appears in the user's turns EXACTLY (case / whitespace / separators folded) -- the rule L5 already
+# applies to identifiers (sensitive_value_extractor.match_policy_for). Fuzzy matching at 0.85 credited
+# an attacker IBAN one digit off the user's own to the user, overriding even a quarantined source.
+L4_SINK_EXACT_IDENTIFIERS = os.getenv("L4_SINK_EXACT_IDENTIFIERS", "true").lower() == "true"
+# L4: reasoning red flags with word boundaries, and "model attributing UNREQUESTED actions to the
+# user" only when the action was in fact not requested ("the user wants me to book the hotel" is
+# ordinary chain of thought when the user asked for exactly that).
+L4_REASONING_FLAGS_STRICT = os.getenv("L4_REASONING_FLAGS_STRICT", "true").lower() == "true"
+
+# ---------------------------------------------------------------------------------------------
+# RCA 2 FIXES (2026-10-19; scratch/rca/v3/RCA_2.md, plan_fixing.md). Each flag names its plan item.
+# Setting a flag to its "off" value reproduces every run before 2026-10-19.
+# ---------------------------------------------------------------------------------------------
+# F-E4: the pipeline simulator parses [Turn N] / [Document] / [User Query] markers and tool names
+# robustly (case, zero-width, confusables); content is not normalised.
+PIPELINE_SIM_ROBUST_PARSE = os.getenv("PIPELINE_SIM_ROBUST_PARSE", "true").lower() == "true"
+# F-E1: the AgentDojo replay models /sentinel/agent/tool_response withholding (raw L1 >= BLOCK).
+AGENTDOJO_REPLAY_WITHHOLD = os.getenv("AGENTDOJO_REPLAY_WITHHOLD", "true").lower() == "true"
+# F-E2: L2 on composite corpora is evaluated per extracted document with document labels.
+L2_EVAL_DOCUMENT_LEVEL = os.getenv("L2_EVAL_DOCUMENT_LEVEL", "true").lower() == "true"
+# F-E3: red-team success = the deployed decision ("deployed") or the historical max layer score ("max_layer").
+REDTEAM_SUCCESS = os.getenv("REDTEAM_SUCCESS", "deployed").strip().lower()
+# F-T3: Tier 3 on TOOL OUTPUTS reads their prose fields only ("fields") or the whole output ("whole").
+L1_TOOL_OUTPUT_TIER3 = os.getenv("L1_TOOL_OUTPUT_TIER3", "fields").strip().lower()
+# F-A0: the OpenAI-compatible proxy audits tool_calls in the upstream reply with L4. "strip" removes a
+# refused call from the reply and says so in the content; "block" refuses the whole reply (403).
+PROXY_AUDIT_TOOL_CALLS = os.getenv("PROXY_AUDIT_TOOL_CALLS", "true").lower() == "true"
+PROXY_TOOL_CALL_ACTION = os.getenv("PROXY_TOOL_CALL_ACTION", "strip").strip().lower()
+# F-A1: "requested" lexicon v2 (lexicon gaps found in RCA 1) and delegation detection.
+L4_REQUESTED_LEXICON_V2 = os.getenv("L4_REQUESTED_LEXICON_V2", "true").lower() == "true"
+L4_DELEGATION_CONFIRM = os.getenv("L4_DELEGATION_CONFIRM", "true").lower() == "true"
+# F-A2: an UNREQUESTED communication (and an unrequested egress whose URL carries data) is held for the
+# user's confirmation instead of executing with a WARN. MEASURED (scratch/rca/v3/m01_replay_configs.json,
+# AgentDojo replay, 60 pairs x 4 suites): direct executions 131 -> 101 of 190, benign AgentDojo tasks needing
+# confirmation 5 -> 5 (no benign cost, after the F-A1 lexicon fixes). ON.
+L4_HOLD_UNREQUESTED_COMMUNICATE = os.getenv("L4_HOLD_UNREQUESTED_COMMUNICATE", "true").lower() == "true"
+# F-A3: a TRANSFER / COMMUNICATE destination that first appears in third-party data and is not named by the
+# user needs the user's confirmation, for the listed capabilities. Default decided by the replay measurement.
+# MEASURED (m01): TRANSFER -> direct executions 101 -> 68, benign confirmations 5 -> 7 (banking bills paid to an
+# IBAN read from a file); adding COMMUNICATE -> 34 executions but 22 benign confirmations (15 of 21 Slack tasks
+# send to recipients found in data) -- too costly as a default. Default TRANSFER.
+L4_DATA_SINK_CONFIRM = os.getenv("L4_DATA_SINK_CONFIRM", "TRANSFER").strip().upper()   # "OFF" or capabilities, e.g. "TRANSFER" / "TRANSFER,COMMUNICATE"
+# F-A4: an instruction block opened by a STRONG addressee cue ends at the injected text's boundary
+# (closing quote / blank line / end of field, capped) instead of a fixed +400 characters.
+L4_SINK_CONTEXT_SPAN_END = os.getenv("L4_SINK_CONTEXT_SPAN_END", "boundary").strip().lower()
+L4_SINK_CONTEXT_SPAN_MAX = int(os.getenv("L4_SINK_CONTEXT_SPAN_MAX", "1200"))
+# F-L5: response-side harm check in L5 with the safety guard. "off" | "report" (adds harm_score, no decision
+# change) | "enforce" (harm >= L5_HARM_TAU raises the leak score to WARN). Off by default: it costs a guard
+# pass per reply and has no validation corpus yet (MHJ replies are gated, RCA 2 §H).
+L5_HARM_CHECK = os.getenv("L5_HARM_CHECK", "off").strip().lower()
+L5_HARM_TAU = float(os.getenv("L5_HARM_TAU", os.getenv("L1_HARM_TAU", "0.6737")))
+# F-H1: report the guard's harm CATEGORY when the harm head fires (one extra forward, flagged prompts only).
+L1_HARM_REPORT_CATEGORY = os.getenv("L1_HARM_REPORT_CATEGORY", "true").lower() == "true"
+# RCA 2 fix validation: the ignore/override addressee cue's left edge treats "_" as a separator, so
+# identifier-embedded injections ("External_Ignore your previous ...") are seen (ignore_previous block recall
+# 147 -> 199 of 295 sink values, benign 0/57 unchanged; scratch/rca/v3/m02_span_boundary.json).
+ADDRESSEE_UNDERSCORE_BOUNDARY = os.getenv("ADDRESSEE_UNDERSCORE_BOUNDARY", "true").lower() == "true"
+# RCA 2 fix validation: a TOOL OUTPUT carrying a STRONG addressee cue (text addressed to the AI) is an indirect
+# injection -> L1 Tier 1 for source="tool_output" (withheld by /sentinel/agent/tool_response). Replaces the
+# accidental protection Tier-3 saturation gave before F-T3 (scratch/rca/v3/m01_replay_configs.json).
+L1_TOOL_OUTPUT_ADDRESSEE = os.getenv("L1_TOOL_OUTPUT_ADDRESSEE", "true").lower() == "true"
+# RCA 2 fix validation: extend F-A2 to UNREQUESTED WRITE calls (reservations, record changes the user did not ask
+# for). MEASURED (m01, config "final_w"): direct executions 68 -> 55 of 190, benign AgentDojo unchanged (0 blocked,
+# 7 tasks needing confirmation). ON.
+L4_HOLD_UNREQUESTED_WRITE = os.getenv("L4_HOLD_UNREQUESTED_WRITE", "true").lower() == "true"
+# RCA 2 fix validation (m03): L4's "action named in third-party content" check compares on canonical text
+# (zero-width stripped, confusables folded), so a homoglyph-obfuscated tool name in an injection still counts.
+L4_NAMED_IN_CANONICAL = os.getenv("L4_NAMED_IN_CANONICAL", "true").lower() == "true"
+
+# ACTION AUTHORIZATION (scratch/rca/v3/ARCHITECTURE_NEXT.md v2, step 1; sentinel/layers/layer4_agentic/authz/).
+# Every side-effecting call is checked against the user's intent contract and a sink-class x source-trust
+# matrix over its arguments' lineage; the stricter of this and L4's existing verdict wins.
+# ON by default since 2026-10-23 (user decision). MEASURED (effect-level AgentDojo replay through the ToolGate,
+# results.md §16.3): held-out `direct` attack effects 59 -> 3 of 398 when the user declines confirmations (83 if
+# the user approves every one). COST: 7 -> 17 of 97 benign tasks ask the user for a confirmation (0 hard-blocked;
+# utility unchanged when the user approves). Set L4_AUTHZ=false for the RCA-2 behaviour.
+L4_AUTHZ = os.getenv("L4_AUTHZ", "true").lower() == "true"
+# "llm" (default): the contract is generated from the user's text + tool schema only (the proxy registers it from the
+# request's `tools`; authz.set_contract elsewhere) and cached. When no contract is registered for the current user
+# text -- no tool schema, the LLM unavailable or failing -- L4 falls back to "lexicon": requested actions from its
+# verb lexicon, no call bounds or literal bindings (offline). "lexicon" forces the fallback everywhere.
+L4_AUTHZ_CONTRACT = os.getenv("L4_AUTHZ_CONTRACT", "llm").strip().lower()
+L4_AUTHZ_CONTRACT_MODEL = os.getenv("L4_AUTHZ_CONTRACT_MODEL", "openai/gpt-oss-120b").strip()
+L4_AUTHZ_CONTRACT_CACHE = os.getenv("L4_AUTHZ_CONTRACT_CACHE", "").strip()
+# Total time budget for generating one contract; past it the call uses the lexicon fallback (safe degradation).
+L4_AUTHZ_CONTRACT_TIMEOUT_S = float(os.getenv("L4_AUTHZ_CONTRACT_TIMEOUT_S", "15"))
+# Trace links / e-mail addresses / IBANs inside message bodies and other content arguments.
+L4_AUTHZ_CONTENT_IDENTIFIERS = os.getenv("L4_AUTHZ_CONTENT_IDENTIFIERS", "true").lower() == "true"
+# Outbound inspection (ARCHITECTURE_NEXT.md v2 §6.2): a credential (password, security code, card number) this session
+# READ may leave in a message / transfer only if the user typed it or asked for that kind of value to be sent (else
+# block); other personal identifiers (passport, ID, account number) need confirmation.
+L4_AUTHZ_SENSITIVE_EGRESS = os.getenv("L4_AUTHZ_SENSITIVE_EGRESS", "true").lower() == "true"
+# Global policy: a transfer amount above this that the user did not state needs confirmation ("" = no limit).
+_l4_tl = os.getenv("L4_AUTHZ_TRANSFER_CONFIRM_ABOVE", "1000").strip()
+L4_AUTHZ_TRANSFER_CONFIRM_ABOVE = float(_l4_tl) if _l4_tl else None
+# Operator trust declarations (which connectors are systems of record); "" = the AgentDojo defaults.
+L4_AUTHZ_TRUST_POLICY_FILE = os.getenv("L4_AUTHZ_TRUST_POLICY_FILE", "").strip()
+# Execution-boundary enforcement (sentinel/enforce/gate.py): the HMAC key for decision tokens. Unset -> a random key
+# per process (an in-process ToolGate works; a separate gate process needs the shared key set explicitly).
+DIDA_DECISION_KEY = os.getenv("DIDA_DECISION_KEY", "").strip() or __import__("secrets").token_hex(32)
+DIDA_DECISION_TTL_S = int(os.getenv("DIDA_DECISION_TTL_S", "300"))

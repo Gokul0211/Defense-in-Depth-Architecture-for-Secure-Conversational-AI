@@ -99,6 +99,31 @@ def _provenance_leak_findings(
     return findings, best_ratio
 
 
+def _user_supplied_text(session) -> str:
+    """The user's own turns in this session (config.L5_USER_PROVENANCE), or "" when off.
+
+    Read from both places the request paths record user text: `turn_provenance` (proxy, demo,
+    pipeline simulator) and `chat_history` (the /sentinel/chat endpoint). A PII value found here
+    was supplied by the user, so a reply repeating it discloses nothing to them.
+    """
+    import sentinel.config as cfg
+
+    if not getattr(cfg, "L5_USER_PROVENANCE", False) or session is None:
+        return ""
+    parts = [str(t.get("text", "")) for t in (getattr(session, "turn_provenance", None) or [])]
+    parts += [str(m.get("content", "")) for m in (getattr(session, "chat_history", None) or [])
+              if m.get("role") == "user"]
+    return "\n".join(p for p in parts if p)
+
+
+def _user_supplied_text_list(session) -> list[str]:
+    """The user's own turns, in order (for the response-side harm check's context)."""
+    parts = [str(t.get("text", "")) for t in (getattr(session, "turn_provenance", None) or [])]
+    parts += [str(m.get("content", "")) for m in (getattr(session, "chat_history", None) or [])
+              if m.get("role") == "user"]
+    return [p for p in parts if p]
+
+
 def _canary_leaked(text: str) -> bool:
     """Check for the canary token both in plaintext and hidden inside a
     base64-encoded span — a model (or attacker) forced to redact/obfuscate
@@ -122,11 +147,16 @@ async def layer5_scan_output(
     """
     if not response_text:
         return L5Result(0.0, "CLEAN", [], 0.0, [], "Empty response", []), response_text
-        
+
     reasons = []
-    
+
+    # Session state: the provenance check (step 4) needs the session's tracked third-party
+    # values, and the control-channel exemption (v3 P1.2) needs the user's own turns.
+    from sentinel.core.threat_bus import threat_bus
+    session = await threat_bus.get_session(session_id)
+
     # 1. PII Scan
-    pii_findings, sanitized_text = scan_for_pii(response_text)
+    pii_findings, sanitized_text = scan_for_pii(response_text, user_text=_user_supplied_text(session))
     if pii_findings:
         reasons.append(f"Redacted {len(pii_findings)} PII instances")
         
@@ -158,8 +188,6 @@ async def layer5_scan_output(
     # nothing pulls in layer5_output, but importing at call time keeps
     # this file's import graph simple and matches how session lookups are
     # already done at the app.py call sites, not inside layer functions).
-    from sentinel.core.threat_bus import threat_bus
-    session = await threat_bus.get_session(session_id)
     provenance_findings, provenance_best_ratio = _provenance_leak_findings(
         sanitized_text, session.tracked_sensitive_values
     )
@@ -191,6 +219,22 @@ async def layer5_scan_output(
     # splitting the components moves no already-published number.
     threat_score = max(leak_score, policy_score)
 
+    # RESPONSE-SIDE HARM (RCA 2 F-L5, config.L5_HARM_CHECK). Harm that never appears in the user's words
+    # (MHJ: 53/110 attacks with no visible intent in the user turns) becomes observable in the reply.
+    # "report" attaches the guard's P(Unsafe) of the reply (in context of the last user turn) without
+    # changing any decision; "enforce" raises the score to WARN when it reaches L5_HARM_TAU.
+    import sentinel.config as _c5
+    harm_score = None
+    mode = getattr(_c5, "L5_HARM_CHECK", "off")
+    if mode in ("report", "enforce"):
+        from sentinel.core.safety_guard import safety_score_response
+        user_turns = [t for t in _user_supplied_text_list(session)] if session is not None else []
+        harm_score = safety_score_response(user_turns[-1] if user_turns else "", response_text)
+        if harm_score is not None and harm_score >= getattr(_c5, "L5_HARM_TAU", 1.0):
+            reasons.append(f"Response-side harm check: P(unsafe)={harm_score:.2f}")
+            if mode == "enforce":
+                threat_score = max(threat_score, LEAK_EVIDENCE_SCORE)
+
     # Threat-class attribution, most severe first.
     #
     # BUG FIX (2026-09-18, Phase 5 Stage 0a / 3B.5): `policy_violations`
@@ -206,12 +250,15 @@ async def layer5_scan_output(
     # Leak evidence now outranks policy; exfiltration's position at the top
     # of the ladder is unchanged.
     threat_class = "CLEAN"
+    harmful_out = (mode == "enforce" and harm_score is not None and harm_score >= getattr(_c5, "L5_HARM_TAU", 1.0))
     if exfil_score >= OUTPUT_EXFILTRATION_THRESHOLD:
         threat_class = "OUTPUT_EXFILTRATION"
     elif pii_findings or provenance_findings:
         threat_class = "PII_LEAK"
     elif policy_violations:
         threat_class = "POLICY_VIOLATION"
+    elif harmful_out:
+        threat_class = "HARMFUL_OUTPUT"
 
     reason_str = " | ".join(reasons) if reasons else "Response clean."
 
@@ -226,6 +273,7 @@ async def layer5_scan_output(
         leak_score=leak_score,
         policy_score=policy_score,
         provenance_best_ratio=provenance_best_ratio,
+        harm_score=harm_score,
         confidence=_continuous_confidence(
             exfil_score=exfil_score,
             n_pii=len(pii_findings),

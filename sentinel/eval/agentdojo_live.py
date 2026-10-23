@@ -469,7 +469,7 @@ def make_dida_elements():
                 text = self.output_formatter(out)
                 if text.strip():
                     with _defense():                             # /sentinel/agent/tool_response
-                        l1r = _run(layer1_check(text, harm_head=False))
+                        l1r = _run(layer1_check(text, harm_head=False, source="tool_output"))
                         chunk = _run(layer2_ingest(text, source="tool_response", session_id=sid))
                         if cfg.l2_tool_response_flagged(chunk["metadata"]):
                             session.l2_flagged_chunks.append(chunk)

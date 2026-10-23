@@ -164,6 +164,56 @@ class _Guard:
             return {"p_safe": 1.0, "p_unsafe": 0.0, "p_controversial": 0.0, "head": None}
         return self._readout([self._piece(t, _MAX_TURN_TOKENS) for t in turns])
 
+    def _clip(self, text: str, cap: int) -> str:
+        ids = self._ids(text or "")
+        if len(ids) <= cap:
+            return text or ""
+        h = cap // 2
+        return self.tok.decode(ids[:h]) + " ... " + self.tok.decode(ids[-h:])
+
+    def _next_token(self, text: str, label_ids: list[int]) -> list[float]:
+        """Renormalised next-token distribution over `label_ids` after `text` (no prefix cache)."""
+        torch = self.torch
+        ids = self._ids(text)
+        # CPU tensor, exactly as _readout passes it: on a GPU the model is a split-device wrapper that places
+        # inputs itself and has no .parameters() (RCA 2 fix validation m03 caught the first version failing).
+        with torch.no_grad():
+            out = self.model(torch.tensor([ids]), attention_mask=torch.ones(1, len(ids), dtype=torch.long))
+        return torch.softmax(torch.log_softmax(out.logits[0, -1].float().cpu(), -1)[label_ids], -1).tolist()
+
+    def score_response(self, prompt: str, response: str) -> dict:
+        """RESPONSE moderation (RCA 2 F-L5): the model's native assistant-response template -- "is THE
+        LAST ASSISTANT's response unsafe" -- read as P(Unsafe) exactly like the prompt mode. This is what
+        makes harm that never appears in the user's words (MHJ hidden intent) observable at L5."""
+        text = self.tok.apply_chat_template(
+            [{"role": "user", "content": self._clip(prompt, _MAX_TURN_TOKENS)},
+             {"role": "assistant", "content": self._clip(response, _MAX_PAYLOAD_TOKENS)}],
+            tokenize=False, add_generation_prompt=True) + "Safety:"
+        p = self._next_token(text, self.label_ids)
+        return {"p_safe": p[0], "p_unsafe": p[1], "p_controversial": p[2], "head": None}
+
+    def category_prompt(self, text: str) -> str | None:
+        """The guard's own category for an UNSAFE prompt (RCA 2 F-H1): next-token readout after the forced
+        prefix "Safety: Unsafe\\nCategories:", over the first token of each category the template lists."""
+        if not hasattr(self, "_cat_ids"):
+            ids = {}
+            for c in _CATEGORIES:
+                t = self._ids(" " + c)
+                if t and t[0] not in ids.values():
+                    ids[c] = t[0]
+            self._cat_ids = ids
+        names = list(self._cat_ids)
+        full = self.tok.apply_chat_template([{"role": "user", "content": self._clip(text, _MAX_PAYLOAD_TOKENS)}],
+                                            tokenize=False, add_generation_prompt=True)
+        p = self._next_token(full + "Safety: Unsafe\nCategories:", [self._cat_ids[n] for n in names])
+        return names[max(range(len(p)), key=p.__getitem__)] if p else None
+
+
+# The guard template's own category list (prompt mode adds Jailbreak).
+_CATEGORIES = ["Violent", "Non-violent Illegal Acts", "Sexual Content or Sexual Acts", "PII",
+               "Suicide & Self-Harm", "Unethical Acts", "Politically Sensitive Topics",
+               "Copyright Violation", "Jailbreak"]
+
 
 def _load_head():
     """The frozen hidden-state head, or None (zero-shot readout)."""
@@ -312,6 +362,43 @@ def safety_score_conversation(turns: list[str]) -> float | None:
         val = _pick(g.score_conversation(turns))
     except Exception as e:                                            # noqa: BLE001
         logger.warning(f"safety guard inference failed: {e}")
+        return None
+    if val is not None:
+        _memo_put(key, val)
+    return val
+
+
+def safety_score_response(prompt: str, response: str) -> float | None:
+    """P(Unsafe) of an assistant RESPONSE in the context of the user's prompt (RCA 2 F-L5). None if unavailable."""
+    g = get_guard()
+    if g is None or not response:
+        return None
+    key = ("r", prompt or "", response)
+    hit = _memo_get(key)
+    if hit is not None:
+        return hit
+    try:
+        val = g.score_response(prompt or "", response)["p_unsafe"]
+    except Exception as e:                                            # noqa: BLE001
+        logger.warning(f"safety guard response inference failed: {e}")
+        return None
+    _memo_put(key, val)
+    return val
+
+
+def harm_category_prompt(text: str) -> str | None:
+    """The guard's category for an unsafe prompt (RCA 2 F-H1). None if unavailable."""
+    g = get_guard()
+    if g is None or not text:
+        return None
+    key = ("cat", text)
+    hit = _memo_get(key)
+    if hit is not None:
+        return hit
+    try:
+        val = g.category_prompt(text)
+    except Exception as e:                                            # noqa: BLE001
+        logger.warning(f"safety guard category inference failed: {e}")
         return None
     if val is not None:
         _memo_put(key, val)

@@ -199,18 +199,59 @@ _VERBS = {
 }
 
 
+# LEXICON V2 (RCA 2 F-A1, config.L4_REQUESTED_LEXICON_V2). Every addition below is one of the AgentDojo
+# benign ground-truth calls v1 read as UNREQUESTED (RCA 1 §F5 / RCA 2 §C, 25 of 102): requests phrased
+# with an object between verb and target ("add also X to the participants", "add Alice to THAT channel",
+# "write them the following message", "send them back the difference") and plurals the \b-bounded v1
+# patterns missed ("websites", "links"). Declared from those phrasings' grammar, not fitted to scores.
+# "Within one sentence": any character but sentence punctuation -- except a dot INSIDE a token, so an e-mail
+# address or a domain ("john.doe@clientcorp.com") does not end the span (caught by tests/test_rca2_fixes.py).
+_IN_SENTENCE = r"(?:[^.?!\n]|\.(?=\S))"
+_VERBS_V2 = {
+    COMMUNICATE: rf"\badd\b{_IN_SENTENCE}{{0,80}}\bto\b{_IN_SENTENCE}{{0,40}}\b(channels?|events?|meetings?|participants?|calendars?|groups?|teams?|conversations?|threads?)\b"
+                 rf"|\bwrite\b{_IN_SENTENCE}{{0,40}}\bmessages?\b|\b(message|dm|e-?mail|text) (them|him|her|everyone|each|all|every)\b",
+    # "send 50 to ...", "send them €20": an amount after "send" (only consulted for money tools)
+    TRANSFER: r"\bsend (\w+ ){0,3}back\b|\breturn (the )?(money|difference|amount|rest)\b|\brefund\w*\b"
+              r"|\bsend\b(?:\s+\w+){0,2}\s+[$€£]?\d",
+    EGRESS: r"\b(websites|web ?pages|links|urls|sites|articles?|blog posts?)\b",
+}
+
+# DELEGATION (RCA 2 F-A1, config.L4_DELEGATION_CONFIRM). "Do the actions specified in the email", "follow the
+# instructions precisely", "do all the tasks on my TODO list at <url>": the USER hands authority to text in
+# third-party data -- exactly the shape an injection takes, so a call made under it is neither clearly
+# requested nor clearly an attack. It is held for the user's confirmation (requires_confirmation), never
+# auto-allowed and never reported as an attack. "Perform the following tasks: 1. ..." lists the tasks
+# itself and is not delegation.
+_DELEGATION = re.compile(
+    rf"\b(do|perform|complete|carry out|follow|execute|handle|take care of)\b(?:(?!\bfollowing\b){_IN_SENTENCE}){{0,40}}"
+    rf"\b(actions?|tasks?|instructions?|steps?|to-?dos?|requests?|items?)\b{_IN_SENTENCE}{{0,60}}"
+    r"\b(in|from|on|at|specified|listed|described|given|mentioned)\b"
+    r"|\bfollow (the|its|their|those|these|any|all|his|her) (instructions|steps|directions)\b"
+    r"|\bdo (what|whatever) (it|the \w+|they|he|she) (says?|asks?)\b", re.I)
+
+
+def user_delegates(text: str) -> bool:
+    import sentinel.config as cfg
+    return bool(getattr(cfg, "L4_DELEGATION_CONFIRM", False) and _DELEGATION.search(text or ""))
+
+
 def user_text(history: list[dict]) -> str:
     return "\n".join(str(t.get("content", "")) for t in (history or []) if t.get("role") == "user")
 
 
 def action_requested(tool_name: str, cap: str, text: str) -> tuple[bool, str]:
     """Does the user's text ask for this kind of action? (control-flow check)"""
+    import sentinel.config as cfg
     t = (text or "").lower()
     if cap == READ:
         return True, "read"
     pat = _VERBS.get(cap)
     if pat and re.search(pat, t):
         return True, f"user asks for {cap.lower()}"
+    if getattr(cfg, "L4_REQUESTED_LEXICON_V2", False):
+        pat2 = _VERBS_V2.get(cap)
+        if pat2 and re.search(pat2, t):
+            return True, f"user asks for {cap.lower()} (lexicon v2)"
     # the tool named in the user's own words ("reserve_hotel" -> "reserve" + "hotel")
     toks = [w for w in re.split(r"[_\W]+", (tool_name or "").lower()) if len(w) >= 4]
     if cap == WRITE and toks and sum(w in t for w in toks) >= max(1, len(toks) - 1):
@@ -226,8 +267,16 @@ def action_named_in(tool_name: str, chunks: list[dict], prose_form: bool = True)
     if len(name) < 4:
         return None
     forms = {name, name.replace("_", " ")} if prose_form else {name}
+    import sentinel.config as cfg
+    canon = getattr(cfg, "L4_NAMED_IN_CANONICAL", False)
     for c in chunks:
         text = (c.get("text") or "").lower()
+        if canon:
+            # RCA 2 fix validation (m03): an injected "get_employe<zero-width>e_DAta" with confusable letters
+            # names the tool to the agent but defeated the exact match, so an unrequested sensitive read got a
+            # WARN instead of a hold. Compare on zero-width-stripped, confusable-folded, lower-cased text.
+            from sentinel.eval.pipeline_sim import canonical_tool_name
+            text = canonical_tool_name(text)
         if any(f in text for f in forms):
             return c.get("chunk_id")
     return None
@@ -312,14 +361,35 @@ def window_injection_score(window: str) -> float | None:
     return s
 
 
+# End of a quoted field in a serialised tool output: a closing quote followed by , ) ] or }.
+_FIELD_END = re.compile(r"(?<!\\)['\"]\s*[,)\]}]")
+
+
 def _instruction_blocks(text: str) -> list[tuple[int, int]]:
     """Character spans of instructions addressed to the agent (R-031d, L4_SINK_CONTEXT_SPAN=block):
     every STRONG addressee cue opens a span that runs to the cue's end + 400 chars (the directive
     follows the cue); spans closer than 600 chars are merged (a template's opening and closing
     cues bracket its goal). A value counts only if it lies INSIDE a span -- a legitimate value
     that merely sits next to an injected block (AgentDojo puts both in the same page) does not."""
-    from sentinel.core.addressee import _STRONG
-    spans = sorted((m.start(), m.end() + 400) for p in _STRONG for m in p.finditer(text or ""))
+    from sentinel.core.addressee import strong_patterns, match_text
+    import sentinel.config as cfg
+    t = match_text(text)               # escapes neutralised, positions unchanged
+    boundary = getattr(cfg, "L4_SINK_CONTEXT_SPAN_END", "fixed") == "boundary"
+    cap = int(getattr(cfg, "L4_SINK_CONTEXT_SPAN_MAX", 1200))
+
+    def _end(m) -> int:
+        # RCA 2 F-A4: the span runs to the end of the text unit holding the cue -- the quoted field of a
+        # serialised tool output, or the paragraph -- capped at L4_SINK_CONTEXT_SPAN_MAX, instead of a fixed
+        # +400 chars. MEASURED (m02): no change on AgentDojo (the ignore_previous gap was a word-boundary bug,
+        # fixed in core/addressee.py, not span length); kept because a span no longer runs into the NEXT
+        # field of a serialised output, where a legitimate value could sit.
+        if not boundary:
+            return m.end() + 400
+        stops = [x.start() for x in _FIELD_END.finditer(t, m.end())][:1] + \
+                ([t.find("\n\n", m.end())] if t.find("\n\n", m.end()) != -1 else [])
+        return min(stops + [m.end() + cap]) if stops else m.end() + 400
+
+    spans = sorted((m.start(), _end(m)) for p in strong_patterns() for m in p.finditer(t))
     out = []
     for s, e in spans:
         if out and s - out[-1][1] <= 600:
@@ -379,8 +449,35 @@ def _instruction_context(v: str, chunks: list[dict]) -> str | None:
     return None
 
 
+def _fold_identifier(s: str) -> str:
+    """Case, whitespace and hyphen folding for identifier comparison ("DE89 3704-0044" ==
+    "de8937040044"). Dots, '@' and digits are kept: they are what distinguishes two identifiers."""
+    return re.sub(r"[\s\-]+", "", (s or "").lower())
+
+
+def _user_supplied(v: str, param_prov: dict, utext: str) -> bool:
+    """Was sink value `v` supplied by the user?
+
+    The provenance tracer answers with a fuzzy match (ratio >= 0.85). For an IDENTIFIER that is the
+    wrong question (config.L4_SINK_EXACT_IDENTIFIERS): an IBAN, address or URL one character off the
+    user's own is a DIFFERENT destination -- the typosquat an attacker plants -- yet it scored as
+    "user" and that verdict outranks every other source, including a quarantined chunk. Identifiers
+    therefore count as user-supplied only on exact (folded) containment in the user's turns; names
+    and free text keep the fuzzy rule. The same split L5 applies to tracked values
+    (sensitive_value_extractor.match_policy_for)."""
+    if param_prov.get("source") != SOURCE_EXPLICIT:
+        return False
+    import sentinel.config as cfg
+    if not getattr(cfg, "L4_SINK_EXACT_IDENTIFIERS", False):
+        return True
+    from sentinel.core.sensitive_value_extractor import match_policy_for
+    if match_policy_for(v) != "exact":
+        return True
+    return _fold_identifier(v) in _fold_identifier(utext)
+
+
 def _sink_source(path_value: tuple[str, str], param_prov: dict, untrusted: list[dict],
-                 trusted: list[dict] = ()) -> tuple[str, float, str | None]:
+                 trusted: list[dict] = (), utext: str | None = None) -> tuple[str, float, str | None]:
     """(source, match_ratio, chunk_id) for one sink leaf. Precedence: the user, then
     TRUSTED third-party content, then untrusted. A value that also appears in trusted data
     (a channel name in an unflagged listing, a colleague's name) is not attacker-chosen;
@@ -388,7 +485,10 @@ def _sink_source(path_value: tuple[str, str], param_prov: dict, untrusted: list[
     Token containment is used only for multi-token values: a single common word matches
     too much text to be evidence."""
     _, v = path_value
-    if param_prov.get("source") == SOURCE_EXPLICIT:
+    if utext is None:
+        if param_prov.get("source") == SOURCE_EXPLICIT:
+            return "user", 1.0, None
+    elif _user_supplied(v, param_prov, utext):
         return "user", 1.0, None
     ctx_hit = _instruction_context(v, list(trusted) + list(untrusted))
     if ctx_hit is not None:                       # R-031: the value sits inside an instruction
@@ -417,6 +517,19 @@ def _sink_source(path_value: tuple[str, str], param_prov: dict, untrusted: list[
     return "none", 0.0, None
 
 
+# Destination parameters for F-A3 (who receives / where it goes); amounts, ids and content are not destinations.
+_DESTINATION = re.compile(r"^(recipients?|iban|account|to|email|user_email|user|channel|cc|bcc|participants|url|"
+                          r"address|phone|arg\d+)$", re.I)
+
+
+def _carries_data(params: dict) -> bool:
+    """An egress URL whose query string carries values (RCA 2 F-A2: the exfiltration shape)."""
+    for _p, v in sink_leaves(EGRESS, params):
+        if "?" in v and "=" in v:
+            return True
+    return False
+
+
 # L4-axis scores (WARN 0.70, BLOCK 0.97). One place, so the policy is auditable.
 _BASE = {READ: 0.2, EGRESS: 0.2, READ_SENSITIVE: 0.3, WRITE: 0.3, COMMUNICATE: 0.4,
          TRANSFER: 0.5, DESTROY: 0.5, SECURITY: 0.6, EXECUTE: 0.6}
@@ -436,7 +549,8 @@ async def audit_action(tool_name: str, parameters: dict, reasoning_trace: str | 
     untrusted = _untrusted_chunks(chunks, flagged_chunks)
     _uids = {c.get("chunk_id") for c in untrusted}
     trusted = [c for c in chunks if not _is_untrusted(c, _uids)]
-    reasoning_flags = parse_reasoning(reasoning_trace)
+    strict_reasoning = getattr(cfg, "L4_REASONING_FLAGS_STRICT", False)
+    reasoning_flags = parse_reasoning(reasoning_trace, strict=strict_reasoning)
     utext = user_text(history)
 
     requested, why_req = action_requested(tool_name, cap, utext)
@@ -450,6 +564,10 @@ async def audit_action(tool_name: str, parameters: dict, reasoning_trace: str | 
         judge_used = p_unauth
         if p_unauth is not None and p_unauth < 0.5:
             requested, why_req = True, f"alignment check: authorised (p_unauth={p_unauth:.2f})"
+    if strict_reasoning and requested:
+        # "the user wants me to <X>" is evidence only when the user did NOT ask for X.
+        from .reasoning_parser import ATTRIBUTING_UNREQUESTED
+        reasoning_flags = [f for f in reasoning_flags if f != ATTRIBUTING_UNREQUESTED]
 
     named_in = action_named_in(tool_name, untrusted) if not requested else None
     named_in_any = (action_named_in(tool_name, chunks, prose_form=False)
@@ -457,11 +575,15 @@ async def audit_action(tool_name: str, parameters: dict, reasoning_trace: str | 
 
     sinks = []
     max_ratio = 0.0
+    data_destinations = []        # RCA 2 F-A3: destinations taken from third-party data, not named by the user
+    utext_fold = _fold_identifier(utext)
     for path, v in sink_leaves(cap, params):
         pname = path.split(".")[0].split("[")[0]
-        src, ratio, cid = _sink_source((path, v), provenance.get(pname, {}), untrusted, trusted)
+        src, ratio, cid = _sink_source((path, v), provenance.get(pname, {}), untrusted, trusted, utext)
         if src == "untrusted":
             max_ratio = max(max_ratio, ratio)
+        if src == "context" and _DESTINATION.match(pname) and _fold_identifier(v) not in utext_fold:
+            data_destinations.append(path)
         sinks.append({"param": path, "source": src, "chunk_id": cid})
     srcs = {s["source"] for s in sinks}
 
@@ -532,6 +654,51 @@ async def audit_action(tool_name: str, parameters: dict, reasoning_trace: str | 
     if not should_execute and threat == "SUSPICIOUS_TOOL_CALL":
         threat = "AGENTIC_HIJACK"
 
+    # CONFIRMATION (RCA 2 F-A1..F-A3). Calls the evidence cannot settle are held for the USER, not executed
+    # with a WARN and not reported as attacks. Never applied when there is attack evidence (a sink from
+    # untrusted content, or an unrequested action named in untrusted content): those stay hard blocks.
+    attack_evidence = "untrusted" in srcs or (not requested and bool(named_in))
+    delegated = (not requested) and user_delegates(utext)
+    confirm = []
+    if cap != READ and not attack_evidence:
+        if delegated and cap in (HIGH_IMPACT | {COMMUNICATE}):
+            confirm.append("the user delegated this to instructions in third-party data; confirm with the user")
+        elif (not requested and getattr(cfg, "L4_HOLD_UNREQUESTED_COMMUNICATE", False)
+              and (cap == COMMUNICATE or (cap == EGRESS and _carries_data(params)))):
+            confirm.append("unrequested communication / data-carrying egress; confirm with the user")
+        elif not requested and cap == WRITE and getattr(cfg, "L4_HOLD_UNREQUESTED_WRITE", False):
+            confirm.append("unrequested write (reservation / record change); confirm with the user")
+        data_caps = {c.strip() for c in str(getattr(cfg, "L4_DATA_SINK_CONFIRM", "OFF")).upper().split(",")}
+        if requested and cap in data_caps and data_destinations:
+            confirm.append(f"destination taken from third-party data, not named by the user "
+                           f"({', '.join(data_destinations[:3])}); confirm with the user")
+    requires_confirmation = bool(confirm)
+    if requires_confirmation:
+        should_execute = False
+        score = max(score, S_HOLD)
+        threat = "CONFIRMATION_REQUIRED"
+        reasons.extend(confirm)
+
+    # ACTION AUTHORIZATION (ARCHITECTURE_NEXT.md v2 step 1, config.L4_AUTHZ): is this action, with these
+    # arguments, authorised by the user's request and the trust matrix -- whatever influenced the model? It
+    # can only tighten the verdict above: a block stays a block, an allow can become a confirmation or a block.
+    authz = None
+    if getattr(cfg, "L4_AUTHZ", False) and cap in SIDE_EFFECT:
+        from .authz import authorize, active_contract, lexicon_contract, record_call, BLOCK, CONFIRM
+        contract = active_contract(session_id, utext) or lexicon_contract(utext, [tool_name])
+        authz = authorize(session_id, tool_name, params, utext, contract)
+        record_call(session_id, tool_name, params)
+        if authz.decision == BLOCK and (should_execute or requires_confirmation):
+            should_execute, requires_confirmation = False, False
+            score, threat, auth = max(score, S_BLOCK), "UNAUTHORIZED_ACTION", "UNAUTHORIZED_ARGUMENT"
+            reasons.extend(f"authz: {r}" for r in authz.reasons)
+        elif authz.decision == CONFIRM and should_execute:
+            should_execute, requires_confirmation = False, True
+            score, threat = max(score, S_HOLD), "CONFIRMATION_REQUIRED"
+            reasons.extend(f"authz: {r}" for r in authz.reasons)
+        elif authz.decision != "allow":
+            reasons.extend(f"authz: {r}" for r in authz.reasons)
+
     risk = ("CRITICAL" if score >= S_BLOCK else "HIGH" if score >= S_WARN
             else "MEDIUM" if score >= 0.5 else "LOW")
     from .tool_auditor import _continuous_confidence, _min_provenance_confidence
@@ -539,9 +706,11 @@ async def audit_action(tool_name: str, parameters: dict, reasoning_trace: str | 
         score=score, threat_class=threat, authorization_source=auth, risk_level=risk,
         should_execute=should_execute, reason=" | ".join(reasons),
         provenance=provenance,
+        requires_confirmation=requires_confirmation,
         action={"capability": cap, "requested": requested, "named_in_untrusted": named_in,
-                "named_in_third_party": named_in_any,
-                "sinks": sinks, "alignment_judge": judge_used},
+                "named_in_third_party": named_in_any, "delegated": delegated,
+                "sinks": sinks, "alignment_judge": judge_used,
+                "authz": authz.to_dict() if authz is not None else None},
         max_flagged_chunk_ratio=max_ratio,
         min_provenance_confidence=_min_provenance_confidence(provenance),
         confidence=_continuous_confidence(risk_level=risk, provenance=provenance,

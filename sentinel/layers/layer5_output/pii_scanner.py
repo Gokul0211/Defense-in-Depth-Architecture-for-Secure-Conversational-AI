@@ -122,6 +122,45 @@ def _is_masked_reference(pii_type: str, matched_text: str) -> bool:
     return bool(_MASK_MARKER_RE.search(prefix))
 
 
+# NUMERIC VALIDITY (config.L5_PII_VALIDITY, v3 P1.3). The digit patterns above only check a
+# shape, so any long enough digit run matches. Two measured false matches on benign traffic: an
+# "aadhaar" that was the fractional part of a coordinate inside a Google-Maps URL
+# ("3843.534694025997!2d...") and a "credit_card" that was the digits of sqrt(2)
+# ("1.4142135623746899"). An identifier is not the tail (or head) of a decimal number, and -- for
+# cards -- is valid under the Luhn checksum every issuer uses.
+# Aadhaar's Verhoeff checksum is deliberately NOT enforced: synthetic corpora (custom_l5) use
+# random digits, and checking it would trade a real format check for a corpus artefact (v3 a05).
+_NUMERIC_TYPES = {"credit_card", "aadhaar", "phone_in"}
+
+
+def _luhn_ok(digits: str) -> bool:
+    total = 0
+    for i, ch in enumerate(reversed(digits)):
+        d = int(ch)
+        if i % 2:
+            d *= 2
+            if d > 9:
+                d -= 9
+        total += d
+    return total % 10 == 0
+
+
+def _numeric_context_invalid(pii_type: str, text: str, start: int, end: int) -> bool:
+    """True when a digit-pattern match is not a standalone identifier."""
+    import sentinel.config as cfg
+
+    if pii_type not in _NUMERIC_TYPES or not getattr(cfg, "L5_PII_VALIDITY", False):
+        return False
+    # Part of a decimal number (a coordinate, a constant). NOT a URL rule: a card number in a URL
+    # query string is a real exfiltration vector and must stay visible.
+    before, after = text[max(0, start - 2):start], text[end:end + 2]
+    if re.search(r"\d[.,]$", before) or re.match(r"[.,]\d", after):
+        return True
+    if pii_type == "credit_card" and not _luhn_ok(re.sub(r"\D", "", text[start:end])):
+        return True
+    return False
+
+
 # Candidate base64-looking spans worth attempting to decode. Public (not
 # underscore-prefixed) because layer5.py reuses this exact pattern for
 # canary-token leak detection — see BASE64_CANDIDATE_PATTERN usage there.
@@ -174,10 +213,14 @@ def _try_decode_base64_spans(text: str) -> list[dict]:
     return findings
 
 
-def scan_for_pii(text: str) -> tuple[list[dict], str]:
+def scan_for_pii(text: str, user_text: str | None = None) -> tuple[list[dict], str]:
     """
     Scan text for PII, including PII hidden inside base64-encoded spans
     (see _try_decode_base64_spans — a real, common evasion technique).
+
+    `user_text` (v3 P1.2, config.L5_USER_PROVENANCE): the user's own turns. A plaintext match that
+    the user themselves supplied is not a disclosure and is neither reported nor redacted. Only
+    exact (case-insensitive) re-appearance counts; base64-hidden values are never exempt.
 
     Returns: (list of findings, sanitized_text)
 
@@ -194,6 +237,7 @@ def scan_for_pii(text: str) -> tuple[list[dict], str]:
     if not text:
         return [], text
 
+    user_low = (user_text or "").lower()
     candidates = []
     for pii_type, pattern in PII_PATTERNS.items():
         for match in re.finditer(pattern, text):
@@ -201,6 +245,10 @@ def scan_for_pii(text: str) -> tuple[list[dict], str]:
                 continue
             if _is_masked_reference(pii_type, match.group(0)):
                 continue
+            if _numeric_context_invalid(pii_type, text, match.start(), match.end()):
+                continue
+            if user_low and match.group(0).lower() in user_low:
+                continue                     # the user supplied this value (control channel)
             candidates.append((match.start(), match.end(), pii_type))
 
     for finding in _try_decode_base64_spans(text):
