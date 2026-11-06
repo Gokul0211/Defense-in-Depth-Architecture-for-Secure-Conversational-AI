@@ -17,6 +17,8 @@ a call without it. This module is that something:
       I4  not expired
       I5  single use: a nonce that executed once never executes again (replay / duplicate execution)
       I6  decision "allow", or "confirm" with a valid approval by the same principal for the same nonce
+      I8  (when the gate is given the current policy version) the decision was made under the same policy
+      I9  (for tools with a state probe) the target's state is the one the decision saw: no TOCTOU change
       I7  every outcome (executed or refused, and why) is appended to a hash-chained audit log that records the
           argument HASH, never the arguments
 
@@ -72,8 +74,19 @@ def _sign(payload: str, key: bytes) -> str:
     return hmac.new(key, payload.encode(), hashlib.sha256).hexdigest()
 
 
+def policy_version() -> str:
+    """Hash of the configuration that decides authorization (v7 P2). A decision made under one policy must not
+    execute under another: a token carries it and a gate given the current version refuses a mismatch (I8)."""
+    import sentinel.config as cfg
+    keys = sorted(k for k in dir(cfg) if k.startswith(("L4_", "PROXY_", "PIPELINE_")) or k in (
+        "WARN_THRESHOLD", "BLOCK_THRESHOLD"))
+    blob = json.dumps({k: getattr(cfg, k) for k in keys}, sort_keys=True, default=str)
+    return hashlib.sha256(blob.encode()).hexdigest()[:16]
+
+
 def issue_decision(session_id: str, principal: str, tool: str, params: dict, decision: str,
-                   ttl_s: int = DEFAULT_TTL_S, reasons: list | None = None, key: bytes | None = None) -> str | None:
+                   ttl_s: int = DEFAULT_TTL_S, reasons: list | None = None, key: bytes | None = None,
+                   policy: str | None = None, state: str | None = None) -> str | None:
     """A signed decision for exactly this call, or None when no key is configured (the caller then has nothing a
     gate would accept -- fail closed). `decision` is "allow" or "confirm"; a block gets no token."""
     if decision not in ("allow", "confirm"):
@@ -85,6 +98,10 @@ def issue_decision(session_id: str, principal: str, tool: str, params: dict, dec
     body = {"v": VERSION, "sid": session_id, "pr": principal, "tool": tool, "ah": args_hash(params),
             "dec": decision, "nonce": secrets.token_hex(12), "iat": now, "exp": now + int(ttl_s),
             "rh": hashlib.sha256(json.dumps(reasons or [], default=str).encode()).hexdigest()[:16]}
+    if policy:
+        body["pv"] = policy
+    if state is not None:
+        body["sh"] = hashlib.sha256(str(state).encode()).hexdigest()[:32]
     p = _b64(body)
     return f"{p}.{_sign(p, key)}"
 
@@ -150,11 +167,18 @@ class AuditLog:
 class ToolGate:
     """Executes a tool only under a valid decision (I1-I7). `executors`: tool name -> callable(**params)."""
 
-    def __init__(self, executors: dict | None = None, key: bytes | None = None, audit: AuditLog | None = None):
+    def __init__(self, executors: dict | None = None, key: bytes | None = None, audit: AuditLog | None = None,
+                 policy=None, state_probes: dict | None = None):
+        """`policy`: None (no check), a version string, or a callable returning the current version (I8).
+        `state_probes`: tool -> callable(params) returning a string that describes the target's CURRENT state (the
+        record to be changed / paid / deleted). A token issued with `state=` that probe's value at decision time is
+        refused if the state differs at execution (I9: time-of-check vs time-of-use)."""
+        self.policy = policy
+        self.state_probes = state_probes or {}
         self.executors = executors or {}
         self._key = key
         self.audit = audit or AuditLog()
-        self._used: set[str] = set()
+        self._used: dict[str, float] = {}     # nonce -> token expiry (v7 review R11: pruned once expired)
         self._lock = threading.Lock()
 
     def check(self, session_id: str, principal: str, tool: str, params: dict, token: str | None,
@@ -174,6 +198,17 @@ class ToolGate:
             raise GateRefused("I3", "arguments changed after authorisation")
         if body["exp"] < time.time():
             raise GateRefused("I4", "decision expired")
+        if self.policy is not None:
+            current = self.policy() if callable(self.policy) else self.policy
+            if body.get("pv") != current:
+                raise GateRefused("I8", "decision was made under a different authorization policy")
+        probe = self.state_probes.get(tool)
+        if probe is not None:
+            if "sh" not in body:
+                raise GateRefused("I9", "this tool requires a decision bound to the target's state")
+            now_state = hashlib.sha256(str(probe(params)).encode()).hexdigest()[:32]
+            if now_state != body["sh"]:
+                raise GateRefused("I9", "the target changed after the decision was made")
         with self._lock:
             if body["nonce"] in self._used:
                 raise GateRefused("I5", "decision already used")
@@ -202,7 +237,11 @@ class ToolGate:
                 self.audit.append({"sid": session_id, "pr": principal, "tool": tool, "ah": body["ah"],
                                    "outcome": "refused", "invariant": "I5", "reason": "decision already used"})
                 raise GateRefused("I5", "decision already used")
-            self._used.add(body["nonce"])
+            self._used[body["nonce"]] = body["exp"]
+            if len(self._used) > 4096:            # an expired token fails I4 before I5, so its nonce can go
+                now = time.time()
+                for n in [n for n, e in self._used.items() if e < now]:
+                    del self._used[n]
         fn = executor or self.executors.get(tool)
         if fn is None:
             self.audit.append({"sid": session_id, "pr": principal, "tool": tool, "ah": body["ah"],

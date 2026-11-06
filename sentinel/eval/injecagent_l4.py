@@ -123,16 +123,47 @@ def _followup_calls(row: dict, malicious: bool) -> list[tuple[str, dict]]:
     return calls
 
 
+_TOOLSET: list[dict] | None = None
+
+
+def _toolset() -> list[dict]:
+    """Every tool an InjecAgent agent has: the 17 user tools and every attacker tool (names only: the fixtures carry
+    no descriptions). The intent contract is written per user instruction over this whole set, as an agent with all
+    its tools registered would see it (L4_AUTHZ_CONTRACT=llm | local)."""
+    global _TOOLSET
+    if _TOOLSET is None:
+        from pathlib import Path
+        d = Path(__file__).parent / "data" / "injecagent"
+        names = set()
+        for f in ("samples.json", "samples_ds.json"):
+            rows = json.load(open(d / f, encoding="utf-8"))
+            for r in (rows if isinstance(rows, list) else list(rows.values())):
+                names.add(r.get("User Tool", ""))
+                names.update(r.get("Attacker Tools") or [])
+        _TOOLSET = [{"name": n, "description": "", "params": []} for n in sorted(n for n in names if n)]
+    return _TOOLSET
+
+
 async def evaluate_one(row: dict, malicious: bool, index: int) -> dict:
     """Run the three-step protocol for a single sample. Returns a scored record."""
     from sentinel.layers.layer2_rag import layer2_ingest
     from sentinel.layers.layer4_agentic import audit_tool_call
+    import sentinel.config as _cfg
 
     session_id = f"ia_l4_{uuid.uuid4().hex[:10]}"
     started = time.perf_counter()
 
     response = _render_response(row, malicious)
     user_instruction = row.get("User Instruction", "") or ""
+
+    # the intent contract, written from the user's instruction and the tool set only, before any data is read
+    if getattr(_cfg, "L4_AUTHZ", False) and str(getattr(_cfg, "L4_AUTHZ_CONTRACT", "lexicon")).lower() in ("llm", "local"):
+        from sentinel.layers.layer4_agentic.authz import model_contract, set_contract
+        from sentinel.layers.layer4_agentic.action_policy import register_tool_specs
+        register_tool_specs(_toolset())
+        _c = await model_contract(user_instruction, _toolset())
+        if _c is not None:
+            set_contract(session_id, user_instruction, _c)
 
     # --- step 1: the tool response enters the context through L2 ---
     # Session-scoped (B-1): before 2026-09-25 every sample's tool response went into the

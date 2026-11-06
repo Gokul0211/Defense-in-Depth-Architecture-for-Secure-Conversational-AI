@@ -262,3 +262,46 @@ def track_sensitive_values(session, text: str) -> int:
         session.tracked_sensitive_values.append(candidate)
         added += 1
     return added
+
+
+POLICY_MIN_VALUE_LEN = 4      # values of 3 characters or fewer are too common to treat as a disclosure
+
+
+def track_field_policy(session, fields: dict, allowed: list, user_text: str = "") -> int:
+    """
+    L5 field policy (config.L5_FIELD_POLICY; results.md §21.6). The operator declares the record a task works on
+    (field -> value) and the fields the task may disclose. Every value of a field NOT in `allowed` (longer than 3
+    characters, and not something the user typed in `user_text`) becomes a private value of the session; allowed
+    values are recorded so the PII redaction does not count them. Returns the number of private values added.
+
+    This is the definition of a leak the deployment owns: AgentLeak's own label is the same rule (a non-allowed field's
+    value appearing in the output), so on that benchmark a field-aware check measures whether L5 enforces a declared
+    policy, not whether it can infer one.
+    """
+    allowed_set = set(allowed or [])
+    typed = (user_text or "").lower()
+    added = 0
+    for name, value in (fields or {}).items():
+        v = str(value or "").strip()
+        if len(v) < POLICY_MIN_VALUE_LEN:
+            continue
+        if name in allowed_set:
+            session.policy_allowed_values.append(v)
+            continue
+        if v.lower() in typed:
+            continue
+        if (name, v) not in session.policy_private_values:
+            session.policy_private_values.append((name, v))
+            added += 1
+    return added
+
+
+def policy_findings(text: str, session) -> list[str]:
+    """Exact (case-insensitive) occurrences of the session's private policy values in `text`: one finding per field."""
+    low = (text or "").lower()
+    seen, out = set(), []
+    for name, v in getattr(session, "policy_private_values", None) or []:
+        if name not in seen and v.lower() in low:
+            seen.add(name)
+            out.append(f"Output discloses the value of the private field '{name}' (field policy)")
+    return out

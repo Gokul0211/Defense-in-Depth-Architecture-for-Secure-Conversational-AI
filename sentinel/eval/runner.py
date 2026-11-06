@@ -101,14 +101,12 @@ def _evaluate_l1(text: str) -> LayerResult:
 
     score = result.score if hasattr(result, "score") else 0.0
 
-    # Determine decision from score using configured thresholds
-    from sentinel.config import BLOCK_THRESHOLD, WARN_THRESHOLD
-    if score >= BLOCK_THRESHOLD:
-        decision = "BLOCK"
-    elif score >= WARN_THRESHOLD:
-        decision = "WARN"
-    else:
-        decision = "ALLOW"
+    # The decision production makes (layer1.l1_decision: rescale with L1's own anchors, then the shared thresholds).
+    # Until 2026-11-04 this compared the RAW score with the shared 0.50 / 0.85, so a raw score in [0.50, 0.5494) was
+    # recorded as WARN here and ALLOW in production (NotInject: 17 recorded vs 11 real; results.md §21.5). The
+    # classification metrics always used L1's own threshold and were not affected.
+    from sentinel.layers.layer1 import l1_decision
+    decision = l1_decision(score)
 
     return LayerResult(
         score=score,
@@ -151,6 +149,23 @@ def _evaluate_l1_harm(text: str) -> LayerResult:
                        details={"harm_source": source, "harm_policy": cfg.HARM_POLICY_VERSION})
 
 
+_L2_EVAL_LOOP = None
+
+
+def _run_on_eval_loop(coro):
+    """Run one L2 coroutine on a PERSISTENT event loop, as production serves from one long-lived loop.
+
+    asyncio.run() per sample built a new loop, and with it a new default thread pool, for every document; L2 scores in
+    worker threads (L2_SCORE_IN_THREAD, the local detector), and torch work in each fresh thread leaves its own OpenMP
+    pool behind. A CPU-classifier L2 run on 2,200 BIPIA documents ran out of threads and memory after 100-160 documents
+    ("can't start new thread", DefaultCPUAllocator: not enough memory; 2026-10-31). One loop keeps one bounded pool."""
+    import asyncio
+    global _L2_EVAL_LOOP
+    if _L2_EVAL_LOOP is None or _L2_EVAL_LOOP.is_closed():
+        _L2_EVAL_LOOP = asyncio.new_event_loop()
+    return _L2_EVAL_LOOP.run_until_complete(coro)
+
+
 def _evaluate_l2_ingest(text: str) -> LayerResult:
     """
     Run SENTINEL Layer 2 (RAG Integrity) on a document chunk.
@@ -158,11 +173,10 @@ def _evaluate_l2_ingest(text: str) -> LayerResult:
     Tests the ingestion path — scoring a chunk for instruction density
     and trust before it enters the chunk store.
     """
-    import asyncio
     from sentinel.layers.layer2_rag.layer2 import layer2_ingest
 
     start = time.perf_counter()
-    result = asyncio.run(layer2_ingest(text, source="eval"))
+    result = _run_on_eval_loop(layer2_ingest(text, source="eval"))
     elapsed_ms = (time.perf_counter() - start) * 1000
 
     # layer2_ingest returns a dict with chunk info. trust_score lives nested
@@ -522,7 +536,7 @@ def _evaluate_l5(text: str) -> LayerResult:
     )
 
 
-def _evaluate_l5_with_provenance(text: str, vault_text: str, session_id: str) -> LayerResult:
+def _evaluate_l5_with_provenance(text: str, vault_text: str, session_id: str, metadata: dict | None = None) -> LayerResult:
     """
     Real, unified L5 evaluation for corpora with real earlier-context
     (currently: AgentLeak's per-trace vault data).
@@ -552,7 +566,14 @@ def _evaluate_l5_with_provenance(text: str, vault_text: str, session_id: str) ->
         # (app.py's RAG-retrieval and tool-response handlers) — an eval
         # that populated this list differently would not be measuring the
         # deployed behaviour, which is the whole point of this function.
-        track_sensitive_values(session, vault_text)
+        import sentinel.config as _c
+        md = metadata or {}
+        if getattr(_c, "L5_FIELD_POLICY", False) and md.get("vault_fields"):
+            # the declared field policy (results.md §21.6): the record's fields, the task's allowed set, the request
+            from sentinel.core.sensitive_value_extractor import track_field_policy
+            track_field_policy(session, md["vault_fields"], md.get("allowed_fields") or [], md.get("request") or "")
+        else:
+            track_sensitive_values(session, vault_text)
         return await layer5_scan_output(text, system_prompt=None, session_id=session_id)
 
     start = time.perf_counter()
@@ -704,8 +725,10 @@ def _default_layer_threshold(layer: str | None = None) -> float:
 # Evaluation orchestration
 # ---------------------------------------------------------------------------
 
-# Attack types whose payload sits in the retrieved document (DIDA-Bench generator, generate_sentinel_bench.py).
-_DOCUMENT_ATTACKS = {"rag_agent_hijack", "poisoned_rag_exfil", "full_chain"}
+# Attack types whose payload sits in the retrieved document (DIDA-Bench generator, generate_sentinel_bench.py; BIPIA's
+# loader writes "rag_poisoning"). Without "rag_poisoning" the document-level filter below dropped EVERY malicious
+# bipia_local sample as turn-borne, so `--layer L2 --dataset bipia_local` scored benign documents only (2026-10-31).
+_DOCUMENT_ATTACKS = {"rag_agent_hijack", "poisoned_rag_exfil", "full_chain", "rag_poisoning"}
 
 
 def _l2_document_level(dataset) -> bool:
@@ -725,6 +748,11 @@ def _l2_document_samples(samples: list) -> list:
         docs = parse_sample_text(s.text).documents
         if not docs:
             continue
+        # A single-document sample is scored exactly as production ingests it: layer2_ingest does not strip, the parser
+        # does (2026-11-04: on t9 middle-position attacks, stripping leading / trailing whitespace alone flipped 10 / 458
+        # local-detector decisions, 424 -> 416 detected; scratch/rca/l2/l2p56_ws_check.py).
+        if len(docs) == 1 and s.text.startswith("[Document] ") and s.text.count("[Document] ") == 1:
+            docs = [s.text[len("[Document] "):]]
         if s.label == "malicious" and s.attack_type not in _DOCUMENT_ATTACKS:
             continue                      # the attack is in the user turns: not an L2 sample
         for k, d in enumerate(docs):
@@ -819,7 +847,8 @@ def run_layer_evaluation(
                 # is a real evaluation-construct fix, not a cosmetic branch.
                 vault_text = (sample.metadata or {}).get("vault_text", "")
                 result = _evaluate_l5_with_provenance(
-                    sample.text, vault_text, session_id=f"agentleak_eval_{sample.sample_id}"
+                    sample.text, vault_text, session_id=f"agentleak_eval_{sample.sample_id}",
+                    metadata=sample.metadata or {},
                 )
             else:
                 result = evaluator(sample.text)

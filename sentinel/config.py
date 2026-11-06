@@ -675,7 +675,18 @@ def _doc_axis(metadata: dict | None):
 
 
 def _short_bin(dt: dict) -> bool:
-    return dt.get("content_type") == "short" or dt.get("bin") == "short"
+    return dt.get("content_type") == "short" or dt.get("bin") in ("short", "short_tool", "short_doc")
+
+
+def _short_anchors(dt: dict) -> tuple[float | None, float | None]:
+    """(WARN, BLOCK) of the short bin that scored `dt` (L2 review I12): the per-source bins when
+    L2_SHORT_BIN_BY_SOURCE scored it and their anchors are set, else the shipped max-over-sources pair."""
+    b = dt.get("bin")
+    if b == "short_doc" and L2_SHORT_DOC_WARN is not None and L2_SHORT_DOC_BLOCK is not None:
+        return L2_SHORT_DOC_WARN, L2_SHORT_DOC_BLOCK
+    if b == "short_tool":
+        return L2_SHORT_TOOL_WARN, L2_SHORT_TOOL_BLOCK
+    return L2_DOCUMENT_THREAT_WARN_THRESHOLD_SHORT, L2_DOCUMENT_THREAT_BLOCK_THRESHOLD_SHORT
 
 
 def l2_warn_threshold_for(metadata: dict | None = None) -> float:
@@ -694,10 +705,11 @@ def l2_warn_threshold_for(metadata: dict | None = None) -> float:
     if dt is None:
         return L2_WARN_THRESHOLD
     if _short_bin(dt):
-        if L2_DOCUMENT_THREAT_WARN_THRESHOLD_SHORT is None:
+        warn, _ = _short_anchors(dt)
+        if warn is None:
             raise RuntimeError("short-document bin scored without a derived anchor "
                                "(scratch/rca/R026_short_doc_anchor.py)")
-        return L2_DOCUMENT_THREAT_WARN_THRESHOLD_SHORT
+        return warn
     if dt.get("content_type") == "code":
         return L2_DOCUMENT_THREAT_WARN_THRESHOLD_CODE
     return L2_DOCUMENT_THREAT_WARN_THRESHOLD
@@ -707,11 +719,15 @@ def l2_block_threshold_for(metadata: dict | None = None) -> float:
     """L2's BLOCK anchor for the axis/bin that produced this score (see above)."""
     dt = _doc_axis(metadata)
     if dt is not None and _short_bin(dt):
-        if L2_DOCUMENT_THREAT_BLOCK_THRESHOLD_SHORT is None:
+        _, block = _short_anchors(dt)
+        if block is None:
             raise RuntimeError("short-document bin scored without a derived BLOCK anchor")
-        return max(L2_DOCUMENT_THREAT_BLOCK_THRESHOLD_SHORT, l2_warn_threshold_for(metadata) + 1e-6)
+        return max(block, l2_warn_threshold_for(metadata) + 1e-6)
     if dt is not None and dt.get("content_type") == "code":
         return max(L2_BLOCK_THRESHOLD, L2_DOCUMENT_THREAT_BLOCK_THRESHOLD_CODE)
+    if dt is not None and L2_DOC_PROSE_BLOCK_DERIVED:
+        # L2 review C6: the doc axis's own alpha-0.01 anchor, not the legacy-axis constant.
+        return max(L2_DOCUMENT_THREAT_BLOCK_THRESHOLD, l2_warn_threshold_for(metadata) + 1e-6)
     return L2_BLOCK_THRESHOLD
 
 
@@ -893,6 +909,12 @@ L5_PII_VALIDITY = os.getenv("L5_PII_VALIDITY", "true").lower() == "true"
 # AgentLeak benign policy hits 121 -> 17 (108 of AgentLeak's 269 benign L5 false positives were
 # policy-only), WildChat 8 -> 0, Alpaca 5 -> 5 (genuine "medical diagnosis" phrases).
 L5_POLICY_PHRASE_MATCH = os.getenv("L5_POLICY_PHRASE_MATCH", "true").lower() == "true"
+# L5 FIELD POLICY (2026-11-06, results.md §21.6; off until measured on the AgentLeak DEV / VAL / TEST split). When the
+# operator declares a record's fields and which of them the current task may disclose (core/sensitive_value_extractor.
+# track_field_policy), the values of the OTHER fields are private and matched exactly (case-insensitive, > 3 chars)
+# in the output; allowed-field values and values the user typed are not a leak and do not trip the PII redaction
+# either. Without a declared policy L5 is unchanged (heuristic value extraction).
+L5_FIELD_POLICY = os.getenv("L5_FIELD_POLICY", "false").lower() == "true"
 
 # Layer 4 — Decision Threshold (InjecAgent-calibrated, additive ceiling)
 # Youden's J-optimal on audit_tool_call()'s final_score once tool-response
@@ -1517,9 +1539,103 @@ L4_AUTHZ = os.getenv("L4_AUTHZ", "true").lower() == "true"
 # request's `tools`; authz.set_contract elsewhere) and cached. When no contract is registered for the current user
 # text -- no tool schema, the LLM unavailable or failing -- L4 falls back to "lexicon": requested actions from its
 # verb lexicon, no call bounds or literal bindings (offline). "lexicon" forces the fallback everywhere.
+# "local" (2026-11-01): the same contract prompt answered by the LOCAL Qwen3-4B (core/local_judge.py; no data leaves the
+# machine). A model contract ("llm" or "local") also decides L4's "requested" for side effects (action_policy.audit).
+# Measured offline on ASB with the lexicon: 81 / 100 legitimate tool calls held for confirmation.
 L4_AUTHZ_CONTRACT = os.getenv("L4_AUTHZ_CONTRACT", "llm").strip().lower()
+# Local per-call alignment check (authz/alignment.py): an unlisted side effect is RESCUED when the local model says, with
+# log-odds >= L4_ALIGNMENT_LOCAL_MIN_LOG_ODDS (a fixed, untuned bar), that the user's request implies the call. Off.
+L4_ALIGNMENT_LOCAL = os.getenv("L4_ALIGNMENT_LOCAL", "false").lower() == "true"
+L4_ALIGNMENT_LOCAL_MIN_LOG_ODDS = float(os.getenv("L4_ALIGNMENT_LOCAL_MIN_LOG_ODDS", "2.0"))
+# ... and a REQUESTED side effect whose arguments are copied from third-party content is held for confirmation when the
+# local model says, with log-odds <= this (fixed, untuned), that the call does not serve the user's request.
+L4_ALIGNMENT_VETO_MAX_LOG_ODDS = float(os.getenv("L4_ALIGNMENT_VETO_MAX_LOG_ODDS", "-2.0"))
+# A side effect whose free-text CONTENT argument is a verbatim copy of third-party text is held for confirmation (ASB's
+# attacker tools are plausible task tools that an intent contract cannot exclude; the call is driven by the data). Off.
+L4_COPIED_CONTENT_CONFIRM = os.getenv("L4_COPIED_CONTENT_CONFIRM", "false").lower() == "true"
 L4_AUTHZ_CONTRACT_MODEL = os.getenv("L4_AUTHZ_CONTRACT_MODEL", "openai/gpt-oss-120b").strip()
 L4_AUTHZ_CONTRACT_CACHE = os.getenv("L4_AUTHZ_CONTRACT_CACHE", "").strip()
+# Contract prompt version: "v1" (shipped, measured in results.md §16) | "v2" (+ per-argument delegated sources,
+# ADR-6) | "v3" (+ per-argument selection criteria, v7 P1).
+L4_AUTHZ_CONTRACT_PROMPT = os.getenv("L4_AUTHZ_CONTRACT_PROMPT", "v1").strip().lower()
+# ADR-6 (scratch/rca/v6/ADR.md). With prompt v2: an authority-bearing argument whose value comes from the text of a
+# document the user pointed at is blocked unless the user named that document as its source (else it is a confirmation).
+L4_AUTHZ_REQUIRE_DELEGATION = os.getenv("L4_AUTHZ_REQUIRE_DELEGATION", "true").lower() == "true"
+# v7: an undelegated document-text value stays a confirmation when it sits in the same text as an entity the user typed
+# in another argument of the call ("invite Dora" + Dora's page with her address). v6 replay: without it, 2 benign
+# AgentDojo tasks (slack 16 / 20) were hard-blocked.
+L4_AUTHZ_ENTITY_ANCHOR = os.getenv("L4_AUTHZ_ENTITY_ANCHOR", "true").lower() == "true"
+# L4 v6 (2026-11-02, results.md §20.17): the rule above for the LOCAL contract, which names no per-argument sources.
+# Only an action the user did not ask for (not in the local contract, not in the lexicon, not rescued by the local
+# alignment check) is held to it: its document-text recipient / payee / URL is refused instead of confirmed. v5 RCA:
+# 38 of 56 dev approve-all effects were such calls. OFF until measured.
+L4_AUTHZ_LOCAL_DELEGATION = os.getenv("L4_AUTHZ_LOCAL_DELEGATION", "false").lower() == "true"
+# L4 v9 candidate (results.md §21.8): named-source authority. (1) A strict-sink identifier from a document the user
+# located directly, which names only that one identifier of its kind, is allowed instead of confirmed. (2) When the
+# user delegated the task to a document, unrequested COMMUNICATE / WRITE actions are not confirmed for that reason
+# alone (the matrix still checks their arguments). OFF until measured.
+L4_NAMED_SOURCE_AUTHORITY = os.getenv("L4_NAMED_SOURCE_AUTHORITY", "false").lower() == "true"
+# L4 v10 candidates (results.md §21.10). GUARD: a tool only the v8 necessity question selected counts as requested
+# but stays under the local named-source delegation rule (v8 RCA: one approve-all effect). ANCHOR: the named-source
+# test also passes when the value sits in the named document next to an entity the user typed in the same call.
+L4_LOCAL_SEL_NECESSITY_GUARD = os.getenv("L4_LOCAL_SEL_NECESSITY_GUARD", "false").lower() == "true"
+L4_NAMED_SOURCE_ANCHOR = os.getenv("L4_NAMED_SOURCE_ANCHOR", "false").lower() == "true"
+# L4 v11 candidate (results.md §21.13): path to an OPERATOR-declared capability registry ({tool name: READ / WRITE /
+# ...}); declared tools take that capability, undeclared tools keep the name rule (unknown -> WRITE). Empty = off.
+L4_CAPABILITY_REGISTRY = os.getenv("L4_CAPABILITY_REGISTRY", "")
+# L4 v7 candidate (pre-registered in results.md §20.17): least privilege for the LOCAL contract -- an unrequested
+# consequential call (transfer / delete / security / execute / booking) whose tool the local selection rejected at
+# log-odds <= L4_AUTHZ_LOCAL_LP_MAX_LOG_ODDS is refused instead of confirmed. The bar is fixed on the dev benign tasks
+# (scratch/rca/v7/a09_lp_margin.py). OFF until measured.
+L4_AUTHZ_LOCAL_LEAST_PRIVILEGE = os.getenv("L4_AUTHZ_LOCAL_LEAST_PRIVILEGE", "false").lower() == "true"
+L4_AUTHZ_LOCAL_LP_MAX_LOG_ODDS = float(os.getenv("L4_AUTHZ_LOCAL_LP_MAX_LOG_ODDS", "-2.0"))
+# L4 v8 candidate (results.md §21.4): a tool the local contract's selection question rejects gets a second question
+# framed on the EFFECT ("refunding someone is sending them money"); selected when either says yes. Its own contract
+# cache key. OFF until measured.
+L4_LOCAL_SEL_NECESSITY = os.getenv("L4_LOCAL_SEL_NECESSITY", "false").lower() == "true"
+# v8 RCA (scratch/rca/v7/RCA_V8.md): scope of least privilege -- "consequential" (transfer / delete / security / execute /
+# booking) or "all" (every side-effect family: unrequested calendar writes, messages). OFF scope change until measured.
+L4_AUTHZ_LEAST_PRIVILEGE_SCOPE = os.getenv("L4_AUTHZ_LEAST_PRIVILEGE_SCOPE", "consequential").strip().lower()
+# v8 RCA: a payee / publication URL read from document text whose document names 2+ different candidates of that kind is
+# blocked (the user must say which) instead of confirmed. OFF until measured.
+L4_AUTHZ_AMBIGUOUS_DELEGATION_BLOCK = os.getenv("L4_AUTHZ_AMBIGUOUS_DELEGATION_BLOCK", "false").lower() == "true"
+# v8 RCA: a URL in an outgoing message body that only document text supplies (not the user, not the user's records) needs
+# confirmation. Benign cost is not measurable in replay (ground-truth bodies are placeholders) -> live run. OFF.
+L4_AUTHZ_CONTENT_LINK_CONFIRM = os.getenv("L4_AUTHZ_CONTENT_LINK_CONFIRM", "false").lower() == "true"
+# v7 (rows #5 / #13): when the hosted L1 judge returns nothing (off, no key, outage), use the local Qwen3Guard's
+# prompt-mode P(Unsafe), counted only when its category is "Jailbreak", inside the same judge band. OFF until measured.
+L1_LOCAL_JUDGE = os.getenv("L1_LOCAL_JUDGE", "false").lower() == "true"
+# L1 redesign 2026-10-30 (scratch/rca/l1/TT_REDESIGN.md; core/local_judge.py): a LOCAL instruction-tuned model (Qwen3-4B,
+# 4-bit, GPU) reads every input that is below WARN under the hosted judge's own v7 policy, and a linear probe on its
+# residual stream at the answer position (artifact core/artifacts/l1_llm_probe.npz, external training data only)
+# lifts the input to WARN when the ensemble score exceeds its threshold: the group-conditional split-conformal
+# (alpha 0.01) threshold on the three benign calibration pools, stored in the artifact (tt18_export_ensemble.py).
+# No hosted call.
+L1_LLM_PROBE = os.getenv("L1_LLM_PROBE", "false").lower() == "true"
+# None = the threshold stored in the probe artifact (its own calibration); set only to override it.
+L1_LLM_PROBE_TAU = float(os.environ["L1_LLM_PROBE_TAU"]) if os.getenv("L1_LLM_PROBE_TAU") else None
+L1_LOCAL_LLM_MODEL = os.getenv("L1_LOCAL_LLM_MODEL", "Qwen/Qwen3-4B-Instruct-2507")
+# A pre-quantized (NF4) copy of that model, written by scratch/rca/l1/tt22_prequantize.py; used when present.
+L1_LOCAL_LLM_DIR = os.getenv("L1_LOCAL_LLM_DIR", "~/.cache/sentinel/qwen3-4b-instruct-2507-nf4")
+# v8 L6 Answer-Provenance Guard (sentinel/layers/layer6_answer): off | report | enforce. Traces links / addresses /
+# reader-directed instructions in the assistant's reply to their source (scratch/rca/v7/LAYERS_V8.md). OFF.
+L6_ANSWER_GUARD = os.getenv("L6_ANSWER_GUARD", "off").strip().lower()
+# L6 v2 (2026-11-04, scratch/rca/l6/L6_RCA.md): only reply elements whose third-party source text ADDRESSES THE AI count
+# (core/addressee.py cues). Measured offline on the live AgentDojo episodes: v1 flagged 11.8 % of benign answers
+# (legitimate links from content the user asked about); every injection text carries a cue, no benign leaf does.
+L6_ADDRESSEE_GATE = os.getenv("L6_ADDRESSEE_GATE", "true").lower() == "true"
+# v8 RCA (scratch/rca/v7/RCA_V8.md): when field-level provenance (authz lineage) places an argument in a user-typed or
+# system-of-record field, the chunk-level "copied from a flagged output" block is overridden for it (instruction-context
+# blocks are not). OFF until measured (a06).
+L4_AUTHZ_FIELD_LEVEL_OVERRIDE = os.getenv("L4_AUTHZ_FIELD_LEVEL_OVERRIDE", "false").lower() == "true"
+# ADR-6: a consequential action (transfer / delete / security / execute / booking) that no requested action shares a
+# family with, and that the user did not delegate, is blocked rather than confirmed (LLM contract only).
+# OFF until measured (effect replay pending, scratch/rca/v6/RESUME.md).
+L4_AUTHZ_BLOCK_UNREQUESTED_CONSEQUENTIAL = os.getenv("L4_AUTHZ_BLOCK_UNREQUESTED_CONSEQUENTIAL", "false").lower() == "true"
+# v7 P1 (scratch/rca/v7/PROPOSALS.md): with contract prompt v3, a target chosen by a user criterion ("the largest
+# file") is checked against the rows the agent read (authz/selector.py). Violation -> confirm (block for consequential
+# actions); unverifiable -> no change. OFF until measured.
+L4_AUTHZ_TARGET_CRITERIA = os.getenv("L4_AUTHZ_TARGET_CRITERIA", "false").lower() == "true"
 # Total time budget for generating one contract; past it the call uses the lexicon fallback (safe degradation).
 L4_AUTHZ_CONTRACT_TIMEOUT_S = float(os.getenv("L4_AUTHZ_CONTRACT_TIMEOUT_S", "15"))
 # Trace links / e-mail addresses / IBANs inside message bodies and other content arguments.
@@ -1528,6 +1644,11 @@ L4_AUTHZ_CONTENT_IDENTIFIERS = os.getenv("L4_AUTHZ_CONTENT_IDENTIFIERS", "true")
 # READ may leave in a message / transfer only if the user typed it or asked for that kind of value to be sent (else
 # block); other personal identifiers (passport, ID, account number) need confirmation.
 L4_AUTHZ_SENSITIVE_EGRESS = os.getenv("L4_AUTHZ_SENSITIVE_EGRESS", "true").lower() == "true"
+# v7 review R3: apply the sensitive-value check to fetch / browse tools too (their arguments reach a remote server).
+# New behaviour -> OFF until measured on the benign replay.
+L4_AUTHZ_EGRESS_SENSITIVE = os.getenv("L4_AUTHZ_EGRESS_SENSITIVE", "false").lower() == "true"
+# v7 review R6: only calls that can still run count toward the contract's call bound (a blocked call used to count).
+L4_AUTHZ_COUNT_ONLY_RUNNABLE = os.getenv("L4_AUTHZ_COUNT_ONLY_RUNNABLE", "false").lower() == "true"
 # Global policy: a transfer amount above this that the user did not state needs confirmation ("" = no limit).
 _l4_tl = os.getenv("L4_AUTHZ_TRANSFER_CONFIRM_ABOVE", "1000").strip()
 L4_AUTHZ_TRANSFER_CONFIRM_ABOVE = float(_l4_tl) if _l4_tl else None
@@ -1537,3 +1658,226 @@ L4_AUTHZ_TRUST_POLICY_FILE = os.getenv("L4_AUTHZ_TRUST_POLICY_FILE", "").strip()
 # per process (an in-process ToolGate works; a separate gate process needs the shared key set explicitly).
 DIDA_DECISION_KEY = os.getenv("DIDA_DECISION_KEY", "").strip() or __import__("secrets").token_hex(32)
 DIDA_DECISION_TTL_S = int(os.getenv("DIDA_DECISION_TTL_S", "300"))
+# v7 review R8: who may approve a confirmation. /sentinel/agent/approve used to accept any caller claiming the principal
+# -- including the agent itself. It now requires the X-DIDA-Approver-Key header to match this secret, which only the
+# human-facing UI holds. Unset -> approvals are refused (fail closed) unless DIDA_APPROVE_OPEN=true (local dev only).
+DIDA_APPROVER_KEY = os.getenv("DIDA_APPROVER_KEY", "").strip()
+DIDA_APPROVE_OPEN = os.getenv("DIDA_APPROVE_OPEN", "false").lower() == "true"
+# v7 P3 (sentinel/core/tool_output_filter.py): what /sentinel/agent/tool_response does with an output L1 scores at or
+# above BLOCK. "withhold" (shipped): the whole output. "filter": replace only the flagged prose fields, withhold the
+# whole output only if the remainder still scores at or above BLOCK. OFF ("withhold") until measured.
+TOOL_OUTPUT_POLICY = os.getenv("TOOL_OUTPUT_POLICY", "withhold").strip().lower()
+# ---------------------------------------------------------------------------------------------
+# L1 REVIEW FIXES (2026-10-27; scratch/rca/l1/L1_REVIEW.md, progress in scratch/rca/l1/RESUME.md).
+# Correctness fixes default ON ("false" reproduces the behaviour before 2026-10-27); detection-changing
+# mechanisms default OFF until measured.
+# ---------------------------------------------------------------------------------------------
+# B13: the image scanner decodes a payload only when every byte is printable and null-terminated, reads only the pixels
+# a sequential payload can occupy, and uses the pairs-of-values chi-square. Hidden text L1 does not block, or a strong
+# statistical sign alone, is WARN; only hidden text L1 itself blocks is BLOCK. The old scanner flagged ordinary photos.
+L1_STEG_STRICT = os.getenv("L1_STEG_STRICT", "true").lower() == "true"
+# B8: inside a live app request (core/request_context.py) one judge call -- key wait, pacing, retries, HTTP -- may take
+# at most this long, then it returns None ("skip"; the local judge takes over when L1_LOCAL_JUDGE is on). Evaluations
+# never pass through the app middleware and keep their patient waiting. 0 = no deadline (the behaviour before).
+L1_JUDGE_LIVE_DEADLINE_S = float(os.getenv("L1_JUDGE_LIVE_DEADLINE_S", "8"))
+# B9: accept only a bare score in [0, 1] from the judge (the first number anywhere used to win: "1. The text ..." -> 1.0).
+L1_JUDGE_STRICT_PARSE = os.getenv("L1_JUDGE_STRICT_PARSE", "true").lower() == "true"
+# B10: an input longer than this many characters is judged as an excerpt (head, the Tier-2 window that scored highest,
+# tail) instead of whole. Changes what the judge reads on long inputs -> OFF (0) until measured; suggested 6000.
+L1_JUDGE_MAX_CHARS = int(os.getenv("L1_JUDGE_MAX_CHARS", "0"))
+# B6: the proxy also runs L1 on earlier user turns of the request that this session has not scanned yet (stateless
+# clients resend history; only the last user turn reached L1). At most L1_SCAN_EARLIER_TURNS_MAX per request. OFF
+# until measured on multi-turn benign traffic.
+L1_SCAN_ALL_USER_TURNS = os.getenv("L1_SCAN_ALL_USER_TURNS", "false").lower() == "true"
+L1_SCAN_EARLIER_TURNS_MAX = int(os.getenv("L1_SCAN_EARLIER_TURNS_MAX", "8"))
+# B5: every base64 / hex span is decoded (deduplicated, longest first). The old cap stopped after 32 SUCCESSFUL decodes,
+# so 32 harmless leading blobs hid a payload; decoding is linear in the input, so the cap bounded nothing.
+L1_DECODE_NO_CAP = os.getenv("L1_DECODE_NO_CAP", "true").lower() == "true"
+# B4: add URL / HTML-entity / unicode-escape / base64url / reversed decoders and 2 nesting levels (core/decoders.py). OFF.
+L1_DECODERS_V2 = os.getenv("L1_DECODERS_V2", "false").lower() == "true"
+# B4: decoded plaintexts are also scored by Tier 2 (windows) and Tier 3 (inputs), not only by the Tier-1 regex. OFF.
+L1_DECODED_VIEWS_ALL_TIERS = os.getenv("L1_DECODED_VIEWS_ALL_TIERS", "false").lower() == "true"
+# B2: Tiers 1-3 also read the "unhide" view (tag characters / variation-selector payloads decoded, invisible and bidi
+# characters removed, mixed-script homoglyphs folded, spaced-out letters collapsed; text_canonicalize.unhide). OFF.
+L1_CANON_V2 = os.getenv("L1_CANON_V2", "false").lower() == "true"
+# T0: hidden-content signal. Text carried by invisible characters (>= 4 chars) raises L1 to its WARN anchor and the
+# hiding counts are reported in L1Result.anomaly. OFF until measured.
+L1_ANOMALY_TIER = os.getenv("L1_ANOMALY_TIER", "false").lower() == "true"
+# B1: Tier 3 scores inputs longer than 448 Prompt-Guard tokens as overlapping windows (both classifiers truncate at 512
+# and keep the head, so a tail after ~400 words was never read). OFF until measured (cost grows with input length).
+L1_TIER3_WINDOWED = os.getenv("L1_TIER3_WINDOWED", "false").lower() == "true"
+# B1: the harm head scores prompts longer than its 1024-token payload cap as overlapping windows (it kept head + tail,
+# so a long middle was never read). OFF until measured (one 0.6B forward per window).
+L1_HARM_WINDOWED = os.getenv("L1_HARM_WINDOWED", "false").lower() == "true"
+# B3: a Tier-1 hit on ONLY the lexical patterns (layer1.TIER1_SOFT: reveal/print ... instructions, new goal/task,
+# forget ... task, disable/turn off ... safety/filter) is not a hard 0.92 BLOCK: it publishes L1_TIER1_SOFT_SCORE inside
+# the judge band (WARN on the shared axis) and the judge decides; a benign hosted verdict removes the floor. OFF.
+L1_TIER1_SOFT = os.getenv("L1_TIER1_SOFT", "false").lower() == "true"
+L1_TIER1_SOFT_SCORE = float(os.getenv("L1_TIER1_SOFT_SCORE", "0.70"))   # must stay inside (L1_SEMANTIC_MEDIUM, HIGH]
+# B11: when Tier 3 ALONE carries a BLOCK (no Tier-1 hit, Tier 2 not in its INJECTION band), the hosted judge is asked; a
+# benign verdict holds the score at WARN (never ALLOW). OFF until measured (NotInject FPR vs TensorTrust / DIDA recall).
+L1_TIER3_VERIFIER = os.getenv("L1_TIER3_VERIFIER", "false").lower() == "true"
+# B15: inside live app requests the hosted judge reuses one HTTP client per event loop (a fresh client per call cost a
+# TCP + TLS handshake each time). Evaluations keep the per-call client.
+L1_JUDGE_SHARED_CLIENT = os.getenv("L1_JUDGE_SHARED_CLIENT", "true").lower() == "true"
+# I8: the raw L1 score at or above which a TOOL OUTPUT is withheld / field-filtered (/sentinel/agent/tool_response, the
+# tool-output filter, and both AgentDojo harnesses read it through l1_tool_output_block()). Tool outputs are third-party
+# data with their own benign distribution, so this is the hook for a per-source operating point calibrated on benign tool
+# outputs. Default = BLOCK_THRESHOLD, i.e. unchanged; NOT yet calibrated (needs a benign tool-output conformal run).
+L1_TOOL_OUTPUT_BLOCK_SCORE = float(os.getenv("L1_TOOL_OUTPUT_BLOCK_SCORE", str(BLOCK_THRESHOLD)))
+
+
+def l1_tool_output_block() -> float:
+    """The tool-output withholding threshold on L1's raw axis (read live, so a harness can patch it)."""
+    return L1_TOOL_OUTPUT_BLOCK_SCORE
+# MEASURED 2026-10-28 (bench arm B + RCA, scratch/rca/l1/rca_b_arm.json; L1_REVIEW.md "RCA 3"): with Alpaca-only anchors
+# these three signals raised NotInject FPR 3.2 % -> 41 % (the bank: 123 of 128 new false positives) for a TensorTrust
+# recall gain that was bought with those false positives. Anchors are now group-conditional (Alpaca + trigger-word +
+# instructional benign); at those anchors the measured gain is +1.5 points TensorTrust recall. KEEP OFF.
+# New mechanism 4: attack-bank k-NN margin (core/attack_bank.py; deepset / Lakera TRAIN attacks vs benign), mapped by its
+# own conformal anchor onto L1's axis, capped below BLOCK. OFF until measured (held-out deepset test AUROC 0.9655 vs
+# 0.8512 for the Tier-2 anchors: same-source split, an optimistic check, not a reported number).
+L1_ATTACK_BANK = os.getenv("L1_ATTACK_BANK", "false").lower() == "true"
+# New mechanism 6: multilingual Tier 2 (intfloat/multilingual-e5-small; core/multilingual.py), own conformal anchor,
+# capped below BLOCK. OFF until measured on a non-English attack set (deepset test, EN + DE: AUROC 0.9533).
+L1_TIER2_MULTILINGUAL = os.getenv("L1_TIER2_MULTILINGUAL", "false").lower() == "true"
+# New mechanism 3: windowed GPT-2 perplexity (core/perplexity.py) at or above its benign 99th percentile lifts the input
+# to the judge band (clearable floor). Targets optimised adversarial suffixes; OFF until measured (no such set on disk).
+L1_PERPLEXITY_TIER = os.getenv("L1_PERPLEXITY_TIER", "false").lower() == "true"
+# New mechanism 1: the Tier-3 Prompt Guard model. "meta-llama/Llama-Prompt-Guard-2-86M" / "-22M" (binary, adversarial-
+# tokenization-resistant tokenizer per Meta's model card) are GATED on Hugging Face: accept Meta's licence first. A switch
+# moves Tier 3's axis, so L1_WARN_THRESHOLD must be re-derived (conformal_l1_eval.py) before reporting. Default PG 1.
+L1_TIER3_MODEL = os.getenv("L1_TIER3_MODEL", "meta-llama/Prompt-Guard-86M").strip()
+# New mechanism 5: OCR (layer1_ocr.py, RapidOCR) reads text RENDERED in images and scores it with L1, in
+# /sentinel/l1/scan-image and (with L1_PROXY_SCAN_IMAGES) in the proxy. OFF until measured.
+L1_IMAGE_OCR = os.getenv("L1_IMAGE_OCR", "false").lower() == "true"
+# B7: the proxy scans inline (data:) images of the last user message with the LSB scanner (+ OCR when on). Remote image
+# URLs are never fetched (SSRF). OFF until measured.
+L1_PROXY_SCAN_IMAGES = os.getenv("L1_PROXY_SCAN_IMAGES", "false").lower() == "true"
+# ---------------------------------------------------------------------------------------------
+# L2 REVIEW FIXES (2026-10-28; scratch/rca/l2/L2_REVIEW.md, progress in scratch/rca/l2/RESUME.md).
+# Correctness / security fixes default ON (their "off" value reproduces the behaviour before 2026-10-28); detection-
+# changing mechanisms default OFF until measured.
+# ---------------------------------------------------------------------------------------------
+# C1: where /sentinel/chat puts retrieved documents. "user" = their own user-role message before the latest user turn,
+# with a fixed data-not-instructions note in the system prompt; "system" = appended to the system prompt (before).
+L2_RAG_CONTEXT_ROLE = os.getenv("L2_RAG_CONTEXT_ROLE", "user").strip().lower()
+# N4: spotlighting of retrieved documents (Hines et al. 2024). "off" | "datamark" (every whitespace run -> U+02C6, and
+# the system note explains it). OFF until its utility cost is measured on the chat path.
+L2_SPOTLIGHT = os.getenv("L2_SPOTLIGHT", "off").strip().lower()
+# C3: knowledge-base administration (chunk text listing, quarantine, review release) needs an operator: header
+# X-DIDA-Operator-Key == DIDA_OPERATOR_KEY. Unset -> nobody (fail closed) unless DIDA_OPERATOR_OPEN=true (local dev only).
+DIDA_OPERATOR_KEY = os.getenv("DIDA_OPERATOR_KEY", "").strip()
+DIDA_OPERATOR_OPEN = os.getenv("DIDA_OPERATOR_OPEN", "false").lower() == "true"
+# C3: the /sentinel/rag/tamper demonstration endpoint is disabled unless this is set (and the caller is an operator).
+DIDA_DEMO_ENDPOINTS = os.getenv("DIDA_DEMO_ENDPOINTS", "false").lower() == "true"
+# C8: the largest text one ingest may carry (characters); larger -> 413 (0 = no cap). Upload: bytes and pages.
+L2_MAX_DOC_CHARS = int(os.getenv("L2_MAX_DOC_CHARS", "200000"))
+L2_MAX_UPLOAD_BYTES = int(os.getenv("L2_MAX_UPLOAD_BYTES", str(20 * 1024 * 1024)))
+L2_MAX_PDF_PAGES = int(os.getenv("L2_MAX_PDF_PAGES", "300"))
+# C8: L2 model work (density, document threat, embedding) runs in a worker thread instead of on the event loop.
+L2_SCORE_IN_THREAD = os.getenv("L2_SCORE_IN_THREAD", "true").lower() == "true"
+# C9: knowledge-base capacity (external ingests are refused when full, never evicting), quarantine retention, and the
+# per-public-client ingest quota (0 = none). Defaults keep the previous capacity (MAX_TRACKED_SESSIONS).
+L2_KB_MAX_CHUNKS = int(os.getenv("L2_KB_MAX_CHUNKS", str(MAX_TRACKED_SESSIONS)))
+L2_QUARANTINE_MAX_CHUNKS = int(os.getenv("L2_QUARANTINE_MAX_CHUNKS", str(MAX_TRACKED_SESSIONS)))
+L2_KB_QUOTA_PER_PRINCIPAL = int(os.getenv("L2_KB_QUOTA_PER_PRINCIPAL", "200"))
+# C4: content-type detection ignores markers that cost nothing to add (empty / one-line fences; repeated operators), so
+# a poisoned prose document cannot move to the code bin's ~32x more lenient anchor by appending an empty fence.
+L2_STRICT_CODE_DETECTION = os.getenv("L2_STRICT_CODE_DETECTION", "true").lower() == "true"
+# C4: score the prose part of a code document against anchors calibrated on the prose parts of benign code answers
+# (scratch/rca/l2/c4_code_prose_anchor.py), mapped onto the code bin. OFF until measured; inert while anchors unset.
+L2_CODE_PROSE_SPLIT = os.getenv("L2_CODE_PROSE_SPLIT", "false").lower() == "true"
+# Derived 2026-10-28 (scratch/rca/l2/c4_code_prose_anchor.json): WildChat benign code answers, disjoint from R-006c,
+# md5-even half; hold-out FPR 3.0 % at WARN, 0 % at BLOCK. Readout on 300 BIPIA code attacks (TEST split, held out):
+# recall 0.587 -> 0.833 with benign code documents flagged unchanged (1 / 26).
+L2_CODE_PROSE_WARN = float(os.getenv("L2_CODE_PROSE_WARN", "0.5936125142582128"))
+L2_CODE_PROSE_BLOCK = float(os.getenv("L2_CODE_PROSE_BLOCK", "0.999401330947876"))
+# C10: a doc-axis chunk admitted under another scoring configuration (scorer_version) is re-scored at retrieval.
+L2_RESCAN_ON_VERSION = os.getenv("L2_RESCAN_ON_VERSION", "true").lower() == "true"
+# C11: an HMAC over text + verdict + source + scorer version + embedding (record_signature), verified at retrieval.
+L2_SIGN_RECORD = os.getenv("L2_SIGN_RECORD", "true").lower() == "true"
+# C15: an exact duplicate (normalized text) of a stored KB document returns the stored verdict instead of a new copy.
+L2_DEDUPE = os.getenv("L2_DEDUPE", "true").lower() == "true"
+# N1: hidden text in uploaded PDFs (layer2_rag/pdf_hidden.py): "off" | "report" | "strip" (ingest visible text only) |
+# "quarantine" (strip + keep the hidden text as quarantined evidence). OFF until measured on benign PDFs.
+L2_PDF_HIDDEN_TEXT = os.getenv("L2_PDF_HIDDEN_TEXT", "off").strip().lower()
+L2_PDF_HIDDEN_MIN_CHARS = int(os.getenv("L2_PDF_HIDDEN_MIN_CHARS", "20"))
+# C7: "sentence" = sentence-aligned chunks with overlap; "legacy" = fixed 1,000-character cuts. Chunk cap per upload.
+L2_CHUNKING = os.getenv("L2_CHUNKING", "sentence").strip().lower()
+L2_MAX_PDF_CHUNKS = int(os.getenv("L2_MAX_PDF_CHUNKS", "15"))
+# I12 / C16: one short bin per source. Tool outputs keep the tool-population anchor (the per-source values of R-026 v2);
+# KB documents use L2_SHORT_DOC_WARN / _BLOCK, derived by scratch/rca/l2/i12_short_doc_anchor.py on benign short
+# documents incl. instructional text. OFF until measured; with unset document anchors the shipped pair is used.
+L2_SHORT_BIN_BY_SOURCE = os.getenv("L2_SHORT_BIN_BY_SOURCE", "false").lower() == "true"
+L2_SHORT_TOOL_WARN = float(os.getenv("L2_SHORT_TOOL_WARN", "0.9997116923332214"))
+L2_SHORT_TOOL_BLOCK = float(os.getenv("L2_SHORT_TOOL_BLOCK", "0.9999327659606934"))
+# Derived 2026-10-29 (scratch/rca/l2/i12_short_doc_anchor.json): group-conditional over news, BIPIA e-mail TRAIN and
+# OASST instructional replies (max = OASST, hold-out FPR <= 3.7 %). Readout: BIPIA-short recall 0.464 -> 0.947, DIDA
+# recall 0.405 -> 0.649 BUT DIDA benign FPR 0 -> 25 % (corporate notices: a register no calibration source covers).
+# Hence the flag stays OFF; these values are used only when it is switched on.
+L2_SHORT_DOC_WARN = float(os.getenv("L2_SHORT_DOC_WARN", "0.590134"))
+L2_SHORT_DOC_BLOCK = float(os.getenv("L2_SHORT_DOC_BLOCK", "0.995022"))
+# C14 / N5: L2 also scores the "unhide" view (tag characters / variation selectors decoded, invisible + bidi removed,
+# spaced letters collapsed) and checks spoof markers on it. OFF until measured.
+L2_UNHIDE = os.getenv("L2_UNHIDE", "false").lower() == "true"
+# C14 / N5: text carried by invisible characters in third-party content: "off" | "review" (WARN anchor) |
+# "quarantine" (BLOCK anchor). OFF until measured.
+L2_HIDDEN_CHARS_ACTION = os.getenv("L2_HIDDEN_CHARS_ACTION", "off").strip().lower()
+# N3: retrieval diversity against knowledge-corruption floods: one representative per near-duplicate cluster
+# (cosine >= L2_DUP_COSINE; a cluster of >= L2_DUP_CLUSTER_MIN is reported) and at most L2_MAX_PER_SOURCE per source.
+# OFF until measured (it can drop a second relevant passage from the same source).
+L2_RETRIEVAL_DIVERSITY = os.getenv("L2_RETRIEVAL_DIVERSITY", "false").lower() == "true"
+L2_DUP_COSINE = float(os.getenv("L2_DUP_COSINE", "0.95"))
+L2_DUP_CLUSTER_MIN = int(os.getenv("L2_DUP_CLUSTER_MIN", "3"))
+L2_MAX_PER_SOURCE = int(os.getenv("L2_MAX_PER_SOURCE", "1"))
+# N2: known-answer detection at ingest ("off" | "kb" | "all"); a contaminated result -> the bin's WARN anchor (review).
+# N8: LLM detect-and-remove at ingest ("off" | "report" | "remove"). Both cost one hosted call per document. OFF.
+L2_KAD = os.getenv("L2_KAD", "off").strip().lower()
+# L2_DETECT_REMOVE: "off" | "report" (record only) | "review" (a detected injection holds the KB document for review) |
+# "remove" (strip the quoted injection, quarantine the original; hold when stripping fails). MEASURED 2026-10-29
+# (scratch/rca/l2/r08 / r09, qwen/qwen3.8-27b): DIDA poisoned documents 37 / 37, BIPIA e-mail attacks 43 / 120, benign
+# 0 / 278 (DIDA corporate notices, BIPIA e-mails, OASST instructional, news). One hosted call per KB document at ingest
+# (data leaves the machine) -> OFF by default; "review" is the recommended setting once the user accepts that.
+L2_DETECT_REMOVE = os.getenv("L2_DETECT_REMOVE", "off").strip().lower()
+# L2 redesign 2026-10-30 (layer2_rag/local_detector.py; scratch/rca/l2/L2_REDESIGN.md): the LOCAL model's document
+# probe (artifact core/artifacts/l2_doc_probe.npz). off | report | review ("review" holds a detected document like the
+# N8 hold, on top of the shipped scorers) | authoritative (when the detector answers, its decision replaces the shipped
+# SOFT document-threat verdict; spoof / hidden-text / known-answer checks still apply; no answer -> shipped verdict).
+# Measured end to end (BIPIA t5, results.md §20.8): "review" 0.983 recall but 12.2 % FP on pasted passages, because the
+# shipped soft scorer runs at its alpha-0.05 anchors. "authoritative" (end to end 0.954 recall at 0.0 / 1.7 / 1.5 %
+# FP on clean / code / pasted, results.md §20.11) is the SHIPPED DEFAULT since 2026-11-03 (user: make the L2 gains
+# real); without the local model it fails soft to the shipped verdict. L2_LOCAL_DETECTOR=off restores the old path.
+L2_LOCAL_DETECTOR = os.getenv("L2_LOCAL_DETECTOR", "authoritative").strip().lower()
+# Also read session-scoped TOOL OUTPUTS with the detector's tool bin (max-z of probe and judge read-out). Off by default.
+L2_LOCAL_DETECTOR_TOOLS = os.getenv("L2_LOCAL_DETECTOR_TOOLS", "false").lower() == "true"
+# L2 v6 round (scratch/rca/l2/L2_REDESIGN.md "ROUTING round"): documents of the OTHER content bin are decided by the
+# probe trained with middle-position and translated injections (core/artifacts/l2_doc_probe_v6.npz, layer 24); code
+# documents and tool outputs keep l2_doc_probe.npz. TEST t9 (one read): middle 0.786 -> 0.926, long-document middle
+# 0.84 -> 0.93, translated attacks 0.56-0.80 -> 0.90-0.99, BIPIA 0.954 -> 0.965, FP unchanged (pasted 1.58 -> 1.76 %).
+# Below the 0.92 mark on zh / it / ru / nl (0.90-0.92) without the translated view below. ON by default since
+# 2026-11-03 (user decision; results.md §20.18).
+L2_LOCAL_PROBE_ROUTING = os.getenv("L2_LOCAL_PROBE_ROUTING", "true").lower() == "true"
+# L2 v7 round (pre-registered, L2_REDESIGN.md): one more reading of a document whose non-English prose segments are
+# replaced by English translations (layer2_rag/translate_view.py; Helsinki-NLP/opus-mt-mul-en, local copy in
+# ~/.cache/sentinel/mt). Documents only (not tool outputs). TEST t9 with routing: it 0.906 -> 0.948, ru 0.918 -> 0.939,
+# nl 0.898 -> 0.949, de / fr / es 0.95-1.00, zh 0.916 (unchanged); FP pasted 1.76 %, code 0.68 %, translated benign 0.
+# ON by default since 2026-11-03 (user decision; results.md §20.19). No model -> no view (fail soft).
+L2_LOCAL_TRANSLATE_VIEW = os.getenv("L2_LOCAL_TRANSLATE_VIEW", "true").lower() == "true"
+# llama-3.1-8b-instant is retired on Groq (404, 2026-10-29); qwen/qwen3.8-27b answers the checks directly (~50 tokens).
+L2_LLM_CHECK_MODEL = os.getenv("L2_LLM_CHECK_MODEL", "qwen/qwen3.8-27b").strip()
+# N6: "shared" (public ingests are retrievable when their score admits them) | "review" (public KB documents are held
+# for an operator's release whatever their score). Default unchanged.
+L2_PUBLIC_KB_POLICY = os.getenv("L2_PUBLIC_KB_POLICY", "shared").strip().lower()
+# C6: the doc-axis PROSE bin's BLOCK anchor. It was L2_BLOCK_THRESHOLD = 0.60, a LEGACY-axis constant (1 - QUARANTINE).
+# The doc-axis alpha-0.01 split-conformal anchor on the same benign news split is 0.553796 (scratch/rca/v3/
+# d03_l2_cred_anchor.json, "new.0.01.tau_other": news hold-out FPR 0.0, BIPIA benign FPR 0.0033). "false" -> 0.60.
+L2_DOC_PROSE_BLOCK_DERIVED = os.getenv("L2_DOC_PROSE_BLOCK_DERIVED", "true").lower() == "true"
+L2_DOCUMENT_THREAT_BLOCK_THRESHOLD = float(os.getenv("L2_DOCUMENT_THREAT_BLOCK_THRESHOLD", "0.553796"))
+# REJECTED 2026-10-29 (scratch/rca/l2/r06): inserted BENIGN blocks are flagged about as often as attacks (61 % vs 73 % at
+# alpha 0.05), i.e. it detects insertion, not malice; no anchor keeps the union FPR within 5 %. Kept inert for the record.
+# L2 RCA 2 candidate: code-block incoherence (document_threat._apply_code_incoherence) lifts a code document to the code
+# bin's WARN when one block does not fit the rest of the answer. OFF; inert until a gated anchor is set
+# (scratch/rca/l2/r06_incoherence_controls.py: insertion control + union budget).
+L2_CODE_INCOHERENCE = os.getenv("L2_CODE_INCOHERENCE", "false").lower() == "true"
+L2_CODE_INCOHERENCE_TAU = float(os.environ["L2_CODE_INCOHERENCE_TAU"]) if os.getenv("L2_CODE_INCOHERENCE_TAU") else None

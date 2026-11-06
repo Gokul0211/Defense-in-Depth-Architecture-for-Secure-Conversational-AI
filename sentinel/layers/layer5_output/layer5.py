@@ -156,7 +156,13 @@ async def layer5_scan_output(
     session = await threat_bus.get_session(session_id)
 
     # 1. PII Scan
-    pii_findings, sanitized_text = scan_for_pii(response_text, user_text=_user_supplied_text(session))
+    import sentinel.config as _cfg5
+    _policy = bool(getattr(_cfg5, "L5_FIELD_POLICY", False)) and bool(
+        getattr(session, "policy_private_values", None) or getattr(session, "policy_allowed_values", None))
+    _exempt = _user_supplied_text(session)
+    if _policy:   # values the declared policy allows are not a disclosure (results.md §21.6)
+        _exempt = " ".join([_exempt or ""] + list(session.policy_allowed_values))
+    pii_findings, sanitized_text = scan_for_pii(response_text, user_text=_exempt)
     if pii_findings:
         reasons.append(f"Redacted {len(pii_findings)} PII instances")
         
@@ -193,6 +199,12 @@ async def layer5_scan_output(
     )
     if provenance_findings:
         reasons.extend(provenance_findings)
+    if _policy:
+        from sentinel.core.sensitive_value_extractor import policy_findings
+        _pf = policy_findings(response_text, session)
+        if _pf:
+            provenance_findings = list(provenance_findings) + _pf
+            reasons.extend(_pf)
 
     # Compose the two component scores separately, then blend.
     #

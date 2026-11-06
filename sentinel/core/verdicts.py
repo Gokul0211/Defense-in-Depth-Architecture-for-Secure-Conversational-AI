@@ -21,6 +21,8 @@ L1_TIER_LABELS = {
     2: "Tier 2 semantic",
     3: "Tier 3 classifier (Prompt Guard x PIGuard)",
     4: "Tier 4 policy judge",
+    0: "T0 hidden-content signal",
+    6: "perplexity signal",
 }
 
 
@@ -179,14 +181,17 @@ def l5_verdict(l5_result) -> dict:
 
 def steg_verdict(steg_result: dict, filename: str | None = None) -> dict:
     """Severity/action/chain for `layer1_steg_scan`, matching /sentinel/l1/scan-image."""
-    score = max(float(steg_result.get("chi_score", 0.0)), float(steg_result.get("l1_score", 0.0)))
-    action = "BLOCKED" if steg_result.get("is_malicious") else "ALLOWED"
+    # The scanner publishes its own shared-axis score since L1 review B13; older results carry only the two parts.
+    score = float(steg_result["score"]) if "score" in steg_result else max(
+        float(steg_result.get("chi_score", 0.0)), float(steg_result.get("l1_score", 0.0)))
+    action = ("BLOCKED" if steg_result.get("is_malicious")
+              else "WARNED" if steg_result.get("suspicious") else "ALLOWED")
     chi = float(steg_result.get("chi_score", 0.0))
     decoded = steg_result.get("decoded_text") or ""
     chain = [{
         "layer": "L1",
         "severity": score_to_severity(chi),
-        "finding": f"LSB chi-square suspicion: {chi:.2f}" + (f" ({filename})" if filename else ""),
+        "finding": f"LSB embedding statistic: {chi:.2f}" + (f" ({filename})" if filename else ""),
         "action": "ANALYZE",
     }, {
         "layer": "L1",

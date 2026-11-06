@@ -1,0 +1,32 @@
+{
+  "built": "2026-10-27 22:13",
+  "embedding_model": "all-MiniLM-L6-v2",
+  "k": 5,
+  "n_attack": 1575,
+  "n_benign": 1343,
+  "attack_sources": {
+    "deepset/prompt-injections train label 1": 203,
+    "Lakera/gandalf_ignore_instructions train": 777,
+    "Lakera/mosscap_prompt_injection train (seed 0 sample)": 600
+  },
+  "benign_sources": {
+    "deepset/prompt-injections train label 0": 343,
+    "alpaca rows 6000-7000": 1000
+  },
+  "calibration": "alpaca rows 7000-7500 (n=500), conformal alpha=0.01",
+  "tau_margin01": 0.692130446434021,
+  "heldout_check": {
+    "set": "deepset/prompt-injections test",
+    "n_attack": 60,
+    "n_benign": 56,
+    "auroc_bank_margin": 0.9654761904761904,
+    "auroc_tier2_anchors": 0.8511904761904763
+  },
+  "texts_stored": false,
+  "tau_margin01_alpaca_only": 0.5577248930931091,
+  "recalibrated": {
+    "date": "2026-10-28",
+    "method": "group-conditional alpha 0.01 (see l1_new_tiers.json)",
+    "evidence": "scratch/rca/l1/rca_b_arm.json"
+  }
+}

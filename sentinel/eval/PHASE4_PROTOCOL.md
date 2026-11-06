@@ -1,5 +1,9 @@
 # Phase 4 Protocol — Cross-Layer Correlation Advantage Study
 
+<!-- status-banner 2026-11-03 -->
+> **Historical document (last updated 2026-09-15).** Kept as a record; numbers and design notes may be superseded. Current state: `README.md` ("Since the paper"), the board in `results.md` §21 (metrics policy §21.1), the plan in `fixing.md` ("STATUS 2026-11-03").
+
+
 **Frozen: 2026-09-14, before any Phase 4 benchmark construction, code, or
 ablation run exists.** This file is the checkable artifact proving the
 benchmark and success criteria were fixed before results could influence

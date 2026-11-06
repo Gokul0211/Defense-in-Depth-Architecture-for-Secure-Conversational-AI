@@ -180,6 +180,40 @@ def dangerous_code_score(text: str) -> float:
     return sum(1 for rx in fams.values() if rx.search(text)) / len(fams)
 
 
+_PG1 = "meta-llama/Prompt-Guard-86M"
+_own_pg1 = None
+_own_pg1_failed = False
+
+
+def _prompt_guard_v1():
+    """
+    Prompt Guard 1 for L2, whatever L1 uses (L2 review C13).
+
+    This axis reads Prompt Guard 1's 3-class `benign` probability. It reused L1's singleton, so setting
+    L1_TIER3_MODEL to a binary model (Prompt Guard 2) made every long document silently fall back to the legacy axis.
+    L1's instance is shared when it IS Prompt Guard 1 (one copy in memory, the old behaviour); otherwise L2 loads its
+    own pinned copy.
+    """
+    global _own_pg1, _own_pg1_failed
+    import sentinel.config as cfg
+    if getattr(cfg, "L1_TIER3_MODEL", _PG1) == _PG1:
+        from sentinel.layers.layer1 import _get_prompt_guard
+        return _get_prompt_guard()
+    if _own_pg1_failed:
+        return None
+    if _own_pg1 is None:
+        try:
+            from sentinel.eval.baselines.prompt_guard import PromptGuardBaseline
+            g = PromptGuardBaseline(model_name=_PG1)
+            g._load()
+            _own_pg1 = g
+        except Exception as e:                                        # noqa: BLE001
+            logger.warning(f"Prompt Guard 1 unavailable for L2: {e}")
+            _own_pg1_failed = True
+            return None
+    return _own_pg1
+
+
 def _benign_prob(text: str) -> float | None:
     """
     Prompt Guard's `benign` class probability for the whole document.
@@ -189,9 +223,7 @@ def _benign_prob(text: str) -> float | None:
     double L2's resident memory for no benefit. Returns None when the model is
     unavailable, so the caller can fail soft instead of scoring everything 0.
     """
-    from sentinel.layers.layer1 import _get_prompt_guard
-
-    guard = _get_prompt_guard()
+    guard = _prompt_guard_v1()
     if guard is None:
         return None
     segments = segment_document(text)
@@ -284,14 +316,27 @@ def _piguard_injection_prob(text: str) -> float | None:
         return None
 
 
-def short_document_threat(text: str, force: bool = False) -> dict | None:
+def _short_bin_name(source_kind: str | None) -> str:
+    """L2 review I12 / C16 (config.L2_SHORT_BIN_BY_SOURCE): one short bin per source. The shipped bin's anchor is
+    the MAXIMUM over its calibration sources -- benign news paragraphs WARN 0.000128, benign agent tool outputs WARN
+    0.999712 (l2_short_anchor_20260925_232659.json) -- so every short KB document was held to the tool-output bar
+    (DIDA-Bench recall 0.405, BIPIA short 0.464; scratch/rca/l2/r02). With the flag, tool outputs keep that bar and KB
+    documents get their own anchor, calibrated on benign short documents that include instructional, human-addressed
+    text (r02 showed a news-only anchor flags every benign corporate notice)."""
+    import sentinel.config as cfg
+    if not getattr(cfg, "L2_SHORT_BIN_BY_SOURCE", False):
+        return "short"
+    return "short_tool" if source_kind == "tool" else "short_doc"
+
+
+def short_document_threat(text: str, force: bool = False, source_kind: str | None = None) -> dict | None:
     """Threat for text below the long-document gate, or None if the short bin is off.
     `force=True` scores even with underived anchors (anchor-derivation scripts only)."""
     import sentinel.config as cfg
 
     if getattr(cfg, "L2_SHORT_DOC_SCORER", "legacy") != "piguard" and not force:
         return None
-    base = {"content_type": "short", "bin": "short", "not_benign": None}
+    base = {"content_type": "short", "bin": _short_bin_name(source_kind), "not_benign": None}
     if not force and (cfg.L2_DOCUMENT_THREAT_WARN_THRESHOLD_SHORT is None
                       or cfg.L2_DOCUMENT_THREAT_BLOCK_THRESHOLD_SHORT is None):
         return {**base, "threat": 0.0, "available": False, "reason": "short_doc_anchor_underived"}
@@ -304,7 +349,7 @@ def short_document_threat(text: str, force: bool = False) -> dict | None:
             "piguard_injection": pig, "dangerous_code": danger}
 
 
-def document_threat_score(text: str) -> dict:
+def document_threat_score(text: str, source_kind: str | None = None) -> dict:
     """
     Threat score in [0, 1] for a retrieved document, plus its components.
 
@@ -321,7 +366,7 @@ def document_threat_score(text: str) -> dict:
     # sit far higher on this axis than prose, so they carry their own anchor.
     ctype = detect_content_type(text)
     if len(text) < _MIN_DOC_CHARS:
-        short = short_document_threat(text)
+        short = short_document_threat(text, source_kind=source_kind)
         if short is not None and short.get("available"):
             return {**short, "instruction_max": profile["max"],
                     "instruction_contrast": profile["contrast"]}
@@ -355,7 +400,7 @@ def document_threat_score(text: str) -> dict:
     # and recall at 1% FPR goes 0.3740 -> 0.4133. Robustness and low-FPR recall
     # were preferred over a fifth of a point of pooled ranking.
     threat = 1.0 - (1.0 - base) * (1.0 - danger)
-    return {
+    out = {
         "threat": max(0.0, min(threat, 1.0)),
         "available": True,
         "content_type": ctype,
@@ -365,3 +410,114 @@ def document_threat_score(text: str) -> dict:
         "dangerous_code": danger,
         "n_segments": len(segment_document(text)),
     }
+    if ctype == "code":
+        _apply_code_prose_part(text, out)
+        _apply_code_incoherence(text, out)
+    return out
+
+
+def code_blocks(text: str) -> list[str]:
+    """Contiguous code runs of a document (fenced bodies; indented / declaration / symbol-dense lines), >= 2 lines."""
+    from sentinel.core.content_type import _DECL_LINE, _symbol_ratio
+    blocks, cur = [], []
+    for i, part in enumerate(re.split(r"```[^\n]*\n?", text or "")):
+        if i % 2 == 1:
+            if cur:
+                blocks.append("\n".join(cur)); cur = []
+            if part.strip():
+                blocks.append(part.strip())
+            continue
+        for ln in part.splitlines():
+            s = ln.strip()
+            if s and (ln.startswith(("    ", "\t")) or _DECL_LINE.match(ln) or _symbol_ratio(s) > 0.15):
+                cur.append(ln)
+            elif s and cur:
+                blocks.append("\n".join(cur)); cur = []
+    if cur:
+        blocks.append("\n".join(cur))
+    return [b for b in blocks if sum(1 for l in b.splitlines() if l.strip()) >= 2]
+
+
+def block_incoherence(text: str) -> float | None:
+    """1 - min over code blocks of cos(block, rest of the document) in MiniLM space; None without a scorable block.
+    Content-neutral: it asks whether a block belongs to the answer it sits in, not what the code does."""
+    import numpy as _np
+    from sentinel.core.embedding import get_model
+    vals = []
+    for b in code_blocks(text):
+        rest = text.replace(b, " ")
+        if len(rest.strip()) < 50:
+            continue
+        e = _np.asarray(get_model().encode([b[:2000], rest[:4000]]))
+        vals.append(float(e[0] @ e[1] / (_np.linalg.norm(e[0]) * _np.linalg.norm(e[1]) + 1e-12)))
+    return (1.0 - min(vals)) if vals else None
+
+
+def _apply_code_incoherence(text: str, out: dict) -> None:
+    """
+    L2 RCA 2 candidate (config.L2_CODE_INCOHERENCE, OFF; inert while L2_CODE_INCOHERENCE_TAU is unset). An injected
+    snippet is usually off-topic for the answer it is inserted into; a code block whose similarity to the rest of the
+    document is below the benign anchor lifts the document to the code bin's WARN anchor (held for review). Evidence of
+    a misfit, not of intent, so it never quarantines on its own. Adoption gates (scratch/rca/l2/r06): an insertion
+    control (benign off-topic blocks) and a union budget with the prose-part check on held-out benign code answers.
+    """
+    import sentinel.config as cfg
+    tau = getattr(cfg, "L2_CODE_INCOHERENCE_TAU", None)
+    if not getattr(cfg, "L2_CODE_INCOHERENCE", False) or tau is None:
+        return
+    inc = block_incoherence(text)
+    if inc is None:
+        return
+    out["block_incoherence"] = inc
+    if inc >= tau:
+        bin_w = cfg.L2_DOCUMENT_THREAT_WARN_THRESHOLD_CODE
+        if out["threat"] < bin_w:
+            out.setdefault("base_threat", out["threat"])
+            out["threat"] = min(1.0, bin_w + 1e-6)
+
+
+CODE_PROSE_MIN_CHARS = 200
+
+
+def prose_part_score(prose: str) -> float | None:
+    """The score the prose part of a code document is judged by (and its anchors derived with,
+    scratch/rca/l2/c4_code_prose_anchor.py): the doc-axis base (Prompt Guard non-benign x instruction contrast) for a
+    prose part of >= _MIN_DOC_CHARS, else PIGuard's injection probability -- each the scorer validated for that length.
+    None when the needed model is unavailable."""
+    if len(prose) >= _MIN_DOC_CHARS:
+        benign = _benign_prob(prose)
+        if benign is None:
+            return None
+        return (1.0 - benign) * (1.0 + instruction_profile(prose)["contrast"]) / 2.0
+    return _piguard_injection_prob(prose)
+
+
+def _apply_code_prose_part(text: str, out: dict) -> None:
+    """
+    L2 review C4 (config.L2_CODE_PROSE_SPLIT, OFF until measured). A code document is judged on the code bin's anchor,
+    calibrated on benign code answers, which is right for the code but lets any prose carried alongside it ride on
+    that lenient bar. The prose part is scored on its own and compared with anchors calibrated on the PROSE PARTS of
+    benign code answers (L2_CODE_PROSE_WARN / _BLOCK); the result is mapped onto the code bin's axis (its WARN -> the
+    bin's WARN, BLOCK -> BLOCK, strictly monotone) and max-fused into `threat`. Inert while the anchors are unset.
+    """
+    import sentinel.config as cfg
+    if not getattr(cfg, "L2_CODE_PROSE_SPLIT", False):
+        return
+    w, b = getattr(cfg, "L2_CODE_PROSE_WARN", None), getattr(cfg, "L2_CODE_PROSE_BLOCK", None)
+    if w is None or b is None:
+        return
+    from sentinel.core.content_type import split_code_prose
+    _, prose = split_code_prose(text)
+    if len(prose) < CODE_PROSE_MIN_CHARS:
+        return
+    s = prose_part_score(prose)
+    if s is None:
+        return
+    from sentinel.layers.layer2_rag.chunk_store import _map_onto_bin
+    bin_w = cfg.L2_DOCUMENT_THREAT_WARN_THRESHOLD_CODE
+    bin_b = max(cfg.L2_BLOCK_THRESHOLD, cfg.L2_DOCUMENT_THREAT_BLOCK_THRESHOLD_CODE)
+    mapped = _map_onto_bin(s, w, max(b, w + 1e-6), bin_w, max(bin_b, bin_w + 1e-6))
+    out["prose_part"] = {"chars": len(prose), "score": s, "mapped": mapped}
+    if mapped > out["threat"]:
+        out["base_threat"] = out["threat"]
+        out["threat"] = mapped

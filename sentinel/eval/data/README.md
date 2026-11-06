@@ -1,5 +1,9 @@
 # SENTINEL Evaluation Datasets
 
+<!-- status-banner 2026-11-03 -->
+> **STATUS 2026-11-03:** datasets added since this list: AgentDojo v1.2 (effect replay), InjecAgent, Agent Security Bench (ASB, MIT; scratch/rca/l2/ext_data/asb), WildChat shards 0-1 (benign code / text), AESLC Enron, XSum, OASST, BIPIA test draws t5-t9 (scratch/rca/l2/l2p/pools.json). Third-party corpora are not redistributed.
+
+
 This directory contains all evaluation datasets used for benchmarking SENTINEL.
 
 ## Structure

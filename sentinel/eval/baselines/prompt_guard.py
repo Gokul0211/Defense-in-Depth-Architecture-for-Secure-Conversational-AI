@@ -48,9 +48,13 @@ class PromptGuardBaseline:
 
     MODEL_NAME = "meta-llama/Prompt-Guard-86M"
 
-    def __init__(self, device: str = "auto", threshold: float = 0.5):
+    def __init__(self, device: str = "auto", threshold: float = 0.5, model_name: str | None = None):
+        # L1 review (new mechanism 1): `model_name` selects Llama Prompt Guard 2 (86M / 22M), a BINARY classifier
+        # (benign, malicious); its score is P(malicious), read by the binary branch below. Default: Prompt Guard 1.
         self.device = device
         self.threshold = threshold
+        if model_name:
+            self.MODEL_NAME = model_name
         self._model = None
         self._tokenizer = None
 
@@ -101,8 +105,8 @@ class PromptGuardBaseline:
         # that is two forward passes over identical text, and Prompt Guard is the
         # most expensive operation in the pipeline.
         cached = self._cached_probs(text)
-        if cached is not None and "jailbreak_prob" in cached:
-            score = cached["jailbreak_prob"]
+        if cached is not None and ("jailbreak_prob" in cached or "score" in cached):
+            score = cached.get("jailbreak_prob", cached.get("score"))
             return BaselineResult(
                 score=score,
                 label="malicious" if score >= self.threshold else "benign",
@@ -162,7 +166,7 @@ class PromptGuardBaseline:
         else:
             # Binary output
             score = float(probs[0, 1]) if probs.shape[-1] == 2 else float(probs[0, 0])
-            details = {"raw_probs": probs[0].tolist()}
+            details = {"score": score, "raw_probs": probs[0].tolist()}
 
         self._store_probs(text, dict(details, latency_ms=elapsed_ms))
 
@@ -213,11 +217,17 @@ class PromptGuardBaseline:
     # limit, and holding only floats.
     _PROBS_CACHE_MAX = 4096
 
+    @staticmethod
+    def _cache_key(text: str) -> str:
+        """L1 review B14: a digest, not the text, so 4,096 long documents cannot pin their full text in memory."""
+        import hashlib
+        return hashlib.sha256((text or "").encode("utf-8", "surrogatepass")).hexdigest()
+
     def _cached_probs(self, text: str):
         cache = getattr(self, "_probs_cache", None)
         if cache is None:
             cache = self._probs_cache = {}
-        return cache.get(text)
+        return cache.get(self._cache_key(text))
 
     def _store_probs(self, text: str, row: dict) -> None:
         cache = getattr(self, "_probs_cache", None)
@@ -226,7 +236,7 @@ class PromptGuardBaseline:
         if len(cache) >= self._PROBS_CACHE_MAX:
             for k in list(cache)[: self._PROBS_CACHE_MAX // 4]:
                 cache.pop(k, None)
-        cache[text] = row
+        cache[self._cache_key(text)] = row
 
     def probs_batch(self, texts: list[str], batch_size: int = 32) -> list[dict]:
         """

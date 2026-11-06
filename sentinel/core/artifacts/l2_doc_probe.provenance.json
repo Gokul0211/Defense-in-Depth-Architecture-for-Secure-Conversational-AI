@@ -1,0 +1,25 @@
+{
+ "built": "2026-10-31 21:27",
+ "model": "Qwen/Qwen3-4B-Instruct-2507 (4-bit NF4)",
+ "policy_md5": "05a02bd07210905a13ebf49257174c42",
+ "layer": 20,
+ "insertion_weight": 3.0,
+ "C": 0.02,
+ "thresholds": {
+  "tau_code": 1.440278172492981,
+  "tau_other": 0.673397421836853,
+  "tau_tool_maxz": 6.340836755618171
+ },
+ "dev": "BIPIA TRAIN x TRAIN attacks, news-context injections, tool-output JSON / AgentDojo DEV suites, LLMail-Inject api_triggered attacks, benign Enron / XSum / OASST / BIPIA train contexts, insertion negatives without code blocks (scratch/rca/l2/l2p01, l2p11, l2p17, l2p19, l2p21, l2p23)",
+ "calibration": "group-conditional split-conformal alpha 0.01 per bin: documents code / other over table, news, OASST, code, pasted-passage, Enron e-mail groups; tool outputs over AgentDojo benign, benign JSON, LLMail benign e-mails, Enron e-mail tool groups",
+ "test_results": {
+  "ia_mal_recall": 0.6869070208728653,
+  "ia_ben_fpr": 0.0058823529411764705,
+  "t6_email_benign_fpr": 0.010582010582010581,
+  "t7_enron_benign_fpr": 0.0025,
+  "dida_all": 1.0,
+  "dida_benign_fpr": 0.0
+ },
+ "record": "scratch/rca/l2/L2_REDESIGN.md",
+ "texts_stored": false
+}

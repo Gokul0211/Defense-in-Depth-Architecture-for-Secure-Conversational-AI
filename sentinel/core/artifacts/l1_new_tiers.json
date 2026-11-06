@@ -1,0 +1,31 @@
+{
+  "built": "2026-10-27 22:15",
+  "perplexity": {
+    "model": "openai-community/gpt2",
+    "window": 16,
+    "stride": 8,
+    "tau_nats": 7.372726500034332,
+    "calibration": "alpaca rows 7000-7500 (n=500), conformal alpha=0.01",
+    "heldout_check": {
+      "set": "deepset test",
+      "auroc": 0.5742559523809524
+    },
+    "tau_nats_alpaca_only": 6.760915470123291
+  },
+  "multilingual": {
+    "model": "intfloat/multilingual-e5-small",
+    "tau_cos": 0.8990628123283386,
+    "calibration": "alpaca rows 7000-7250 + 250 non-English WildChat first user turns (shard 0), conformal alpha=0.01",
+    "heldout_check": {
+      "set": "deepset test (English + German)",
+      "auroc": 0.9532738095238096
+    },
+    "tau_cos_alpaca_only": 0.866712212562561
+  },
+  "recalibrated": {
+    "date": "2026-10-28",
+    "method": "group-conditional split-conformal, alpha 0.01: max over the Alpaca anchor and three benign populations the first anchors never saw (synthetic trigger-word benign, OASST trigger-word texts, OASST instructional replies)",
+    "evidence": "scratch/rca/l1/rca_b_arm.json (fix F1)",
+    "why": "the Alpaca-only anchors held 1 % on Alpaca but not on harder benign text (bench arm B, NotInject FPR 41 %)"
+  }
+}

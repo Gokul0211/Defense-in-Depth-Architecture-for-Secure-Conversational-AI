@@ -16,6 +16,7 @@
 ![multi-turn](https://img.shields.io/badge/cipher%20jailbreak%20AUROC-0.996-brightgreen)
 ![runs local](https://img.shields.io/badge/runs%20on-a%204%20GB%20laptop%20GPU-orange)
 
+[Since the paper](#since-the-paper) ·
 [What it does](#what-it-does) ·
 [Results](#results) ·
 [The research](#research) ·
@@ -34,6 +35,62 @@
 - 🤖 **On a live Gemini agent** (AgentDojo), DIDA's tool-call check alone cuts attack success from **58.8% to 10.3%** with **zero loss** of benign task success. The full defense gets it to **4.4%**.
 - 🔬 **A research result:** layered guardrails don't compose the way people assume. No detector that reads threshold crossings can catch an attacker who keeps every layer just under its threshold. And no statistically valid fusion beats the best single layer unless it assumes the layers are independent. We prove both, then show they hold on DIDA **and** on a second stack built from third-party parts (LLM Guard + Llama Guard 3).
 - 📒 **Nothing hand-waved:** every number below comes from [`results.md`](results.md), the full lab log of every run, bug, fix and superseded figure.
+
+---
+
+<a id="since-the-paper"></a>
+
+## 🆕 Since the paper (October–November 2026)
+
+The results tables further down are the paper's measurements (September 2026). The work since then ran in rounds
+with pre-registered DEV / VAL / one-time TEST protocols on fresh, untouched test draws; everything is logged in
+[`results.md`](results.md) §18–§21 (current board: §21, metrics and 95 % intervals: §21.1).
+
+| Layer | What changed | Shipped by default? | Measured (fresh test draws) |
+|---|---|---|---|
+| **L2** documents | A **local document detector**: a 4-bit Qwen3-4B reads the document under a document policy and a linear probe on its residual stream decides, with split-conformal thresholds per content type. Code and prose go to separate probes; non-English prose segments get one more reading translated to English (opus-mt-mul-en); long documents are read in windows, hidden-character text unhidden. | **Yes**, since 2026-11-03 (`L2_LOCAL_DETECTOR=authoritative`, `L2_LOCAL_PROBE_ROUTING`, `L2_LOCAL_TRANSLATE_VIEW`). Without the local model it falls back to the earlier scorer. | BIPIA **0.969**; injection in the middle of a document **0.926** (long documents 0.930); injections translated into German / French / Spanish / Italian / Russian / Dutch **0.94–1.00**, Chinese 0.916; DIDA **1.0**. False positives: pasted passages 1.8 %, code 0.7 %, e-mail and translated benign text 0. |
+| **L4** tool calls | **Action authorization** at the tool boundary: an intent contract (which actions the user asked for, with which values), value lineage (where every argument came from: the user, a system of record, or document text) and a trust matrix per argument class. | **Yes**, since 2026-10-23 (`L4_AUTHZ`; the contract is written by a hosted model, with a lexicon fallback). | AgentDojo, 398 held-out attack pairs, effect-level replay: 3 attacks with an effect when the user declines unexpected confirmations (0.8 %). |
+| | A **fully local profile**: the contract and a per-call alignment check written by the local Qwen3-4B (nothing leaves the machine), copied-argument guards, and a named-source rule for actions the user did not ask for. | No (opt-in profile). | AgentDojo held-out: 0 / 398 with a declining user, 38 / 398 when every confirmation is approved — statistically the same as the hosted candidate (paired McNemar p = 0.79); InjecAgent 100 % stopped, 0 / 34 benign held; Agent Security Bench 99.5 % stopped. **Named-source rule** (2026-11-06, `L4_NAMED_SOURCE_AUTHORITY`, in the local profile): a value from a document the user pointed at, of the kind the user asked for, needs no confirmation unless the text around it reads as an injection — benign tasks prompted 16.5 % → 8.2 %. **v10** (adds v8's necessity question, guarded so it cannot turn a block into a confirmation, and an entity anchor): **5.2 %** of benign tasks prompted, benign utility 0.41 → **0.52**, still **0 / 398** attacks with a declining user, whose utility under attack (0.46) now equals that of a user who approves everything. |
+| **L1** prompts | A local judge and residual-probe ensemble (Qwen3-4B) plus a ProtectAI feature. | No (`L1_LOCAL_JUDGE`, `L1_LLM_PROBE`). | Untouched TensorTrust split (800 attacks): shipped **0.465** → candidate **0.805**, at a NotInject false-positive rate of 4.4 %. |
+| | v8 round (2026-11-06): probe score S1 plus **AUTH**, which lets the local probe overrule soft-tier false alarms (hard pattern matches keep their verdict). | No (best measured, below the mark). | Fourth untouched TensorTrust split (537), read once: hijacking **0.853**, extraction **0.713** (shipped 0.523 / 0.448); fifth untouched split (800), read once: **0.802 / 0.783** (shipped 0.500 / 0.450); NotInject false positives **2.65 %** (shipped 3.24 %); pooled precision 0.98–0.99. A probe adapted on the spent TensorTrust sets (v10) adds ~4 points on a sixth untouched split: **0.832 / 0.780**, NotInject 2.95 %. A **fine-tuned classifier** stage (v11, ProtectAI DeBERTa tuned on the spent sets) on a seventh untouched split: **0.846 / 0.843**, NotInject **1.77 %**, precision 0.991. |
+| **L5** outputs | **Field policy**: the operator declares which record fields a task may disclose; L5 matches the other fields' values exactly. | No (`L5_FIELD_POLICY`; for sessions with a declared policy). | AgentLeak scenario split, TEST read once: recall **1.000**, false positives **0.91 %**, precision 0.976 (shipped 0.900 / 5.3 %). On AgentLeak the check mirrors how the label is built: it shows the policy is enforced, not that L5 infers which fields are private. |
+
+**Every metric, every layer** (shipped configuration unless marked; 95 % Wilson intervals; AUROC / AUPRC ranked against
+all benign rows of the same run; latency per item on an i5-12500H laptop with a 4 GB RTX 3050). Full tables, one row per
+dataset slice, with sources: [`results.md`](results.md) §21.5.
+
+| Layer · benchmark | n attack / benign | Recall [95 % CI] | FP rate [95 % CI] | Precision | F1 | AUROC | AUPRC | Latency mean / p95 |
+|---|---|---|---|---|---|---|---|---|
+| **L1** TensorTrust untouched + DIDA vs NotInject + Alpaca + DIDA benign | 859 / 892 | 0.502 (TensorTrust 0.465 [0.431, 0.500]) | 1.35 % (NotInject 3.24 % [1.82, 5.72]) | 0.973 | 0.662 | 0.854 | 0.875 | 0.2–0.5 / 0.2–1.9 s |
+| L1 probe candidate (off) | 859 / 892 | 0.789 (TensorTrust 0.774 [0.744, 0.801]) | 1.57 % (NotInject 3.83 %) | 0.980 | 0.874 | 0.916 | 0.931 | 1.7–2.3 / 2.4–5.2 s |
+| L1 S1 + AUTH (off; v8, fourth untouched TensorTrust split, read once) | 537 / 892 | 0.816 (hijacking 0.853 [0.814, 0.884], extraction 0.713 [0.634, 0.781]) | 1.01 % (NotInject 2.65 % [1.40, 4.97]) | 0.980 | 0.890 | 0.983 (score) | 0.978 | probe stage 1.7–2.3 s |
+| L1 S1 + AUTH (off) · fifth untouched TensorTrust split, read once | 800 / 892 | 0.795 (hijacking 0.802 [0.765, 0.835], extraction 0.783 [0.733, 0.826]) | 1.01 % (NotInject 2.65 % [1.40, 4.97]) | 0.986 | 0.880 | 0.981 (score) | 0.982 | probe stage 1.7–2.3 s |
+| L1 v10 = S1 + AUTH + domain-adapted probe (off) · sixth untouched TensorTrust split, read once | 800 / 892 | 0.813 (hijacking 0.832 [0.797, 0.862], extraction 0.780 [0.730, 0.823]) | 1.12 % (NotInject 2.95 % [1.61, 5.34]) | 0.985 | 0.890 | 0.987 (score) | 0.987 | probe stage 1.7–2.3 s |
+| **L1 v11 = v10 + fine-tuned classifier (off) · seventh untouched TensorTrust split, read once** | 800 / 892 | **0.845** (hijacking 0.846 [0.812, 0.875], extraction 0.843 [0.798, 0.880]) | **0.67 %** (NotInject **1.77 %** [0.81, 3.81]) | **0.991** | **0.912** | 0.989 (score) | 0.989 | probe stage 1.7–2.3 s + 11 ms |
+| **L1H** harm head · WildJailbreak | 2,000 / 210 | 0.738 [0.718, 0.757] | 4.29 % [2.27, 7.94] | 0.994 | 0.847 | 0.952 | 0.992 | 2.8 / 5.8 s |
+| **L2** BIPIA, middle-of-document, translated attacks vs pasted, code, e-mail, translated benign (t9 TEST) | 1,985 / 1,822 | 0.952 (lowest row: Chinese 0.916) | 0.60 % (highest row: pasted 1.76 %) | 0.994 | 0.973 | 0.996 | 0.997 | 3.1–3.8 / 6.3–9.7 s per document |
+| **L3** tom-gibbs multi-turn | 4,136 / 1,200 | 0.984 [0.980, 0.987] | 0 % [0, 0.32] | 1.000 | 0.992 | 0.996 | 0.998 | 0.39 / 0.48 s |
+| L3 · MHJ vs audited WildChat | 110 / 646 | 0.082 [0.044, 0.148] | 3.10 % [2.01, 4.73] | 0.310 | 0.130 | 0.682 | 0.249 | 0.56 / 1.3 s |
+| **L4** InjecAgent (direct + data stealing) | 1,054 / 34 | 1.000 [0.996, 1.000] | 0 % [0, 10.2] | 1.000 | 1.000 | 1.000 | — | 0.45 / 0.58–0.66 s |
+| L4 · Agent Security Bench (local profile) | 1,200 / 100 | 0.995 [0.989, 0.998] | 29 % prompted [21.0, 38.5] | 0.976 | 0.986 | 0.871 | 0.979 | not stored |
+| L4 · AgentDojo held-out (local profile, effect replay) | 398 / 97 | attack success 0 [0, 0.010] declining, 0.095 [0.070, 0.128] approve-all | 16.5 % of benign tasks prompted [10.4, 25.1] | — | — | — | — | not stored |
+| L4 · AgentDojo held-out, local profile + named-source rule + guarded necessity + entity anchor (v10, adopted 2026-11-06) | 398 / 97 | attack success 0 [0, 0.010] declining, 0.096 [0.070, 0.128] approve-all | 5.2 % of benign tasks prompted [2.2, 11.5] | 0.794 (refusals, calls) | 0.672 (calls) | — | — | 3.7 s per benign task (harness, all L4 checks) |
+| **L5** AgentLeak | 1,355 / 3,651 | 0.875 [0.857, 0.892] | 4.85 % [4.20, 5.59] | 0.870 | 0.873 | 0.911 | 0.795 | 0.04 / 0.10 s |
+| L5 with a declared field policy (off; scenario TEST, read once) | 290 / 771 | 1.000 [0.987, 1.000] | 0.91 % [0.44, 1.86] | 0.976 | 0.988 | 0.994 | 0.976 | 0.007 / 0.021 s |
+| **L6** answer guard (off) · live AgentDojo answers, validation | 16 / 97 | 0.938 [0.717, 0.989] | 0 % [0, 3.8] | 0.577 | 0.714 | — | — | not stored |
+| **Pipeline** DIDA-Bench (Sept. 2026 configuration) | 59 / 53 | 0.915 blocked (59 / 59 blocked or warned) | 0 / 53 | — | — | — | — | 0.52 / 0.75 s |
+| Pipeline · benign traffic arm (Sept. 2026) | — / 529 | — | 1.5 % blocked, **33 % warned** | — | — | — | — | 1.8 / 3.1 s |
+
+**Meets the mark:** L2 overall (t9 TEST), L3 on tom-gibbs, L4's attack stopping on InjecAgent and AgentDojo (declining
+user), and **L5 when the operator declares a field policy** (AgentLeak TEST: recall 1.000, FP 0.91 %).
+
+**Still below the project's mark** (recall ≥ 0.92 at ~1.7 % false positives per row, and no other weak metric): L1 on
+untouched TensorTrust splits (best measured: 0.846 / 0.843 on the seventh split with the fine-tuned classifier, whose NotInject false positives, 1.77 %, are now near the mark); the
+L1H harm head (WildJailbreak, and 38.8 % over-refusal on OR-Bench-Hard); L3 on MHJ; L4's benign prompts (ASB 29 %,
+AgentDojo 5.2 % with the adopted v10 rules, from 16.5 %; 3 of those 5 are the operator's transfer limit;
+InjecAgent's 17-task benign arm is too small to show the mark); L5 without a declared policy; L6 precision; L2 on
+Chinese (0.916) and pasted passages (1.76 %); and the pipeline's benign warning rate in the September configuration
+(re-measure pending). Each has a logged root cause and a next step in [`results.md`](results.md) §21.
 
 ---
 
@@ -70,7 +127,9 @@ A real Gemini agent doing real tasks (email, banking, travel, Slack) while attac
 > ✅ **The tool-call check alone cuts attacks about 6× and keeps benign task success exactly the same.**
 > The full defense stopped 37 attacks and enabled none (p < 10⁻⁶). AgentDojo's own detector gets its low number by breaking **13 of 34** benign tasks.
 
-### 🧱 Every layer, shipped configuration
+### 🧱 Every layer, shipped configuration (paper era, September 2026)
+
+> For the current shipped defaults and their numbers on fresh test draws, see [Since the paper](#since-the-paper). The L2 row below is the scorer that is now the fail-soft fallback.
 
 | Layer | Stops | Benchmark | Result |
 |---|---|---|---|
@@ -182,9 +241,9 @@ Most guardrail projects ship detectors. DIDA also ships the machinery to **prove
 ```mermaid
 flowchart LR
     P([User prompt]) --> L1["<b>L1</b> · injection tiers<br/>+ separate harm head"]
-    D([Retrieved docs /<br/>tool output]) --> L2["<b>L2</b> · document scorer<br/>per-content-type anchors"]
+    D([Retrieved docs /<br/>tool output]) --> L2["<b>L2</b> · local document detector<br/>(scorer as fallback)"]
     C([Conversation]) --> L3["<b>L3</b> · drift + velocity<br/>+ cipher decoder"]
-    T([Tool call]) --> L4["<b>L4</b> · action authorization<br/>+ addressee check"]
+    T([Tool call]) --> L4["<b>L4</b> · action authorization<br/>contract + lineage + trust matrix"]
     O([Model output]) --> L5["<b>L5</b> · PII / exfil /<br/>canary / leak check"]
 
     L1 & L2 & L3 & L4 & L5 --> BUS[("Threat Intelligence Bus<br/>per-session evidence")]
@@ -197,9 +256,9 @@ flowchart LR
 | Layer | How it works |
 |---|---|
 | **L1** | Regex → semantic templates → Prompt Guard × PIGuard (an AND, which kills trigger-word false positives) → an optional policy judge (gpt-oss-safeguard-20b). Plus a **separate** harm-intent head (Qwen3Guard): fusing it in with `max()` measurably hurt both signals. |
-| **L2** | Prompt Guard's *injection* head over overlapping segments, plus a dangerous-code indicator, with Mondrian split-conformal anchors per content type (news, code answers, tool outputs). Short text is scored by PIGuard. |
+| **L2** | **Default (since 2026-11-03):** a local document detector. A 4-bit Qwen3-4B reads each document under a document policy; a linear probe on its residual stream decides against split-conformal thresholds per content type, with code and prose routed to separate probes, an extra translated-to-English reading for non-English prose segments, windows for long documents and an unhidden reading for hidden-character text. **Fallback** (no local model, or `L2_LOCAL_DETECTOR=off`): Prompt Guard's *injection* head over overlapping segments plus a dangerous-code indicator, with Mondrian split-conformal anchors per content type; short text scored by PIGuard. |
 | **L3** | Alignment, cumulative drift and velocity over sentence windows. For substitution-cipher jailbreaks it reverse-substitutes the conversation and scores the **decoded goal** instead of the encoding. |
-| **L4** | Every tool has a capability class. The user must have asked for the action, and every argument is traced back to where it came from. The **addressee check** asks whether the text around a copied value is *talking to the AI*: emails and chats instruct humans, injections instruct the model. |
+| **L4** | Every tool has a capability class. **Action authorization** (`L4_AUTHZ`, default since 2026-10-23): an intent contract records which actions the user asked for and with which values; every argument's lineage is traced (the user, a system of record, or document text) and checked against a trust matrix per argument class, so a payee or recipient that only a document supplies needs the user's confirmation or is refused. The **addressee check** asks whether the text around a copied value is *talking to the AI*. A fully local profile writes the contract with the local model. |
 | **L5** | PII and exfiltration patterns, canary tokens (including base64), and a provenance leak check that reuses L4's tracing on the output. |
 
 🎚️ Thresholds are **split-conformal, calibrated on benign data only**, so the false-positive rate is guaranteed on traffic like the calibration set. We also report where that guarantee breaks across corpora.
@@ -229,9 +288,11 @@ python main.py                            # proxy + live dashboard → http://lo
 ```
 
 - **Python 3.10+.** A GPU is optional.
+- **Local models (optional, recommended):** the default L2 document detector uses `Qwen/Qwen3-4B-Instruct-2507` in 4-bit (~2.9 GB of GPU memory) and, for the translated reading, `Helsinki-NLP/opus-mt-mul-en` in `~/.cache/sentinel/mt/opus-mt-mul-en`. Without them L2 falls back to the earlier scorer (fail soft); `L2_LOCAL_DETECTOR=off` restores that path explicitly.
+- **Small GPUs:** on a card under 8 GB with a local model configured, the 4B model keeps the GPU and the Qwen3Guard harm head and small classifiers run on the CPU (`SENTINEL_GUARD_DEVICE=auto`, `SENTINEL_CLASSIFIER_DEVICE=auto`; CPU and GPU scores are parity-tested, so only latency changes). Measured on a 4 GB laptop GPU: putting everything on the card spilled 1.4 GB into shared system memory and slowed the document path about 4x. Set either variable to `cuda` to override. Measured harm-head latency per prompt: ~0.1 s on the GPU, ~1.1 s mean / 1.7 s p95 on the CPU, where the guard runs on its own 8-thread worker (`SENTINEL_GUARD_THREADS`) while every other model keeps one thread (`SENTINEL_TORCH_THREADS`, default 1; torch's own pool crashed the full test suite, results.md §21.5.1).
 - **Gated models:** Prompt Guard and Llama Guard 3 need their Hugging Face licences accepted (`huggingface-cli login`).
 - **Optional keys:**
-  - `GROQ_API_KEYS` enables L1's policy judge. Set `L1_LLM_JUDGE_ENABLED=false` for a fully local defense.
+  - `GROQ_API_KEYS` enables L1's policy judge and L4's hosted intent contract. For a fully local defense set `L1_LLM_JUDGE_ENABLED=false` and either `L4_AUTHZ_CONTRACT=lexicon`, or the measured local L4 profile: `L4_AUTHZ_CONTRACT=local L4_ALIGNMENT_LOCAL=true L4_AUTHZ_TARGET_CRITERIA=true L4_AUTHZ_CONTENT_LINK_CONFIRM=true L4_COPIED_CONTENT_CONFIRM=true L4_AUTHZ_LOCAL_DELEGATION=true` ([`results.md`](results.md) §20.17).
   - `GEMINI_API_KEYS` is used only by the live AgentDojo harness and the benign-data audit.
 
 ### 🔌 Core endpoints
@@ -271,7 +332,8 @@ sentinel/                  the DIDA package (directory keeps the project's origi
 ├── app.py                 FastAPI proxy and WebSocket
 ├── config.py              every threshold and feature flag, shipped defaults documented inline
 ├── core/                  threat bus, correlation, taint graph, e-value fusion, conformal calibration,
-│                          addressee cues, split-device GPU placement
+│                          addressee cues, split-device GPU placement, local judge (Qwen3-4B),
+│                          artifacts/ (probe artifacts for L1 / L2)
 ├── layers/                L1 · L2 (layer2_rag/) · L3 · L4 (layer4_agentic/) · L5 (layer5_output/)
 └── eval/                  harness, dataset loaders, SPLIT-Bench generator + certificates,
     └── data/              live AgentDojo, guard baselines, second-stack audit; our benchmarks

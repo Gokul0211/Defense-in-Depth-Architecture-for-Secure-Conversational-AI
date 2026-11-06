@@ -29,11 +29,40 @@ import os
 from types import SimpleNamespace
 
 
+SMALL_GPU_GIB = 8.0      # below this the local 4B model keeps the card to itself (see _small_shared_gpu)
+
+
+def local_model_configured() -> bool:
+    """Will the local Qwen3-4B (core/local_judge, ~2.9 GB of VRAM) hold the GPU? The L2 document detector (shipped
+    default since 2026-11-03), the L1 local judge / probe, or the local L4 contract / alignment check."""
+    try:
+        import sentinel.config as cfg
+    except Exception:                                           # noqa: BLE001
+        return False
+    return (str(getattr(cfg, "L2_LOCAL_DETECTOR", "off")).lower() != "off"
+            or bool(getattr(cfg, "L1_LOCAL_JUDGE", False)) or bool(getattr(cfg, "L1_LLM_PROBE", False))
+            or str(getattr(cfg, "L4_AUTHZ_CONTRACT", "")).lower() == "local"
+            or bool(getattr(cfg, "L4_ALIGNMENT_LOCAL", False)))
+
+
+def _small_shared_gpu(torch) -> bool:
+    """A card the local 4B model must keep to itself: smaller than SMALL_GPU_GIB while that model is configured. Measured
+    2026-11-03 (scratch/rca/l2/l2p50_e2e_v7.py): the 4B model + opus-mt + the small classifiers on a 4 GB card spilled
+    1.42 GB into shared system memory and the document path slowed to ~5 s per document. Under "auto" the guard and the
+    small classifiers then run on the CPU (CPU / GPU parity-tested: scores unchanged, only latency moves)."""
+    if not local_model_configured():
+        return False
+    try:
+        return torch.cuda.get_device_properties(0).total_memory / 2 ** 30 < SMALL_GPU_GIB
+    except Exception:                                           # noqa: BLE001
+        return False
+
+
 def guard_device() -> str:
     import torch
     d = os.getenv("SENTINEL_GUARD_DEVICE", "auto").strip().lower()
     if d == "auto":
-        d = "cuda" if torch.cuda.is_available() else "cpu"
+        d = "cuda" if torch.cuda.is_available() and not _small_shared_gpu(torch) else "cpu"
     if d.startswith("cuda") and not torch.cuda.is_available():
         d = "cpu"
     return d
@@ -96,4 +125,7 @@ def classifier_cuda_ok(name: str = "") -> bool:
     allow = {x.strip().lower() for x in os.getenv("SENTINEL_GPU_CLASSIFIERS", "").split(",") if x.strip()}
     if name and name.strip().lower() in allow:
         return True
-    return os.getenv("SENTINEL_CLASSIFIER_DEVICE", "auto").strip().lower() != "cpu"
+    dev = os.getenv("SENTINEL_CLASSIFIER_DEVICE", "auto").strip().lower()
+    if dev == "cpu":
+        return False
+    return not (dev == "auto" and _small_shared_gpu(torch))

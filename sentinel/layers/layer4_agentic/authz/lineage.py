@@ -125,7 +125,9 @@ def fold_id(s) -> str:
 
 _EMAIL = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
 _IBAN = re.compile(r"\b[A-Z]{2}\d{2}[A-Z0-9]{10,30}\b")
-_URL = re.compile(r"(?:https?://)?(?:www\.)?(?:[A-Za-z0-9\-]+\.)+(?:com|org|net|io|ai|co|gov|edu|info|biz|xyz|"
+# a scheme or a www. prefix makes anything a link, whatever its TLD (new gTLDs, .test); bare domains need a known TLD
+_URL = re.compile(r"(?:https?://|www\.)(?:[A-Za-z0-9\-]+\.)+[A-Za-z]{2,24}(?:/[^\s<>\"')\]]*)?"
+                  r"|(?:[A-Za-z0-9\-]+\.)+(?:com|org|net|io|ai|co|gov|edu|info|biz|xyz|"
                   r"me|app|dev|uk|de|fr|ch|it|es|nl|ru|cn|in|us|eu|ly|gl|to|cc|tv|site|online|page|link)"
                   r"(?:/[^\s<>\"')\]]*)?", re.I)
 _PHONE = re.compile(r"(?<!\w)\+\d[\d\s\-]{8,}\d(?!\w)")
@@ -160,6 +162,8 @@ class Leaf:
     structural: bool
     atoms: tuple = ()      # structural leaves: the exact values a match may equal (whole value, each line,
                            # each "Label: value" line's value) -- never a substring of them
+    direct: bool = True    # T2 content leaves: the user typed this read's locator (False: named one hop away,
+                           # through another document -- L4_NAMED_SOURCE_AUTHORITY never counts those)
 
 
 PROSE_WORDS = 10           # a "structural" line this long is text someone wrote (a channel NAME carrying an
@@ -182,6 +186,39 @@ class Session:
     leaves: list = field(default_factory=list)
     calls: list = field(default_factory=list)       # (tool, params) of every audited side-effect call
     sensitive: dict = field(default_factory=dict)   # folded value -> category ("credential" / "personal")
+    records: list = field(default_factory=list)     # (batch, tool, {field: folded value}) rows, for target criteria
+    batches: int = 0
+
+
+_NUM_LINE = re.compile(r"^\s*([A-Za-z][A-Za-z _\-]{0,40}?)\s*:\s*(-?\d+(?:[.,]\d+)?)\b")
+
+
+def _record_rows(obj) -> list[dict]:
+    """Rows of a tool output, for criterion checks (v7 P1): a list of objects -> one row each; a mapping of name ->
+    text/object (a catalogue) -> one row per name with `_key`. "Label: number" lines inside text values become numeric
+    fields ("Rating: 4.2" -> rating=4.2)."""
+    def flat(d: dict) -> dict:
+        row = {}
+        for k, v in d.items():
+            if isinstance(v, (dict, list)):
+                continue
+            row[str(k).lower()] = fold(v)
+            if isinstance(v, str):
+                for line in v.split("\n"):
+                    m = _NUM_LINE.match(line)
+                    if m:
+                        row.setdefault(m.group(1).strip().lower(), m.group(2).replace(",", "."))
+        return row
+    if isinstance(obj, list) and obj and all(isinstance(x, dict) for x in obj):
+        return [flat(x) for x in obj]
+    if isinstance(obj, dict) and obj and all(isinstance(v, (str, dict)) for v in obj.values()) and len(obj) >= 2:
+        rows = []
+        for k, v in obj.items():
+            r = flat(v) if isinstance(v, dict) else flat({"_text": v})
+            r["_key"] = fold(k)
+            rows.append(r)
+        return rows
+    return []
 
 
 # --- sensitive values (outbound inspection, ARCHITECTURE_NEXT.md v2 §6.2) ---------------------------------
@@ -212,6 +249,55 @@ def _record_sensitive(s: "Session", fname: str, raw: str, content: bool) -> None
     for rx, cat in _SENSITIVE_TEXT:
         for m in rx.finditer(str(raw)):
             s.sensitive.setdefault(fold(m.group(1)), cat)
+
+
+def candidates_in_source(session_id: str, value) -> int:
+    """How many DISTINCT identifiers of the same kind as `value` (IBAN / e-mail / URL / phone) appear in the
+    document-text leaves (T2) that contain `value` (v8 ambiguity rule). 1 = the document names only this one."""
+    v = fold(value)
+    kinds = {k for k, _ in identifiers_in(str(value))}
+    if not kinds:
+        return 0
+    found = set()
+    for leaf in session(session_id).leaves:
+        if leaf.tier != T2 or leaf.structural:
+            continue
+        if not (_bounded_in(v, leaf.text) or (fold_id(value) and fold_id(value) in fold_id(leaf.text))):
+            continue
+        idents = identifiers_in(leaf.text)
+        idents += [("iban", m.group(0)) for m in _IBAN_ANYCASE.finditer(leaf.text)]   # stored text is lowercased
+        for k, ident in idents:
+            if k in kinds:
+                found.add(fold_id(ident))
+    return len(found)
+
+
+def directly_named(session_id: str, value) -> bool:
+    """Every document-text (T2) leaf that contains `value` comes from a read whose locator the user typed (not one
+    hop away). L4_NAMED_SOURCE_AUTHORITY: a strict-sink value is taken as delegated only from such a source."""
+    v = fold(value)
+    hits = [leaf for leaf in session(session_id).leaves if leaf.tier == T2 and not leaf.structural
+            and (_bounded_in(v, leaf.text) or (fold_id(value) and fold_id(value) in fold_id(leaf.text)))]
+    return bool(hits) and all(leaf.direct for leaf in hits)
+
+
+_IBAN_ANYCASE = re.compile(r"\b[A-Za-z]{2}\d{2}[A-Za-z0-9]{10,30}\b")
+
+
+def anchored(session_id: str, value, anchors: list) -> bool:
+    """Does `value` sit in the same document-text leaf (T2) as one of `anchors` -- values the user typed in this call
+    (v7, entity anchor)? "Invite Dora" + a page reading "...website of Dora. My e-mail is dora@...": the address is an
+    attribute of the entity the user named, read from a source the user named."""
+    v = fold(value)
+    keys = [fold(a) for a in anchors if a is not None and len(fold(a)) >= 3]
+    if not v or not keys:
+        return False
+    for leaf in session(session_id).leaves:
+        if leaf.tier == T2 and not leaf.structural and _bounded_in(v, leaf.text) or (
+                leaf.tier == T2 and not leaf.structural and fold_id(value) and fold_id(value) in fold_id(leaf.text)):
+            if any(_bounded_in(k, leaf.text) for k in keys):
+                return True
+    return False
 
 
 def sensitive_in(session_id: str, text: str) -> list[tuple[str, str]]:
@@ -303,7 +389,8 @@ def _named_through_document(session_id: str, params: dict, user_text: str) -> bo
 def record_tool_output(session_id: str, tool: str, params: dict, output, user_text: str = "") -> int:
     """Split one tool output into tiered leaves. Returns the number of leaves recorded."""
     pol = tool_policy(tool)
-    named = user_named(params, fold(user_text)) or _named_through_document(session_id, params, user_text)
+    direct = user_named(params, fold(user_text))
+    named = direct or _named_through_document(session_id, params, user_text)
     content_tier = T2 if named else T3
     base = pol.get("tier", content_tier)
     if base not in (T1,):
@@ -311,7 +398,15 @@ def record_tool_output(session_id: str, tool: str, params: dict, output, user_te
     roles = pol.get("roles", {})
     vals_content = bool(pol.get("values_are_content"))
     raw = []
-    _walk(_to_plain(output), "", raw)
+    plain = _to_plain(output)
+    _walk(plain, "", raw)
+    _s = session(session_id)
+    rows = _record_rows(plain)
+    if rows:
+        _s.batches += 1
+        _s.records.extend((_s.batches, tool, r) for r in rows)
+        if len(_s.records) > _MAX_LEAVES:
+            del _s.records[: len(_s.records) - _MAX_LEAVES]
     s = session(session_id)
     n = 0
     for fname, val, is_key, is_dval in raw:
@@ -322,7 +417,7 @@ def record_tool_output(session_id: str, tool: str, params: dict, output, user_te
         # structure only means something for a declared system of record: every field of any other tool is text
         content = base != T1 or (fname in CONTENT_FIELDS and not is_key) or (vals_content and is_dval)
         if content:
-            s.leaves.append(Leaf(content_tier, None, tool, fname, text, False))
+            s.leaves.append(Leaf(content_tier, None, tool, fname, text, False, (), direct))
             n += 1
             continue
         role = roles.get(fname) if fname in roles else (roles.get("_value") if fname in ("_value", "_key") else None)
@@ -333,7 +428,7 @@ def record_tool_output(session_id: str, tool: str, params: dict, output, user_te
             s.leaves.append(Leaf(base, role, tool, fname, text, True, short))
             n += 1
         for a in prose:
-            s.leaves.append(Leaf(content_tier, None, tool, fname, a, False))
+            s.leaves.append(Leaf(content_tier, None, tool, fname, a, False, (), direct))
             n += 1
     if len(s.leaves) > _MAX_LEAVES:
         del s.leaves[: len(s.leaves) - _MAX_LEAVES]

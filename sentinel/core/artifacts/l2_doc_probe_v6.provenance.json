@@ -1,0 +1,50 @@
+{
+ "built": "2026-11-03 17:17",
+ "model": "Qwen/Qwen3-4B-Instruct-2507 (4-bit NF4)",
+ "policy_md5": "05a02bd07210905a13ebf49257174c42",
+ "layer": 24,
+ "insertion_weight": 3.0,
+ "C": 0.02,
+ "bin": "other (documents only)",
+ "thresholds": {
+  "tau_other": 0.4619978666305542
+ },
+ "routing": "documents of the code bin and tool outputs keep l2_doc_probe.npz (layer 20); documents of the other bin use this probe (layer 24); L2_LOCAL_PROBE_ROUTING=true",
+ "dev": "the export's DEV + dev_pos_mid (BIPIA TRAIN attacks in the MIDDLE of TRAIN contexts / XSum TRAIN news), dev_pos_ml (the same attacks translated de / fr / es / zh, start / middle / end), dev_neg_ml (translated benign XSum TRAIN sentences pasted, insertion weight 3) -- scratch/rca/l2/l2p41_v6_pools.py",
+ "calibration": "group-conditional split-conformal alpha 0.01, other bin, over table, news, OASST, pasted-passage, Enron e-mail groups (same CAL groups as the export)",
+ "selection": "VAL routing round, l2p/v6_select2.json (val_ctrl_insert FP 1.75 % vs the 1.7 % bound: user accepted the TEST read, 2026-11-03)",
+ "test_results": {
+  "recall": {
+   "t9_bipia_email": 0.961,
+   "t9_bipia_table": 0.9592,
+   "t9_bipia_code": 0.97,
+   "t9_bipia_abstract": 0.97,
+   "t9_bipia_all": 0.965,
+   "t9_bipia_pooled": 0.9654,
+   "t9_mid": 0.9258,
+   "t9_long_mid (whole OR windows)": 0.93,
+   "t9_ml_de": 0.9381,
+   "t9_ml_fr": 0.9684,
+   "t9_ml_es": 0.9898,
+   "t9_ml_zh": 0.9158,
+   "t9_ml_it": 0.9062,
+   "t9_ml_ru": 0.9184,
+   "t9_ml_nl": 0.898
+  },
+  "fp": {
+   "t9_pasted": 0.0176,
+   "t9_code": 0.0034,
+   "t9_enron": 0.0,
+   "t9_long_ben (whole OR windows)": 0.0,
+   "t9_mlben_de": 0.0,
+   "t9_mlben_fr": 0.0,
+   "t9_mlben_es": 0.0,
+   "t9_mlben_zh": 0.0,
+   "t9_mlben_it": 0.0,
+   "t9_mlben_ru": 0.0,
+   "t9_mlben_nl": 0.0
+  }
+ },
+ "record": "scratch/rca/l2/L2_REDESIGN.md",
+ "texts_stored": false
+}

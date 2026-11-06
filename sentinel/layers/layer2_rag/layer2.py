@@ -1,15 +1,15 @@
 from sentinel.core.models import L2Result
 from .chunk_store import (ingest_chunk, get_all_chunks, quarantine_chunk, retrieve_and_validate,
-                          reset_store, get_chunks_for_provenance, retrieval_flagged)
+                          reset_store, get_chunks_for_provenance, retrieval_flagged, review_chunk)
 
 async def layer2_ingest(text: str, source: str, session_id: str | None = None,
-                        scope: str | None = None) -> dict:
+                        scope: str | None = None, principal: str | None = None) -> dict:
     """
     Public interface to ingest a document chunk. Tool outputs (source "tool_response*")
     are stored per session and never enter the shared, retrievable knowledge base (B-1);
     pass the session_id so that session's L4 can trace against them.
     """
-    return await ingest_chunk(text, source, session_id=session_id, scope=scope)
+    return await ingest_chunk(text, source, session_id=session_id, scope=scope, principal=principal)
 
 async def layer2_validate_context(query: str) -> tuple[L2Result, list]:
     """
@@ -21,7 +21,13 @@ async def layer2_validate_context(query: str) -> tuple[L2Result, list]:
     correctly (via an isinstance(..., tuple) check), so this was a type-hint
     lie rather than a runtime bug — fixed here for correctness.
     """
-    validated_chunks = retrieve_and_validate(query)
+    # L2 review C8: retrieval embeds the query and re-scores candidates -- model work, kept off the event loop.
+    import sentinel.config as _cfg
+    if getattr(_cfg, "L2_SCORE_IN_THREAD", True):
+        from sentinel.core.model_executor import run_model     # reused pool: no leaked OpenMP teams (§21.5)
+        validated_chunks = await run_model(retrieve_and_validate, query)
+    else:
+        validated_chunks = retrieve_and_validate(query)
 
     max_score = 0.0
     threat_class = "CLEAN"
@@ -39,6 +45,15 @@ async def layer2_validate_context(query: str) -> tuple[L2Result, list]:
             chunk_score = 1.0
             candidate_class = "KNOWLEDGE_POISONING"
             candidate_reason = f"HMAC validation failed for chunk {chunk['chunk_id']}"
+            all_findings.append(candidate_reason)
+        elif chunk.get("doc_axis") and chunk.get("blocked"):
+            # L2 review C12: a doc-axis chunk re-validated at/above its anchor (re-scored under a newer configuration,
+            # or an anchor that moved) used to score 0 here, so a blocked retrieval was invisible to the pipeline. It
+            # now publishes its own score on the shared axis (>= WARN by construction).
+            from sentinel.config import l2_shared_score
+            chunk_score = l2_shared_score(chunk.get("metadata") or {})
+            candidate_class = "INSTRUCTIONAL_CHUNK"
+            candidate_reason = f"Retrieved chunk {chunk['chunk_id']} re-validated at/above its anchor"
             all_findings.append(candidate_reason)
         elif chunk.get("doc_axis"):
             # Doc-axis chunks are judged on their own axis (R-014); an admitted chunk
@@ -92,6 +107,11 @@ def layer2_retrieval_flagged(chunk: dict) -> bool:
 def layer2_quarantine(chunk_id: str) -> bool:
     """Manually quarantine a chunk."""
     return quarantine_chunk(chunk_id)
+
+def layer2_review(chunk_id: str, decision: str, note: str = "") -> dict | None:
+    """Release (retrievable) or reject (quarantine) a chunk held for review (L2 review C5)."""
+    return review_chunk(chunk_id, decision, note)
+
 
 def layer2_reset() -> None:
     """Clear all RAG chunk stores. Called on /sentinel/reset."""

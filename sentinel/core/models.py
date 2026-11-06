@@ -106,6 +106,27 @@ def rescale_layer_score(
     return global_block_threshold + overshoot
 
 
+def inverse_rescale_layer_score(
+    shared_score: float,
+    layer_warn_threshold: float,
+    layer_block_threshold: float,
+    global_warn_threshold: float,
+    global_block_threshold: float,
+) -> float:
+    """The raw layer score that `rescale_layer_score` maps to `shared_score` (its exact inverse; both are strictly
+    monotone piecewise-linear). Used where a verdict computed on the shared axis must be published as a layer's raw
+    score (L1 review: the proxy's image-part verdict becomes L1's result)."""
+    if shared_score <= 0:
+        return 0.0
+    if shared_score <= global_warn_threshold:
+        return shared_score / global_warn_threshold * layer_warn_threshold if global_warn_threshold > 0 else 0.0
+    if shared_score <= global_block_threshold:
+        span = global_block_threshold - global_warn_threshold
+        frac = (shared_score - global_warn_threshold) / span if span > 0 else 1.0
+        return layer_warn_threshold + frac * (layer_block_threshold - layer_warn_threshold)
+    return layer_block_threshold + (shared_score - global_block_threshold)
+
+
 @dataclass
 class ThreatEvent:
     """A single threat detection event emitted by any layer."""
@@ -190,11 +211,18 @@ class SessionState:
     # no fixed format) by reusing L4's provenance-tracing idea
     # (fuzzy_contains) pointed at output instead of input.
     tracked_sensitive_values: list = field(default_factory=list)
+    # L5 field policy (config.L5_FIELD_POLICY): (field, value) pairs the current task must NOT disclose, and the
+    # values it MAY disclose; empty unless the operator declared a policy (track_field_policy).
+    policy_private_values: list = field(default_factory=list)
+    policy_allowed_values: list = field(default_factory=list)
     # Set when a correlation rule whose verdict is BLOCKED fires (correlation_engine.
     # RULE_ACTIONS). A correlation verdict is about the SESSION, not one request, so
     # every later request/tool call on a terminated session is refused.
     terminated: bool = False
     termination_reason: str = ""
+    # L1 review B6: digests of the user turns L1 has scanned this session (insertion-ordered dict used as a bounded
+    # set; see app._l1_earlier_user_turns). Server-side only, not serialised.
+    l1_scanned: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -267,6 +295,13 @@ class L1Result:
     # RCA 2 F-H1: the guard's own unsafe-content category when the harm head fires (config
     # L1_HARM_REPORT_CATEGORY), so alerts can be routed / thresholded per category by policy.
     harm_category: str | None = None
+    # L1 review T0 (config.L1_ANOMALY_TIER): counts of hiding techniques (core/text_canonicalize.hiding_report), None
+    # when the tier is off. `hidden_text` is reduced to its length here so a payload is not echoed downstream.
+    anomaly: dict | None = None
+    # L1 review B12: the decision L1's own score implies on the shared axis ("ALLOW" / "WARN" / "BLOCK"). The
+    # `threat_class` label is decided on the raw cosine bands and can disagree with it (a 0.80 is "INJECTION" and
+    # only WARNed); consumers that need the action read this.
+    decision: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -280,6 +315,8 @@ class L1Result:
             "harm_score": self.harm_score,
             "harm_source": self.harm_source,
             "harm_category": self.harm_category,
+            "anomaly": self.anomaly,
+            "decision": self.decision,
         }
 
 

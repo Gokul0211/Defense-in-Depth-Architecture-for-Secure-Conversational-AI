@@ -1,7 +1,7 @@
 import uuid
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
-from .provenance import sign_chunk, verify_chunk
+from .provenance import sign_chunk, verify_chunk, sign_record, verify_record
 from .instruction_density import calculate_instruction_density
 from sentinel.layers.layer1 import layer1_check
 from sentinel.core.embedding import get_model
@@ -19,9 +19,81 @@ from sentinel.config import MAX_TRACKED_SESSIONS
 # multi-thousand-sample benchmark run would otherwise grow these dicts
 # without bound for the lifetime of the process, same as the leak that was
 # already fixed in layer3/threat_bus/correlation_engine.
-collection = BoundedLRUDict(MAX_TRACKED_SESSIONS)          # trust_score >= REVIEW_THRESHOLD  -> eligible for retrieval
-review_store = BoundedLRUDict(MAX_TRACKED_SESSIONS)        # QUARANTINE_THRESHOLD <= trust_score < REVIEW_THRESHOLD -> held for human review, NOT retrievable
-quarantine_store = BoundedLRUDict(MAX_TRACKED_SESSIONS)    # trust_score < QUARANTINE_THRESHOLD, or failed post-ingestion re-validation
+import sentinel.config as _cfg_store
+
+# L2 review C9 (2026-10-28): the knowledge base had the SESSION cap (MAX_TRACKED_SESSIONS) and LRU eviction, so a client
+# ingesting that many documents evicted the operator's real knowledge base (poisoning by displacement) and quarantined
+# evidence aged out the same way. The stores keep their LRU type (the eval runner ingests one document per sample and
+# relies on bounded memory), but sized by L2_KB_MAX_CHUNKS / L2_QUARANTINE_MAX_CHUNKS, and an EXTERNAL ingest
+# (an operator or a public client, see ingest_chunk's `principal`) is refused when the knowledge base is full instead
+# of evicting what is there. Internal callers (evaluations, demo scenarios) keep the bounded-LRU behaviour.
+collection = BoundedLRUDict(_cfg_store.L2_KB_MAX_CHUNKS)          # eligible for retrieval
+review_store = BoundedLRUDict(_cfg_store.L2_KB_MAX_CHUNKS)        # held for human review, NOT retrievable
+quarantine_store = BoundedLRUDict(_cfg_store.L2_QUARANTINE_MAX_CHUNKS)    # quarantined, or failed re-validation
+
+# Knowledge-base chunks ingested per external principal (C9 quota). Public principals are keyed by client address in
+# the app; the address is never stored in a chunk's metadata.
+_principal_counts: dict[str, int] = {}
+# Exact-duplicate registry for the shared KB (L2 review C15): normalized-text digest -> chunk_id.
+_kb_digests: dict[str, str] = {}
+
+
+def _norm_digest(text: str) -> str:
+    import hashlib
+    import re as _re
+    return hashlib.sha256(_re.sub(r"\s+", " ", (text or "").strip().lower()).encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def scorer_version() -> str:
+    """Identifier of the L2 scoring configuration a verdict was produced under (L2 review C10). A chunk whose stored
+    version differs is re-scored at retrieval instead of keeping a verdict from older detectors or anchors."""
+    import hashlib
+    import sentinel.config as cfg
+    keys = ("L2_DOCUMENT_THREAT_SCORER", "L2_SHORT_DOC_SCORER", "L2_DANGER_CREDENTIAL_STRICT", "L2_STRICT_CODE_DETECTION",
+            "L2_CODE_PROSE_SPLIT", "L2_CODE_PROSE_WARN", "L2_CODE_PROSE_BLOCK", "L2_DOCUMENT_THREAT_WARN_THRESHOLD",
+            "L2_DOCUMENT_THREAT_WARN_THRESHOLD_CODE", "L2_DOCUMENT_THREAT_BLOCK_THRESHOLD_CODE",
+            "L2_DOCUMENT_THREAT_WARN_THRESHOLD_SHORT", "L2_DOCUMENT_THREAT_BLOCK_THRESHOLD_SHORT", "L2_BLOCK_THRESHOLD",
+            "L2_SPOOF_MARKERS", "L2_ADR", "L2_CODE_INCOHERENCE", "L2_CODE_INCOHERENCE_TAU", "L2_SHORT_BIN_BY_SOURCE",
+            "L2_SHORT_DOC_WARN", "L2_UNHIDE", "L2_HIDDEN_CHARS_ACTION", "L2_KAD", "L2_DOC_PROSE_BLOCK_DERIVED")
+    raw = "|".join(f"{k}={getattr(cfg, k, None)!r}" for k in keys) + "|code=2026-10-28"
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+def _find_kb_chunk(chunk_id: str):
+    for store in (collection, review_store, quarantine_store):
+        if chunk_id in store:
+            return store[chunk_id]
+    return None
+
+
+class IngestRefused(Exception):
+    """An external ingest that must not proceed: `status` is the HTTP status the API should return."""
+
+    def __init__(self, status: int, reason: str):
+        super().__init__(reason)
+        self.status, self.reason = status, reason
+
+
+def _principal_tier(principal: str | None) -> str:
+    if principal is None:
+        return "internal"
+    return "operator" if principal == "operator" else "public"
+
+
+def _admit_external(text: str, principal: str | None, session_scoped: bool) -> None:
+    """C8 / C9 gates for one ingest; raises IngestRefused. Internal callers (principal None) only meet the size cap."""
+    import sentinel.config as cfg
+    cap = int(getattr(cfg, "L2_MAX_DOC_CHARS", 0) or 0)
+    if cap and len(text or "") > cap:
+        raise IngestRefused(413, f"document too large ({len(text)} chars > {cap})")
+    if principal is None or session_scoped:
+        return
+    if len(collection) + len(review_store) >= int(cfg.L2_KB_MAX_CHUNKS):
+        raise IngestRefused(507, "knowledge base is full; an operator must remove documents first")
+    if principal != "operator":
+        quota = int(getattr(cfg, "L2_KB_QUOTA_PER_PRINCIPAL", 0) or 0)
+        if quota and _principal_counts.get(principal, 0) >= quota:
+            raise IngestRefused(429, f"ingest quota reached ({quota} documents for this client)")
 
 # SESSION-SCOPED third-party content (B-1, 2026-09-25). The three stores above are the
 # SHARED knowledge base. Tool outputs used to be ingested into them too, which made one
@@ -71,7 +143,7 @@ def _is_session_scoped(source: str, scope: str | None) -> bool:
 
 
 async def ingest_chunk(text: str, source: str, session_id: str | None = None,
-                       scope: str | None = None) -> dict:
+                       scope: str | None = None, principal: str | None = None) -> dict:
     """
     Ingest a chunk into the RAG vector store.
     Runs L1 scan, calculates instruction density, assigns trust score, signs it,
@@ -80,8 +152,72 @@ async def ingest_chunk(text: str, source: str, session_id: str | None = None,
     `scope`: "kb" (shared knowledge base, retrievable) or "session" (third-party content
     of one session, never retrievable, visible to that session's L4 only). Default:
     "session" for sources starting with "tool_response", else "kb" (B-1).
+
+    `principal` (L2 review C8 / C9): None for internal callers (evaluations, the proxy's tool outputs, demo
+    scenarios); "operator" or a public-client key for the RAG API. External ingests meet the size cap, the
+    knowledge-base capacity check and (public only) the per-client quota; refusals raise IngestRefused.
     """
+    _admit_external(text, principal, _is_session_scoped(source, scope))
+    import sentinel.config as _cfgd
+    if getattr(_cfgd, "L2_DEDUPE", True) and not _is_session_scoped(source, scope):
+        # L2 review C15: the same document ingested again returns the stored verdict instead of a second copy (copies
+        # could fill the whole top-k, the PoisonedRAG pattern). The first ingest's source is kept.
+        prev_id = _kb_digests.get(_norm_digest(text))
+        prev = _find_kb_chunk(prev_id) if prev_id else None
+        if prev is not None and (prev.get("metadata") or {}).get("scorer_version") == scorer_version():
+            return {**_strip(prev), "duplicate_of": prev_id, "reason": f"Duplicate of {prev_id}: {prev['reason']}"}
+        if prev is not None:
+            # A verdict made under another scoring configuration is not reused (the C10 rule): the stale copy is
+            # removed and the document is scored again below.
+            for store in (collection, review_store, quarantine_store):
+                store.pop(prev_id, None)
     chunk_id = f"chk_{uuid.uuid4().hex[:8]}"
+
+    # L2 review N8 (L2_DETECT_REMOVE, off): an LLM detector quotes the injection and it is removed by fuzzy match;
+    # "remove" ingests the sanitized text and keeps the original as quarantined evidence, "report" only records it.
+    llm_meta = {}
+    _dr_mode = getattr(_cfgd, "L2_DETECT_REMOVE", "off")
+    _dr_hold = False
+    if _dr_mode in ("report", "review", "remove") and not _is_session_scoped(source, scope):
+        from .llm_checks import detect_and_remove
+        dr = await detect_and_remove(text)
+        if dr is not None:
+            llm_meta["detect_remove"] = {"injected": dr["injected"],
+                                         "removed_chars": len(text) - len(dr["sanitized"])}
+            if dr["injected"] and _dr_mode == "remove" and dr["sanitized"] != text and dr["sanitized"].strip():
+                ev = quarantine_text(text, source, "Original of a document an LLM detector sanitized (injection "
+                                                   "removed before ingest)")
+                llm_meta["detect_remove"]["original_quarantined"] = ev["chunk_id"]
+                text = dr["sanitized"]
+            elif dr["injected"] and _dr_mode in ("review", "remove"):
+                # "review": a detected injection holds the document for an operator (measured, r08: 37 / 37 DIDA
+                # poisoned documents, 0 / 278 benign incl. corporate notices and instructional text). "remove" falls
+                # back to the same hold when the quoted injection could not be removed.
+                _dr_hold = True
+
+    # L2 redesign (L2_LOCAL_DETECTOR, off | report | review | authoritative; scratch/rca/l2/L2_REDESIGN.md): the LOCAL
+    # model reads the document under a document policy and a residual-stream probe (BIPIA TRAIN only, threshold from
+    # held-out benign documents) decides -- the N8 reading without a hosted call. "review" holds a detected document for
+    # an operator exactly like the N8 hold, ON TOP of the shipped scorers; "report" only records the score.
+    # "authoritative": when the detector answers, ITS decision replaces the soft document-threat verdict (applied below,
+    # once the bin's anchors are known); the high-precision checks after it (control-channel spoofing, hidden text,
+    # known-answer) still apply. Why: the shipped soft scorer's WARN anchors are its alpha-0.05 bin anchors, so a union
+    # with the alpha-0.01 detector cannot meet a ~1 % budget -- measured end to end on BIPIA t5, "review" 0.983 recall
+    # at 12.2 % false positives on pasted passages, 11.5 % of them the shipped scorer's own (results.md §20.8).
+    _ld_mode = getattr(_cfgd, "L2_LOCAL_DETECTOR", "off")
+    _ld_tool = _is_session_scoped(source, scope)
+    ld = None
+    if (_ld_mode in ("report", "review", "authoritative")
+            and (not _ld_tool or getattr(_cfgd, "L2_LOCAL_DETECTOR_TOOLS", False))):
+        import asyncio
+        from sentinel.core.model_executor import run_model     # reused pool: no leaked OpenMP teams (§21.5)
+        from .local_detector import local_doc_read
+        ld = await run_model(local_doc_read, text, _ld_tool)
+        if ld is not None:
+            llm_meta["local_detector"] = {"bin": ld["bin"], "score": round(ld["score"], 4), "tau": round(ld["tau"], 4),
+                                          "fired": ld["fired"]}
+            if ld["fired"] and _ld_mode == "review":
+                _dr_hold = True
 
     # 1. L1 is scored LAZILY (2026-09-23, scratch/rca/LEDGER.md R-006): it only enters
     # the trust score on the legacy path. When the document-threat scorer handles the
@@ -91,7 +227,9 @@ async def ingest_chunk(text: str, source: str, session_id: str | None = None,
     l1_score: float | None = None
 
     # 2. Calculate instruction density
-    density_score = calculate_instruction_density(text)
+    # L2 review C8: model work runs in a worker thread (L2_SCORE_IN_THREAD), so a long document no longer blocks the
+    # event loop -- and with it every other request -- while it is scored.
+    density_score = await _run_scoring(calculate_instruction_density, text)
 
     # 3. Calculate Trust Score.
     #
@@ -110,9 +248,28 @@ async def ingest_chunk(text: str, source: str, session_id: str | None = None,
     if getattr(_cfg, "L2_DOCUMENT_THREAT_SCORER", False):
         from .document_threat import document_threat_score
 
-        threat_detail = document_threat_score(text)
+        if getattr(_cfg, "L2_SHORT_BIN_BY_SOURCE", False):
+            # L2 review I12: the short bin is chosen by source (tool output vs KB document).
+            _kind = "tool" if _is_session_scoped(source, scope) else "doc"
+            threat_detail = await _run_scoring(lambda t: document_threat_score(t, source_kind=_kind), text)
+        else:
+            threat_detail = await _run_scoring(document_threat_score, text)
+    # L2 review C14 / N5 (L2_UNHIDE, off): the classifiers read raw text, so Unicode tag characters, variation-selector
+    # payloads, bidi / invisible characters and spaced-out letters reached them unchanged. When the unhide view
+    # (text_canonicalize.unhide, the same view L1 uses) differs, it is scored too and the higher threat stands.
+    if (threat_detail is not None and threat_detail["available"] and getattr(_cfg, "L2_UNHIDE", False)):
+        from sentinel.core.text_canonicalize import unhide
+        from .document_threat import document_threat_score as _dts
+        _u = unhide(text)
+        if _u != text:
+            _kind2 = "tool" if _is_session_scoped(source, scope) else "doc"
+            _alt = await _run_scoring(
+                (lambda t: _dts(t, source_kind=_kind2)) if getattr(_cfg, "L2_SHORT_BIN_BY_SOURCE", False) else _dts,
+                _u)
+            if _alt.get("available") and _alt["threat"] > threat_detail["threat"]:
+                threat_detail = {**_alt, "raw_view_threat": threat_detail["threat"], "view": "unhide"}
     if (threat_detail is not None and threat_detail["available"]
-            and threat_detail.get("bin") == "short"
+            and str(threat_detail.get("bin", "")).startswith("short")
             and getattr(_cfg, "L2_SHORT_DOC_JUDGE", False)
             and getattr(_cfg, "L1_LLM_JUDGE_ENABLED", False)):
         lo, hi = _cfg.L2_SHORT_DOC_JUDGE_BAND
@@ -134,10 +291,11 @@ async def ingest_chunk(text: str, source: str, session_id: str | None = None,
     signature = sign_chunk(chunk_id, text)
 
     # 5. Compute embedding for semantic retrieval
-    embedding = get_model().encode([text])[0].tolist()
+    embedding = (await _run_scoring(lambda t: get_model().encode([t])[0], text)).tolist()
 
     metadata = {
         "source": source,
+        "ingested_by": _principal_tier(principal),
         "trust_score": trust_score,
         "instruction_density": density_score,
         # Components of the rebuilt scorer, when it ran. Recorded so an artifact
@@ -172,6 +330,26 @@ async def ingest_chunk(text: str, source: str, session_id: str | None = None,
     else:
         q_trust, r_trust = QUARANTINE_THRESHOLD, REVIEW_THRESHOLD
 
+    # L2_LOCAL_DETECTOR="authoritative" (see the detector block above): the detector's decision, mapped monotonically
+    # onto this bin's axis, replaces the soft verdict. Fired -> between the bin's review and quarantine cuts (held for
+    # an operator, never quarantined by this signal alone); clear -> below the review cut. The soft score is kept as
+    # base_threat for audit. No answer from the detector (no GPU / weights / artifact) -> the soft verdict stands.
+    if _ld_mode == "authoritative" and ld is not None:
+        import math
+        r_thr, q_thr = 1.0 - r_trust, 1.0 - q_trust
+        _m = ld["score"] - ld["tau"]
+        if ld["fired"]:                              # _m > 0: strictly above the review cut, below the quarantine cut
+            a_thr = r_thr + 1e-6 + max(0.0, q_thr - r_thr - 2e-6) * (1.0 - math.exp(-_m))
+        else:
+            a_thr = max(0.0, r_thr * math.exp(min(_m, 0.0)) - 1e-6)
+        if threat_detail is not None and threat_detail.get("available"):
+            threat_detail.setdefault("base_threat", threat_detail["threat"])
+            threat_detail["threat"] = a_thr
+        trust_score = 1.0 - a_thr
+        metadata["trust_score"] = trust_score
+        _why = (f"local detector {'fired' if ld['fired'] else 'clear'} (score {ld['score']:.2f}, tau {ld['tau']:.2f}, "
+                f"authoritative); {_why}")
+
     # ADDRESSEE (v3, config.L2_ADR, off by default): a second detector on its own benign anchors --
     # does this third-party text address the AI? -- mapped onto THIS bin's axis (ADR WARN -> the
     # bin's review cut, ADR BLOCK -> its quarantine cut) and united with the bin's score by max, so
@@ -198,6 +376,10 @@ async def ingest_chunk(text: str, source: str, session_id: str | None = None,
     if getattr(_cfg, "L2_SPOOF_MARKERS", False):
         from sentinel.core.control_spoof import spoof_markers
         marks = spoof_markers(text)
+        if not marks and getattr(_cfg, "L2_UNHIDE", False):
+            from sentinel.core.text_canonicalize import unhide
+            _uv = unhide(text)
+            marks = spoof_markers(_uv) if _uv != text else []
         if marks:
             metadata["control_spoof"] = marks
             if trust_score >= q_trust:
@@ -209,8 +391,70 @@ async def ingest_chunk(text: str, source: str, session_id: str | None = None,
                 metadata["trust_score"] = trust_score
             _why = f"spoofed control-channel marker ({', '.join(marks)}); {_why}"
 
+    # L2 review C14 / N5 (L2_HIDDEN_CHARS_ACTION, off): text carried by INVISIBLE characters (Unicode tag characters,
+    # variation-selector runs; >= 4 characters, emoji flag sequences excepted) inside third-party content has no benign
+    # use. "review" raises the threat to this bin's WARN anchor (held for review), "quarantine" to its BLOCK anchor.
+    _hca = getattr(_cfg, "L2_HIDDEN_CHARS_ACTION", "off")
+    if _hca in ("review", "quarantine"):
+        from sentinel.core.text_canonicalize import hiding_report
+        _rep = hiding_report(text)
+        if _rep["strong"]:
+            metadata["hidden_chars"] = {k: v for k, v in _rep.items() if k != "hidden_text"} | {
+                "hidden_text_chars": len(_rep["hidden_text"])}
+            cut = q_trust if _hca == "quarantine" else r_trust
+            if trust_score >= cut:
+                h_threat = min(1.0, 1.0 - cut + 1e-6)
+                if threat_detail is not None and threat_detail["available"]:
+                    threat_detail.setdefault("base_threat", threat_detail["threat"])
+                    threat_detail["threat"] = h_threat
+                trust_score = 1.0 - h_threat
+                metadata["trust_score"] = trust_score
+            _why = f"text hidden in invisible characters ({len(_rep['hidden_text'])} chars); {_why}"
+
+    # L2 review N2 (L2_KAD: off | kb | all): known-answer detection -- does the document stop a model from repeating a
+    # fresh key? A contaminated result lifts the threat to this bin's WARN anchor (held for review): behavioural
+    # evidence of a hijack, but not proof (adaptive attacks and refusals exist), so never a quarantine on its own.
+    _kad = getattr(_cfg, "L2_KAD", "off")
+    if _kad == "all" or (_kad == "kb" and not _is_session_scoped(source, scope)):
+        from .llm_checks import known_answer_check
+        k = await known_answer_check(text)
+        if k is not None:
+            llm_meta["kad"] = k
+            if k["contaminated"] and trust_score >= r_trust:
+                k_threat = min(1.0, 1.0 - r_trust + 1e-6)
+                if threat_detail is not None and threat_detail["available"]:
+                    threat_detail.setdefault("base_threat", threat_detail["threat"])
+                    threat_detail["threat"] = k_threat
+                trust_score = 1.0 - k_threat
+                metadata["trust_score"] = trust_score
+                _why = f"known-answer check: the document overrode a repeat instruction; {_why}"
+    if _dr_hold and trust_score >= r_trust:
+        h_threat = min(1.0, 1.0 - r_trust + 1e-6)
+        if threat_detail is not None and threat_detail["available"]:
+            threat_detail.setdefault("base_threat", threat_detail["threat"])
+            threat_detail["threat"] = h_threat
+        trust_score = 1.0 - h_threat
+        metadata["trust_score"] = trust_score
+        _why = f"LLM detector: the document contains an instruction aimed at an AI; {_why}"
+    if llm_meta:
+        metadata.update(llm_meta)
+
+    # L2 review N6 (L2_PUBLIC_KB_POLICY): "review" holds every PUBLIC (non-operator) knowledge-base document for an
+    # operator's release, whatever its score -- source trust as an enforced attribute, not a free-text label.
+    if (getattr(_cfg, "L2_PUBLIC_KB_POLICY", "shared") == "review" and _principal_tier(principal) == "public"
+            and not _is_session_scoped(source, scope) and trust_score >= q_trust):
+        metadata["held_by_policy"] = "public_kb_review"
+        _why = f"public knowledge-base documents need operator release; {_why}"
+
+    # L2 review C10 / C11: the verdict is final here -- record the scorer version and sign the whole record.
+    metadata["scorer_version"] = scorer_version()
+    if getattr(_cfg, "L2_SIGN_RECORD", True):
+        metadata["record_signature"] = sign_record(chunk_id, text, metadata, embedding)
+
     session_scoped = _is_session_scoped(source, scope)
     result["scope"] = "session" if session_scoped else "kb"
+    if not session_scoped:
+        _kb_digests[_norm_digest(text)] = chunk_id
     if session_scoped:
         result["session_id"] = session_id
 
@@ -224,20 +468,22 @@ async def ingest_chunk(text: str, source: str, session_id: str | None = None,
             _store_session_chunk(session_id, result)
         else:
             quarantine_store[chunk_id] = result
+            _count_principal(principal)
         return result
 
-    if trust_score < r_trust:
+    if trust_score < r_trust or metadata.get("held_by_policy"):
         result["review_flagged"] = True
         result["reason"] = (
             f"Flagged for manual review: trust_score={trust_score:.2f} "
-            f"is between {q_trust:.3f} and {r_trust:.3f} "
-            f"({_why}). "
+            + (f"is between {q_trust:.3f} and {r_trust:.3f} " if trust_score < r_trust else "(held by policy) ")
+            + f"({_why}). "
             f"Not eligible for retrieval until reviewed."
         )
         if session_scoped:
             _store_session_chunk(session_id, result)
         else:
             review_store[chunk_id] = result
+            _count_principal(principal)
         return result
 
     if session_scoped:
@@ -247,7 +493,21 @@ async def ingest_chunk(text: str, source: str, session_id: str | None = None,
 
     # trust_score >= REVIEW_THRESHOLD: eligible for retrieval
     collection[chunk_id] = result
+    _count_principal(principal)
     return result
+
+
+def _count_principal(principal: str | None) -> None:
+    if principal is not None and principal != "operator":
+        _principal_counts[principal] = _principal_counts.get(principal, 0) + 1
+
+
+async def _run_scoring(fn, text):
+    import sentinel.config as cfg
+    if getattr(cfg, "L2_SCORE_IN_THREAD", True):
+        from sentinel.core.model_executor import run_model     # reused pool: no leaked OpenMP teams (§21.5)
+        return await run_model(fn, text)
+    return fn(text)
 
 
 def _map_onto_bin(a: float, a_warn: float, a_block: float, b_warn: float, b_block: float) -> float:
@@ -330,6 +590,49 @@ def retrieval_flagged(chunk: dict) -> bool:
     return chunk.get("current_density", 0) > 0.6
 
 
+def review_chunk(chunk_id: str, decision: str, note: str = "") -> dict | None:
+    """
+    L2 review C5: the human-review step that "review_flagged" always promised and nothing implemented. A held chunk
+    used to stay in `review_store` forever -- never retrievable, i.e. review was quarantine under another name, and the
+    prose bin's alpha-0.05 anchor holds ~5 % of benign prose documents there by design.
+
+    decision "release": the chunk becomes retrievable (moved to `collection`); its verdict, signature and text are
+    unchanged, and the release is recorded in metadata["review"] (who decided is the caller's audit concern).
+    decision "reject": the chunk is quarantined. Returns the chunk (stripped of its embedding) or None if it is not
+    held for review.
+    """
+    if decision not in ("release", "reject"):
+        raise ValueError("decision must be 'release' or 'reject'")
+    if chunk_id not in review_store:
+        return None
+    chunk = review_store.pop(chunk_id)
+    import time as _t
+    chunk["metadata"]["review"] = {"decision": decision, "note": str(note)[:500],
+                                   "at": _t.strftime("%Y-%m-%dT%H:%M:%S")}
+    chunk["review_flagged"] = False
+    if decision == "release":
+        chunk["quarantined"] = False
+        chunk["reason"] = "Released by an operator after review"
+        collection[chunk_id] = chunk
+    else:
+        chunk["quarantined"] = True
+        chunk["reason"] = "Rejected by an operator after review"
+        quarantine_store[chunk_id] = chunk
+    return _strip(chunk)
+
+
+def quarantine_text(text: str, source: str, reason: str) -> dict:
+    """Store `text` directly in quarantine, unscored (evidence, never retrievable) -- e.g. text a PDF hides from its
+    reader (L2 review N1). Signed like any chunk so the evidence itself is tamper-evident."""
+    chunk_id = f"chk_{uuid.uuid4().hex[:8]}"
+    metadata = {"source": source, "ingested_by": "internal", "trust_score": 0.0,
+                "signature": sign_chunk(chunk_id, text), "scorer_version": scorer_version()}
+    result = {"chunk_id": chunk_id, "text": text, "metadata": metadata, "embedding": None, "quarantined": True,
+              "review_flagged": False, "reason": reason, "scope": "kb"}
+    quarantine_store[chunk_id] = result
+    return _strip(result)
+
+
 def quarantine_chunk(chunk_id: str) -> bool:
     """Manually move a chunk to quarantine, from either the active collection or review store."""
     for store in (collection, review_store):
@@ -358,6 +661,51 @@ def _quarantine_after_failed_revalidation(chunk_id: str, chunk_data: dict, reaso
     chunk_data["quarantined"] = True
     chunk_data["reason"] = reason
     quarantine_store[chunk_id] = chunk_data
+
+
+def _diverse_top_k(ranked: list, top_k: int) -> tuple[list, dict]:
+    """
+    L2 review N3 (config.L2_RETRIEVAL_DIVERSITY, off until measured): knowledge-corruption attacks (PoisonedRAG) inject
+    several near-identical passages crafted to win retrieval for a target question, so that they fill the whole
+    context and outvote the true passage. Two cheap, model-free rules over the ranked candidates:
+
+      * near-duplicate cluster: candidates whose embeddings are within cosine L2_DUP_COSINE of an already-picked one
+        are skipped (one representative per cluster), and a cluster of >= L2_DUP_CLUSTER_MIN members is reported on the
+        representative -- the clustering idea of TrustRAG's first stage (arXiv 2501.00879), in its simplest form;
+      * source diversity: at most L2_MAX_PER_SOURCE picks per declared source.
+
+    Returns (picked [(sim, chunk)], {chunk_id: note}). Deliberately not a verdict: a flagged cluster is evidence for
+    the operator and the pipeline, the documents themselves are not quarantined by this rule.
+    """
+    import sentinel.config as cfg
+    dup_cos = float(getattr(cfg, "L2_DUP_COSINE", 0.95))
+    min_cluster = int(getattr(cfg, "L2_DUP_CLUSTER_MIN", 3))
+    per_source = int(getattr(cfg, "L2_MAX_PER_SOURCE", 1))
+    pool = ranked[:max(top_k * 5, top_k)]
+    picked, members, by_source = [], {}, {}
+    for sim, item in pool:
+        emb = np.asarray(item.get("embedding") or [], dtype=float)
+        dup_of = None
+        for _, p in picked:
+            pe = np.asarray(p.get("embedding") or [], dtype=float)
+            if emb.size and pe.size == emb.size:
+                c = float(emb @ pe / ((np.linalg.norm(emb) * np.linalg.norm(pe)) or 1.0))
+                if c >= dup_cos:
+                    dup_of = p["chunk_id"]
+                    break
+        if dup_of is not None:
+            members[dup_of] = members.get(dup_of, 1) + 1
+            continue
+        src = str((item.get("metadata") or {}).get("source", ""))
+        if per_source > 0 and by_source.get(src, 0) >= per_source:
+            continue
+        if len(picked) < top_k:
+            picked.append((sim, item))
+            by_source[src] = by_source.get(src, 0) + 1
+            members.setdefault(item["chunk_id"], 1)
+    notes = {cid: f"near-duplicate cluster of {n} candidate passages (possible knowledge-corruption flood)"
+             for cid, n in members.items() if n >= min_cluster}
+    return picked, notes
 
 
 def retrieve_and_validate(query: str, top_k: int = 3, min_similarity: float | None = None) -> list:
@@ -395,7 +743,13 @@ def retrieve_and_validate(query: str, top_k: int = 3, min_similarity: float | No
     if min_similarity is None:
         import sentinel.config as _c
         min_similarity = float(getattr(_c, "L2_RETRIEVAL_MIN_SIMILARITY", 0.0))
-    results = [(sim, item) for sim, item in scored[:top_k] if sim >= min_similarity]
+    cluster_notes: dict[str, str] = {}
+    import sentinel.config as _cd
+    if getattr(_cd, "L2_RETRIEVAL_DIVERSITY", False):
+        picked, cluster_notes = _diverse_top_k([(s, i) for s, i in scored if s >= min_similarity], top_k)
+        results = picked
+    else:
+        results = [(sim, item) for sim, item in scored[:top_k] if sim >= min_similarity]
 
     validated_chunks = []
 
@@ -405,11 +759,14 @@ def retrieve_and_validate(query: str, top_k: int = 3, min_similarity: float | No
         metadata = chunk_data["metadata"]
 
         is_valid = verify_chunk(chunk_id, text, metadata.get("signature", ""))
-        density = calculate_instruction_density(text)
-
-        findings = []
+        findings = [cluster_notes[chunk_id]] if chunk_id in cluster_notes else []
         if not is_valid:
             findings.append("HMAC signature mismatch - possible tampering")
+        elif metadata.get("record_signature") and not verify_record(
+                chunk_id, text, metadata, chunk_data.get("embedding"), metadata["record_signature"]):
+            # L2 review C11: the verdict, source or embedding was edited after ingest.
+            is_valid = False
+            findings.append("Record signature mismatch - stored verdict, source or embedding changed")
 
         # RE-VALIDATION ON THE AXIS THE CHUNK WAS ADMITTED ON (R-014, 2026-09-24). This
         # compared instruction DENSITY against REVIEW_THRESHOLD, a TRUST cutoff on the
@@ -421,6 +778,21 @@ def retrieve_and_validate(query: str, top_k: int = 3, min_similarity: float | No
         import sentinel.config as _cfg
         dt = metadata.get("document_threat") or {}
         doc_axis = bool(getattr(_cfg, "L2_DOCUMENT_THREAT_SCORER", False) and dt.get("available"))
+        if (doc_axis and is_valid and getattr(_cfg, "L2_RESCAN_ON_VERSION", True)
+                and metadata.get("scorer_version") != scorer_version()):
+            # L2 review C10: admitted under another scoring configuration -> re-score once with the current one.
+            from .document_threat import document_threat_score
+            fresh = document_threat_score(text)
+            if fresh.get("available"):
+                metadata["document_threat"] = fresh
+                metadata["trust_score"] = 1.0 - fresh["threat"]
+                metadata["scorer_version"] = scorer_version()
+                if metadata.get("record_signature"):
+                    metadata["record_signature"] = sign_record(chunk_id, text, metadata, chunk_data.get("embedding"))
+                dt = fresh
+                findings.append("Re-scored under the current L2 configuration")
+        # L2 review C10: instruction density is only the legacy axis's rule; the doc axis never used it here.
+        density = calculate_instruction_density(text) if not doc_axis else None
         if doc_axis:
             over = dt["threat"] >= _cfg.l2_warn_threshold_for(metadata)
             if over:
@@ -472,3 +844,5 @@ def reset_store():
     review_store.clear()
     quarantine_store.clear()
     session_chunks.clear()
+    _principal_counts.clear()
+    _kb_digests.clear()

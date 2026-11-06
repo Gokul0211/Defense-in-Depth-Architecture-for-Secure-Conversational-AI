@@ -74,6 +74,58 @@ _LONG_FORM_MIN_CHARS = 1200
 _SENTENCE_END = re.compile(r"[.!?][\s\"')\]]")
 
 
+_FENCE_BLOCK = re.compile(r"```[^\n]*\n(.*?)```", re.S)
+_OPERATOR = _CODE_MARKERS[4]
+
+
+def _code_score_strict(text: str) -> int:
+    """
+    L2 review C4 (config.L2_STRICT_CODE_DETECTION, default on): markers that cost nothing to add no longer make text
+    CODE. Checked: a plain prose sentence followed by an EMPTY fenced block, or containing two "->" arrows, was
+    classified CODE -- and the code bin's WARN anchor is ~32x the prose bin's (0.633 vs 0.0197), so one empty fence
+    moved a poisoned document to the lenient bar ("bin shopping").
+
+    Here a fenced block counts (as 2, its two fences) only when it holds at least two non-empty lines; bare fences
+    count nothing; the operator pattern contributes at most 1 however often it occurs. The declaration and brace
+    markers are unchanged. Real code -- a fenced snippet, a source file, minified code via the symbol-ratio fallback --
+    still classifies as CODE.
+    """
+    n = 0
+    for body in _FENCE_BLOCK.findall(text):
+        if sum(1 for ln in body.splitlines() if ln.strip()) >= 2:
+            n += 2
+    n += min(1, len(_OPERATOR.findall(text)))
+    for pattern in _CODE_MARKERS[1:4]:
+        n += len(pattern.findall(text))
+    return n
+
+
+_DECL_LINE = re.compile(r"^\s*(?:def|class|import|from|function|var|let|const|public|private|return|if|for|while|"
+                        r"#include|package|using)\b")
+
+
+def split_code_prose(text: str) -> tuple[str, str]:
+    """(code part, prose part) of a document (L2 review C4, used by L2_CODE_PROSE_SPLIT).
+
+    Code: the bodies of fenced blocks, and outside them any line indented by 4+ spaces / a tab, starting with a
+    declaration keyword, or dense in code punctuation. Prose: every other non-empty line. Structural only, like the rest
+    of this module."""
+    code, prose = [], []
+    for i, part in enumerate(re.split(r"```[^\n]*\n?", text or "")):
+        if i % 2 == 1:                                     # inside a fence
+            code.append(part)
+            continue
+        for ln in part.splitlines():
+            s = ln.strip()
+            if not s:
+                continue
+            if ln.startswith(("    ", "\t")) or _DECL_LINE.match(ln) or _symbol_ratio(s) > 0.15:
+                code.append(ln)
+            else:
+                prose.append(s)
+    return "\n".join(code).strip(), "\n".join(prose).strip()
+
+
 def _code_score(text: str) -> int:
     """
     Total code-marker OCCURRENCES, not the number of distinct patterns
@@ -124,7 +176,9 @@ def detect_content_type(text: str) -> str:
     if not text or not text.strip():
         return PROSE
 
-    if _code_score(text) >= 2:
+    import sentinel.config as _cfg
+    score = _code_score_strict(text) if getattr(_cfg, "L2_STRICT_CODE_DETECTION", True) else _code_score(text)
+    if score >= 2:
         return CODE
 
     if _is_tabular(text):

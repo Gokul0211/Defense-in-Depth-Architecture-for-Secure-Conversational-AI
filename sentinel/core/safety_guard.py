@@ -57,6 +57,8 @@ class _Guard:
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
+        # Process default stays 1 (core/embedding.py; results.md §21.5: the full test suite crashed twice at torch's
+        # own 12-thread pool). The CPU forward passes below get their own team instead (core/model_executor.py).
         threads = int(os.getenv("SENTINEL_TORCH_THREADS", "1"))
         if threads > 0:
             torch.set_num_threads(threads)
@@ -126,11 +128,13 @@ class _Guard:
             ids = [t for p in pieces for t in p] + self.post_ids
             cache = copy.deepcopy(self.pre_cache)
             L = len(self.pre_ids)
+        def fwd():
+            with torch.no_grad():                     # grad mode is thread-local: set inside the worker
+                return self.model(torch.tensor([ids]), past_key_values=cache, use_cache=True,
+                                  output_hidden_states=self.head is not None,
+                                  attention_mask=torch.ones(1, L + len(ids), dtype=torch.long))
         try:
-            with torch.no_grad():
-                out = self.model(torch.tensor([ids]), past_key_values=cache, use_cache=True,
-                                 output_hidden_states=self.head is not None,
-                                 attention_mask=torch.ones(1, L + len(ids), dtype=torch.long))
+            out = self._compute(fwd)
         except torch.cuda.OutOfMemoryError:
             # One very long input on a 4 GB GPU: score THIS item on a CPU twin (same fp32
             # model), counted, instead of failing it.
@@ -177,9 +181,20 @@ class _Guard:
         ids = self._ids(text)
         # CPU tensor, exactly as _readout passes it: on a GPU the model is a split-device wrapper that places
         # inputs itself and has no .parameters() (RCA 2 fix validation m03 caught the first version failing).
-        with torch.no_grad():
-            out = self.model(torch.tensor([ids]), attention_mask=torch.ones(1, len(ids), dtype=torch.long))
+        def fwd():
+            with torch.no_grad():
+                return self.model(torch.tensor([ids]), attention_mask=torch.ones(1, len(ids), dtype=torch.long))
+        out = self._compute(fwd)
         return torch.softmax(torch.log_softmax(out.logits[0, -1].float().cpu(), -1)[label_ids], -1).tolist()
+
+    def _compute(self, fwd):
+        """A forward pass. On the CPU it runs on a dedicated long-lived worker with its own torch team
+        (SENTINEL_GUARD_THREADS, default 8), so the guard is ~2.3x faster than at the process default of one
+        thread without widening any other model's team (core/model_executor.py). On the GPU: inline."""
+        if getattr(self, "on_gpu", False):        # a bare instance (tests build one with __new__) takes the CPU path
+            return fwd()
+        from sentinel.core.model_executor import cpu_compute, guard_cpu_threads
+        return cpu_compute(fwd, threads=guard_cpu_threads())
 
     def score_response(self, prompt: str, response: str) -> dict:
         """RESPONSE moderation (RCA 2 F-L5): the model's native assistant-response template -- "is THE
@@ -327,21 +342,54 @@ def _memo_put(key, val):
         _MEMO.popitem(last=False)
 
 
+def _text_key(text: str) -> str:
+    """L1 review B14: memo keys hold a digest, not the text. With _MEMO_MAX = 20,000 entries keyed on the FULL text,
+    long documents / tool outputs could hold gigabytes on an 8 GB machine; a sha256 digest is 64 characters."""
+    import hashlib
+    return hashlib.sha256((text or "").encode("utf-8", "surrogatepass")).hexdigest()
+
+
 def _head_tag():
     import sentinel.config as cfg
     return getattr(cfg, "SAFETY_GUARD_HEAD", "") or ""
+
+
+HARM_WINDOW_STRIDE = 768          # windows of _MAX_PAYLOAD_TOKENS with a 256-token overlap
+
+
+def _harm_windows(g, text: str) -> list[str] | None:
+    """L1 review B1 (config.L1_HARM_WINDOWED): the windows of a prompt longer than the guard's payload cap, or None
+    when it fits or the flag is off. `score_prompt` keeps head + tail at the cap, so a long middle was never read."""
+    import sentinel.config as cfg
+    if not getattr(cfg, "L1_HARM_WINDOWED", False):
+        return None
+    ids = g._ids(text)
+    if len(ids) <= _MAX_PAYLOAD_TOKENS:
+        return None
+    out = []
+    for start in range(0, len(ids), HARM_WINDOW_STRIDE):
+        out.append(g.tok.decode(ids[start:start + _MAX_PAYLOAD_TOKENS]))
+        if start + _MAX_PAYLOAD_TOKENS >= len(ids):
+            break
+    return out
 
 
 def safety_score_prompt(text: str) -> float | None:
     g = get_guard()
     if g is None or not text:
         return None
-    key = ("p", _head_tag(), text)
+    windows = _harm_windows(g, text)
+    key = ("p", _head_tag(), _text_key(text), windows is not None)
     hit = _memo_get(key)
     if hit is not None:
         return hit
     try:
-        val = _pick(g.score_prompt(text))
+        if windows is not None:
+            vals = [_pick(g.score_prompt(w)) for w in windows]
+            vals = [v for v in vals if v is not None]
+            val = max(vals) if vals else None
+        else:
+            val = _pick(g.score_prompt(text))
     except Exception as e:                                            # noqa: BLE001
         logger.warning(f"safety guard inference failed: {e}")
         return None
@@ -354,7 +402,7 @@ def safety_score_conversation(turns: list[str]) -> float | None:
     g = get_guard()
     if g is None or not turns:
         return None
-    key = ("c", _head_tag(), tuple(turns))
+    key = ("c", _head_tag(), _text_key("\x1e".join(turns)))
     hit = _memo_get(key)
     if hit is not None:
         return hit
@@ -373,7 +421,7 @@ def safety_score_response(prompt: str, response: str) -> float | None:
     g = get_guard()
     if g is None or not response:
         return None
-    key = ("r", prompt or "", response)
+    key = ("r", _text_key(prompt or ""), _text_key(response))
     hit = _memo_get(key)
     if hit is not None:
         return hit
@@ -391,7 +439,7 @@ def harm_category_prompt(text: str) -> str | None:
     g = get_guard()
     if g is None or not text:
         return None
-    key = ("cat", text)
+    key = ("cat", _text_key(text))
     hit = _memo_get(key)
     if hit is not None:
         return hit
@@ -402,6 +450,28 @@ def harm_category_prompt(text: str) -> str | None:
         return None
     if val is not None:
         _memo_put(key, val)
+    return val
+
+
+def local_jailbreak_score(text: str) -> float | None:
+    """v7 (row #13 / #5): a LOCAL stand-in for the hosted L1 judge in its band. The guard's prompt-mode P(Unsafe),
+    counted ONLY when its own category readout is "Jailbreak" -- general harm is the harm head's job, and counting it
+    here would import OR-Bench-style over-flagging into the injection score. None when the guard is unavailable."""
+    g = get_guard()
+    if g is None or not text:
+        return None
+    key = ("jb", _text_key(text))
+    hit = _memo_get(key)
+    if hit is not None:
+        return hit
+    try:
+        r = g.score_prompt(text)
+        p_unsafe = float(r.get("p_unsafe", 0.0)) if isinstance(r, dict) else float(_pick(r) or 0.0)
+        val = p_unsafe if (p_unsafe >= 0.5 and g.category_prompt(text) == "Jailbreak") else 0.0
+    except Exception as e:                                            # noqa: BLE001
+        logger.warning(f"local jailbreak judge failed: {e}")
+        return None
+    _memo_put(key, val)
     return val
 
 

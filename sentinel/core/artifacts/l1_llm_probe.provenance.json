@@ -1,0 +1,33 @@
+{
+ "built": "2026-10-30 17:49",
+ "model": "Qwen/Qwen3-4B-Instruct-2507 (4-bit NF4)",
+ "template": "core/local_judge.py judge template (v7 policy + yes/no answer line), last token",
+ "probes": [
+  {
+   "name": "v3",
+   "layers": [
+    20
+   ]
+  },
+  {
+   "name": "bal20",
+   "layers": [
+    20
+   ]
+  },
+  {
+   "name": "bal162024",
+   "layers": [
+    16,
+    20,
+    24
+   ]
+  }
+ ],
+ "combination": "max_k z_k, z_k = (logit p_k - mu_k) / sd_k over pooled CAL",
+ "tau": 2.8930578231811523,
+ "calibration": "group-conditional split-conformal alpha 0.01, max over Alpaca 7000-7300 / synthetic trigger / OASST trigger (scratch/rca/l1/tt01_score.py)",
+ "dev": "external only (scratch/rca/l1/head/train_v3.json, train_v4.json; leakage audit tt12)",
+ "record": "scratch/rca/l1/TT_REDESIGN.md \u00a77",
+ "texts_stored": false
+}

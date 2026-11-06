@@ -1674,4 +1674,124 @@ _REGISTRY.update({
     "tomgibbs_semi": {"loader": "_load_tomgibbs_semi", "layer": "L3",
                       "hf_path": "tom-gibbs/multi-turn_jailbreak_attack_datasets", "license": "MIT",
                       "description": "tom-gibbs Harmful vs Semi-Benign control"},
+    "tensortrust_hijacking": {"loader": "_load_tensortrust_hijacking", "layer": "L1", "hf_path": "qxcv/tensor-trust",
+                              "license": "MIT",
+                              "description": "TensorTrust hijacking-robustness benchmark (776 attacks, Toyer et al.)"},
+    "tensortrust_fresh": {"loader": "_load_tensortrust_fresh", "layer": "L1", "hf_path": "qxcv/tensor-trust",
+                          "license": "MIT",
+                          "description": "Fresh successful TensorTrust attacks from the raw dump, near-duplicate "
+                                         "filtered against both benchmarks (scratch/rca/l1/tt15_fresh_test.py)"},
 })
+
+
+def _load_tensortrust_fresh(split: str = "test", limit: int | None = None, cache: bool = True) -> EvalDataset:
+    """Cache-only: built once by scratch/rca/l1/tt15_fresh_test.py (pre-registered sampling rules there)."""
+    cached = _load_from_cache_capped("tensortrust_fresh", split, limit)
+    if cached is None:
+        raise FileNotFoundError("tensortrust_fresh is built by scratch/rca/l1/tt15_fresh_test.py")
+    return cached
+
+
+def _load_tensortrust_fresh_robust(split: str = "test", limit: int | None = None, cache: bool = True) -> EvalDataset:
+    """Cache-only: tt15_fresh_test.py --robust (inputs that succeeded against >= 2 distinct defenders)."""
+    cached = _load_from_cache_capped("tensortrust_fresh_robust", split, limit)
+    if cached is None:
+        raise FileNotFoundError("tensortrust_fresh_robust is built by scratch/rca/l1/tt15_fresh_test.py --robust")
+    return cached
+
+
+def _load_tensortrust_fresh3_robust(split: str = "test", limit: int | None = None, cache: bool = True) -> EvalDataset:
+    """Cache-only: tt15_fresh_test.py --v3 (raw dump v2; excludes everything near both benchmarks and both earlier
+    fresh sets; >= 2 distinct defenders)."""
+    cached = _load_from_cache_capped("tensortrust_fresh3_robust", split, limit)
+    if cached is None:
+        raise FileNotFoundError("tensortrust_fresh3_robust is built by scratch/rca/l1/tt15_fresh_test.py --v3")
+    return cached
+
+
+def _load_tensortrust_fresh4_robust(split: str = "test", limit: int | None = None, cache: bool = True) -> EvalDataset:
+    """Cache-only: tt15_fresh_test.py --v4 (raw dump v2; excludes everything near both benchmarks and all three earlier
+    fresh sets; >= 2 distinct defenders)."""
+    cached = _load_from_cache_capped("tensortrust_fresh4_robust", split, limit)
+    if cached is None:
+        raise FileNotFoundError("tensortrust_fresh4_robust is built by scratch/rca/l1/tt15_fresh_test.py --v4")
+    return cached
+
+
+def _load_tensortrust_fresh5_robust(split: str = "test", limit: int | None = None, cache: bool = True) -> EvalDataset:
+    """Cache-only: tt15_fresh_test.py --v5 (raw dump v2; excludes everything near both benchmarks and all four earlier
+    fresh sets; >= 2 distinct defenders). Built 2026-11-06 for the L1 v9 round."""
+    cached = _load_from_cache_capped("tensortrust_fresh5_robust", split, limit)
+    if cached is None:
+        raise FileNotFoundError("tensortrust_fresh5_robust is built by scratch/rca/l1/tt15_fresh_test.py --v5")
+    return cached
+
+
+def _load_tensortrust_fresh6(split: str = "test", limit: int | None = None, cache: bool = True) -> EvalDataset:
+    """Cache-only: tt15_fresh_test.py --v6 (raw dump v2; single-defender successes >= 5 words; excludes everything near
+    both benchmarks and all five earlier fresh sets). Built 2026-11-06 for the L1 v10 round."""
+    cached = _load_from_cache_capped("tensortrust_fresh6", split, limit)
+    if cached is None:
+        raise FileNotFoundError("tensortrust_fresh6 is built by scratch/rca/l1/tt15_fresh_test.py --v6")
+    return cached
+
+
+def _load_tensortrust_fresh7(split: str = "test", limit: int | None = None, cache: bool = True) -> EvalDataset:
+    """Cache-only: tt15_fresh_test.py --v7 (raw dump v2; single-defender successes >= 5 words; excludes everything near
+    both benchmarks and all six earlier fresh sets). Built 2026-11-06 20:15 for the L1 v11 round; untouched."""
+    cached = _load_from_cache_capped("tensortrust_fresh7", split, limit)
+    if cached is None:
+        raise FileNotFoundError("tensortrust_fresh7 is built by scratch/rca/l1/tt15_fresh_test.py --v7")
+    return cached
+
+
+_REGISTRY["tensortrust_fresh7"] = {
+    "loader": "_load_tensortrust_fresh7", "layer": "L1", "hf_path": "qxcv/tensor-trust", "license": "MIT",
+    "description": "Seventh fresh TensorTrust set (raw dump v2), single-defender >= 5 words, near-duplicate filtered vs all earlier"}
+_REGISTRY["tensortrust_fresh6"] = {
+    "loader": "_load_tensortrust_fresh6", "layer": "L1", "hf_path": "qxcv/tensor-trust", "license": "MIT",
+    "description": "Sixth fresh TensorTrust set (raw dump v2), single-defender >= 5 words, near-duplicate filtered vs all earlier"}
+_REGISTRY["tensortrust_fresh5_robust"] = {
+    "loader": "_load_tensortrust_fresh5_robust", "layer": "L1", "hf_path": "qxcv/tensor-trust", "license": "MIT",
+    "description": "Fifth fresh TensorTrust set (raw dump v2), >= 2 defenders, near-duplicate filtered vs all earlier"}
+_REGISTRY["tensortrust_fresh4_robust"] = {
+    "loader": "_load_tensortrust_fresh4_robust", "layer": "L1", "hf_path": "qxcv/tensor-trust", "license": "MIT",
+    "description": "Fourth fresh TensorTrust set (raw dump v2), >= 2 defenders, near-duplicate filtered vs all earlier"}
+_REGISTRY["tensortrust_fresh3_robust"] = {
+    "loader": "_load_tensortrust_fresh3_robust", "layer": "L1", "hf_path": "qxcv/tensor-trust", "license": "MIT",
+    "description": "Third fresh TensorTrust set (raw dump v2), >= 2 defenders, near-duplicate filtered vs all earlier"}
+_REGISTRY["tensortrust_fresh_robust"] = {
+    "loader": "_load_tensortrust_fresh_robust", "layer": "L1", "hf_path": "qxcv/tensor-trust", "license": "MIT",
+    "description": "Fresh TensorTrust attacks that succeeded against >= 2 distinct defenders, near-duplicate filtered"}
+
+
+def _load_tensortrust_hijacking(split: str = "test", limit: int | None = None, cache: bool = True) -> EvalDataset:
+    """TensorTrust HIJACKING robustness benchmark (776 attacks that try to make the defended model say "access
+    granted"). The `tensortrust` key is the EXTRACTION benchmark (570); this is its sibling, added 2026-10-30 as an
+    untouched final test for the L1 redesign (scratch/rca/l1/TT_REDESIGN.md). Only the attack text is the sample;
+    the defense pre/post prompts are not kept (L1 never sees them)."""
+    if cache:
+        cached = _load_from_cache_capped("tensortrust_hijacking", split, limit)
+        if cached:
+            return cached
+    from huggingface_hub import hf_hub_download
+    path = hf_hub_download("qxcv/tensor-trust", "benchmarks/hijacking-robustness/v1/hijacking_robustness_dataset.jsonl",
+                           repo_type="dataset")
+    samples = []
+    with open(path, encoding="utf-8") as fh:
+        for i, line in enumerate(fh):
+            row = json.loads(line)
+            text = row.get("attack") or ""
+            if not text.strip():
+                continue
+            samples.append(EvalSample(text=str(text), label="malicious", attack_type="direct_injection",
+                                      target_layer="L1", source_benchmark="tensortrust_hijacking",
+                                      sample_id=f"tth_{row.get('sample_id', i)}", metadata={}))
+    if limit:
+        samples = _apply_limit(samples, limit)
+    dataset = EvalDataset(name="tensortrust_hijacking", samples=samples,
+                          description="TensorTrust hijacking-robustness attacks (Toyer et al.)", license="MIT",
+                          source_url="https://huggingface.co/datasets/qxcv/tensor-trust", split=split)
+    if cache:
+        _save_to_cache(dataset, limit)
+    return dataset

@@ -35,6 +35,10 @@ def get_model() -> SentenceTransformer:
             # reductions are not bitwise-identical to the recorded artifacts), but now
             # overridable: SENTINEL_TORCH_THREADS=0 leaves torch's own default.
             import os
+            # 2026-11-04: the default was briefly 0 (torch's own 12-thread pool) for the CPU harm head's latency; the full
+            # test suite then crashed twice at the same model load (access violation, ~45 %) and passed at 1
+            # (results.md §21.5) -> back to 1. The harm head gets its own multi-threaded worker instead
+            # (core/model_executor.py, SENTINEL_GUARD_THREADS). SENTINEL_TORCH_THREADS=0 still leaves torch's default.
             n = int(os.getenv("SENTINEL_TORCH_THREADS", "1"))
             if n > 0:
                 torch.set_num_threads(n)

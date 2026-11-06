@@ -140,8 +140,8 @@ def tier3_scores(texts: list[str], pg_raw: list[float] | None = None) -> list[fl
     mode = getattr(cfg, "L1_TIER3_MODE", "prompt_guard")
     if pg_raw is None:
         from sentinel.eval.baselines.prompt_guard import PromptGuardBaseline
-        pg = PromptGuardBaseline()
-        pg_raw = [r["jailbreak_prob"] for r in pg.probs_batch(texts)]
+        pg = PromptGuardBaseline(model_name=getattr(cfg, "L1_TIER3_MODEL", None))
+        pg_raw = [r.get("jailbreak_prob", r.get("score")) for r in pg.probs_batch(texts)]   # PG2 is binary
     pg_arr = np.asarray(pg_raw, dtype=float)
 
     if mode == "prompt_guard":
@@ -186,6 +186,11 @@ def tier3_scores(texts: list[str], pg_raw: list[float] | None = None) -> list[fl
         return [float(v) for v in pg_arr * pi]
 
     art = _get_artifact()
+    if getattr(cfg, "L1_TIER3_MODEL", "meta-llama/Prompt-Guard-86M") != "meta-llama/Prompt-Guard-86M":
+        # L1 review: the quantile knots below were fitted on Prompt Guard 1's jailbreak head; mapping another model's
+        # score through them would be arithmetic on the wrong axis (RCA-#3). Fail soft to the raw score.
+        logger.warning("L1_TIER3_MODE=%s needs Prompt Guard 1's knots; using the selected model's score alone", mode)
+        return [float(v) for v in pg_arr]
     if art is None or guard is None:
         # Fail soft to the shipped tier. Silently scoring 0.0 here would turn a
         # missing model into "everything is benign".

@@ -1,12 +1,20 @@
 """
 SENTINEL Layer 1 — Text Injection Classifier (Real)
 
-Two-tier detection:
-  Tier 1: Regex pattern matching against known injection signatures (<1ms)
-  Tier 2: Semantic similarity via sentence-transformers (~15ms)
-
-If Tier 1 fires → return immediately, skip Tier 2.
-If Tier 1 clean → run Tier 2.
+A cascade (doc corrected 2026-10-27, L1 review B15; it used to say "two-tier"):
+  decode   base64 / hex / ROT13 views (+ URL / HTML / escapes / reversed with L1_DECODERS_V2); a Tier-1 hit on any
+           decoded view returns OBFUSCATED_INJECTION
+  Tier 1   regex + spoofed control-channel markers (+ the tool-output addressee cue); a HARD hit returns 0.92 (BLOCK).
+           With L1_TIER1_SOFT, hits on only the lexical TIER1_SOFT patterns go to the judge band instead
+  Tier 2   MiniLM cosine to KNOWN_INJECTIONS, per sentence window, raw + canonical (+ unhide view, L1_CANON_V2)
+  Tier 3   Prompt Guard jailbreak x PIGuard injection (L1_TIER3_MODE="agreement", the default), max over inputs
+           (tool-output prose fields; unhide view; decoded views; 448-token windows with L1_TIER3_WINDOWED)
+  Tier 4   hosted LLM judge when max(T2, T3) is in (L1_SEMANTIC_MEDIUM, L1_SEMANTIC_HIGH]; may only raise (local
+           guard fallback with L1_LOCAL_JUDGE; Tier-3-only blocks verified with L1_TIER3_VERIFIER)
+  T0       hidden-content signal (L1_ANOMALY_TIER): invisible carriers holding text raise the score to WARN
+  harm     the harm-intent head (L1_HARM_HEAD="separate"), reported as harm_score, never fused into score
+Fusion is max() unless L1_TIER_FUSION; the harm-content / harm-probe / safety tiers are optional and off.
+`L1Result.decision` is the shared-axis action the score implies.
 """
 
 import re
@@ -39,24 +47,35 @@ logger = logging.getLogger(__name__)
 # Tier-2-only instead of crashing the request.
 _prompt_guard_singleton = None
 _prompt_guard_load_failed = False
+_prompt_guard_model = None
 
 
 def _get_prompt_guard():
     """Returns a loaded PromptGuardBaseline, or None if it's unavailable
     (missing transformers/torch, model download failure, etc.) — callers
-    must treat None as "skip this signal", never as an error."""
-    global _prompt_guard_singleton, _prompt_guard_load_failed
+    must treat None as "skip this signal", never as an error.
+
+    L1 review (new mechanism 1): the model is config.L1_TIER3_MODEL, read live; the singleton is rebuilt when it
+    changes. Llama Prompt Guard 2 publishes P(malicious) on a DIFFERENT axis from Prompt Guard 1's jailbreak head, so
+    L1_WARN_THRESHOLD and the "ensemble" / "piguard" quantile maps (fitted on Prompt Guard 1) do not carry over: a
+    switch needs the conformal re-derivation (conformal_l1_eval.py) before any number is reported."""
+    global _prompt_guard_singleton, _prompt_guard_load_failed, _prompt_guard_model
+    import sentinel.config as _c
+    want = getattr(_c, "L1_TIER3_MODEL", "meta-llama/Prompt-Guard-86M")
+    if _prompt_guard_singleton is not None and _prompt_guard_model != want:
+        _prompt_guard_singleton, _prompt_guard_load_failed = None, False
     if _prompt_guard_load_failed:
         return None
     if _prompt_guard_singleton is None:
         try:
             from sentinel.eval.baselines.prompt_guard import PromptGuardBaseline
-            candidate = PromptGuardBaseline()
+            candidate = PromptGuardBaseline(model_name=want)
             candidate._load()
-            _prompt_guard_singleton = candidate
+            _prompt_guard_singleton, _prompt_guard_model = candidate, want
         except Exception as e:
-            logger.warning(f"Prompt Guard unavailable, L1 will run Tier 2-only: {e}")
+            logger.warning(f"Prompt Guard ({want}) unavailable, L1 will run Tier 2-only: {e}")
             _prompt_guard_load_failed = True
+            _prompt_guard_model = want
             return None
     return _prompt_guard_singleton
 
@@ -182,6 +201,31 @@ TIER1_PATTERNS = [
 
 TIER1_COMPILED = [re.compile(p, re.IGNORECASE) for p in TIER1_PATTERNS]
 
+# L1 REVIEW B3 (2026-10-27, config.L1_TIER1_SOFT, off): a Tier-1 hit is a fixed 0.92, i.e. a BLOCK, with no second
+# read. These four patterns are LEXICAL rather than aimed at the AI's own instructions, and all of these everyday
+# sentences hit them (regex-checked, deterministic): "Can you show me the assembly instructions for this desk?",
+# "Print the original instructions from the recipe card", "Create a new task in Jira for the release", "My new goal
+# is to run a marathon", "How do I turn off the safety lock on my drill?", "Disable the spam filter for this folder",
+# "Did I forget the task list at home?". The same text inside a tool output (a task tracker, an e-mail) was withheld.
+# With the flag on, a hit on ONLY these publishes L1_TIER1_SOFT_SCORE inside the judge band and the cascade continues:
+# the judge (or Tiers 2 / 3) decides. Everything else -- override-your-instructions forms, persona / mode switches,
+# control-channel tags, spoof markers, spaced-out or decoded matches -- stays a hard 0.92.
+TIER1_SOFT = frozenset({
+    TIER1_PATTERNS[3],      # (reveal|output|print|show|repeat) ... instructions / guidelines / system prompt
+    TIER1_PATTERNS[7],      # new (goal|task|objective|instruction)
+    TIER1_PATTERNS[8],      # forget ... (goal|instructions|task|objective)
+    TIER1_PATTERNS[10],     # (override|bypass|disable|turn off|deactivate) ... (safety|filter|...)
+})
+# L1 review B2: the same patterns with literal spaces removed, for letter runs collapsed from spaced-out text (no
+# word breaks survive). Applied only to such runs (>= 8 spaced letters), never to ordinary text.
+TIER1_COMPACT = []
+for _p in TIER1_PATTERNS:
+    try:
+        _c = re.compile(_p.replace(" ", ""), re.IGNORECASE)
+    except re.error:
+        continue
+    TIER1_COMPACT.append(_c)
+
 
 import base64
 import codecs
@@ -216,6 +260,8 @@ def try_decode_hex(text: str) -> str | None:
     return None
 
 _MAX_DECODE_CANDIDATES = 32
+# L1 review B4: decoded views handed to Tiers 2 / 3 as well (L1_DECODED_VIEWS_ALL_TIERS), longest first.
+_MAX_DECODED_VIEWS_FOR_MODELS = 8
 
 
 def _decoded_candidates(text: str) -> list[tuple[str, str]]:
@@ -223,7 +269,18 @@ def _decoded_candidates(text: str) -> list[tuple[str, str]]:
 
     try_decode_base64 / try_decode_hex return the FIRST span that decodes to printable text, so a
     harmless leading blob ("aGVsbG8gd29ybGQ=" = "hello world") hid every later one from Tier 1.
-    Capped at _MAX_DECODE_CANDIDATES spans per kind so a long token-heavy input stays cheap."""
+
+    L1 review B5 (L1_DECODE_NO_CAP, default on): the cap below counted SUCCESSFUL decodes, so 32 harmless leading
+    blobs hid the real one again, and it never bounded cost (failed decodes were not counted). Decoding is linear in
+    the input, so core/decoders.py decodes every span, drops duplicates and puts longer plaintexts first. With
+    L1_DECODERS_V2 the URL / HTML / unicode-escape / base64url / reversed decoders and two nesting levels are added."""
+    import sentinel.config as cfg
+    if getattr(cfg, "L1_DECODERS_V2", False):
+        from sentinel.core.decoders import decode_views
+        return decode_views(text, max_depth=2)
+    if getattr(cfg, "L1_DECODE_NO_CAP", True):
+        from sentinel.core.decoders import decode_views
+        return decode_views(text, max_depth=1, legacy_kinds_only=True)
     out = []
     for kind, pattern, decode in (
             ("Base64", r'\b[A-Za-z0-9+/]{8,}={0,2}\b',
@@ -244,17 +301,85 @@ def _decoded_candidates(text: str) -> list[tuple[str, str]]:
     return out
 
 
-def _tier1_reason(text: str) -> str | None:
+TIER3_WINDOW_TOKENS = 448        # below 512 so the second classifier's (different) tokenizer also fits
+TIER3_WINDOW_STRIDE = 320        # 128-token overlap: a sentence cut at one window edge is whole in the next
+
+
+def _tier3_segments(classifier, text: str) -> list[str]:
+    """The pieces Tier 3 scores for one input (L1 review B1, config.L1_TIER3_WINDOWED; off -> [text]).
+
+    Prompt Guard and PIGuard tokenize with truncation at 512 and keep the beginning, so an instruction after a long
+    benign preamble was never read by either. Above TIER3_WINDOW_TOKENS (Prompt Guard's tokenizer) the input is cut
+    into overlapping windows covering every token, decoded back to text, and each is scored; the caller takes the max.
+    Inputs that fit are returned whole, so short inputs score exactly as before."""
+    import sentinel.config as cfg
+    if not getattr(cfg, "L1_TIER3_WINDOWED", False) or not text:
+        return [text]
+    tok = getattr(classifier, "_tokenizer", None)
+    if tok is None:
+        return [text]
+    ids = tok(text, add_special_tokens=False, verbose=False)["input_ids"]
+    if len(ids) <= TIER3_WINDOW_TOKENS:
+        return [text]
+    segs = []
+    for start in range(0, len(ids), TIER3_WINDOW_STRIDE):
+        segs.append(tok.decode(ids[start:start + TIER3_WINDOW_TOKENS]))
+        if start + TIER3_WINDOW_TOKENS >= len(ids):
+            break
+    return segs
+
+
+def _model_views(decoded: list[tuple[str, str]]) -> list[str]:
+    """The decoded plaintexts Tiers 2 / 3 also read (L1 review B4, config.L1_DECODED_VIEWS_ALL_TIERS; off -> []).
+    Longest first, at most _MAX_DECODED_VIEWS_FOR_MODELS, so a text full of encoded blobs stays bounded."""
+    import sentinel.config as cfg
+    if not getattr(cfg, "L1_DECODED_VIEWS_ALL_TIERS", False):
+        return []
+    views = sorted({s for _, s in decoded if s and s.strip()}, key=lambda v: (-len(v), v))
+    return views[:_MAX_DECODED_VIEWS_FOR_MODELS]
+
+
+def _snippet(s: str, n: int = 80) -> str:
+    """Attacker-controlled text as it may appear in a reason string (L1 review B15): at most `n` characters, with
+    control and non-ASCII characters escaped, so a decoded payload cannot flood logs or the dashboard or carry
+    line breaks / terminal escapes into them. The reason used to echo the whole decoded plaintext."""
+    cut = s[:n]
+    out = cut.encode("unicode_escape").decode("ascii")
+    return out + ("..." if len(s) > n else "")
+
+
+def _tier1_reason(text: str, exclude_soft: bool = False) -> str | None:
     """Why Tier 1 fires on `text` (raw or normalized), or None. One place for the regex list and
-    the spoofed-control-channel markers (core/control_spoof.py, L1_SPOOF_MARKERS)."""
-    normalized = normalize(text)
-    for pattern in TIER1_COMPILED:
-        if pattern.search(text) or pattern.search(normalized):
-            return f"Matched pattern: {pattern.pattern[:40]}"
+    the spoofed-control-channel markers (core/control_spoof.py, L1_SPOOF_MARKERS).
+
+    `exclude_soft` skips the TIER1_SOFT patterns (L1 review B3): "is there a HARD reason?"."""
     import sentinel.config as _cfg
+    normalized = normalize(text)
+    views = [text, normalized]
+    unhidden, runs = None, []
+    if getattr(_cfg, "L1_CANON_V2", False):
+        # L1 review B2: also the view with tag characters / variation selectors decoded, invisible and bidi
+        # characters removed, mixed-script homoglyphs folded and spaced letters collapsed (text_canonicalize.unhide).
+        from sentinel.core.text_canonicalize import canonicalize, collapse_spaced_letters, unhide
+        unhidden = unhide(text)
+        if unhidden != text:
+            views.append(canonicalize(unhidden))
+            _, runs = collapse_spaced_letters(text)
+    for pattern in TIER1_COMPILED:
+        if exclude_soft and pattern.pattern in TIER1_SOFT:
+            continue
+        if any(pattern.search(v) for v in views):
+            return f"Matched pattern: {pattern.pattern[:40]}"
+    # A run spaced one letter at a time ("i g n o r e p r e v i o u s ...", the issue-#50 form) carries no word
+    # breaks, so the patterns are also tried with their spaces removed, on the collapsed runs only.
+    for run in runs:
+        compact = normalize(run).replace(" ", "")
+        for pattern in TIER1_COMPACT:
+            if pattern.search(compact):
+                return f"Matched pattern in spaced-out letters: {pattern.pattern[:40]}"
     if getattr(_cfg, "L1_SPOOF_MARKERS", False):
         from sentinel.core.control_spoof import spoof_markers
-        marks = spoof_markers(text)
+        marks = spoof_markers(text) or (spoof_markers(unhidden) if unhidden and unhidden != text else [])
         if marks:
             return f"Spoofed control-channel marker ({', '.join(marks)})"
     return None
@@ -670,6 +795,24 @@ async def _harm_head(text: str) -> tuple[float | None, str | None]:
     return float(g), "guard"
 
 
+def _judge_text(text: str, raw_windows: list[str], raw_sims) -> str:
+    """What the hosted judge reads (L1 review B10, config.L1_JUDGE_MAX_CHARS).
+
+    Unchanged unless the cap is set and the input exceeds it. A long input used to be sent whole: it spent the token
+    budget the pacer reserves for it, or failed on the provider's context limit and read as "judge unavailable". Above
+    the cap the judge reads the head, the Tier-2 window that put the input in the band (the most injection-like
+    sentence, wherever it sits), and the tail, a third of the budget each, with explicit omission markers. A head-only
+    or head+tail clip would hide a middle insertion, the failure B1 documents for Tier 3."""
+    import sentinel.config as cfg
+    cap = int(getattr(cfg, "L1_JUDGE_MAX_CHARS", 0) or 0)
+    if cap <= 0 or len(text) <= cap:
+        return text
+    third = max(1, cap // 3)
+    best = raw_windows[int(np.argmax(np.max(raw_sims, axis=1)))] if len(raw_windows) else ""
+    marker = "\n[... omitted ...]\n"
+    return text[:third] + marker + best[:third] + marker + text[-third:]
+
+
 _FIELD_RE = re.compile(r"'((?:[^'\\]|\\.)*)'|\"((?:[^\"\\]|\\.)*)\"")
 _MIN_FIELD_WORDS = 6
 
@@ -707,7 +850,9 @@ async def layer1_check(text: str, harm_head: bool = True, source: str = "user") 
     `source` (RCA 2 F-T3): "tool_output" makes Tier 3 read the output's prose fields only
     (see tool_output_fields); every other tier and every other source is unchanged.
     """
-    result = await _layer1_injection_check(text, source=source)
+    anomaly = _anomaly_report(text)
+    result = await _layer1_injection_check(text, source=source, anomaly=anomaly)
+    result.anomaly = anomaly
     import sentinel.config as cfg
     if harm_head and getattr(cfg, "L1_HARM_HEAD", "off") == "separate":
         result.harm_score, result.harm_source = await _harm_head(text)
@@ -717,15 +862,119 @@ async def layer1_check(text: str, harm_head: bool = True, source: str = "user") 
                 and getattr(cfg, "L1_HARM_REPORT_CATEGORY", False)):
             from sentinel.core.safety_guard import harm_category_prompt
             result.harm_category = harm_category_prompt(text)
+    result.decision = l1_decision(result.score)
     return result
 
 
-async def _layer1_injection_check(text: str, source: str = "user") -> L1Result:
+def l1_decision(score: float) -> str:
+    """L1 review B12: "ALLOW" / "WARN" / "BLOCK" for an L1 raw score, by the same shared-axis rule the proxy applies
+    (rescale with L1's own anchors, then the global thresholds)."""
+    from sentinel.config import BLOCK_THRESHOLD, L1_BLOCK_THRESHOLD, WARN_THRESHOLD, l1_warn_threshold
+    from sentinel.core.models import rescale_layer_score
+    shared = rescale_layer_score(score, l1_warn_threshold(), L1_BLOCK_THRESHOLD, WARN_THRESHOLD, BLOCK_THRESHOLD)
+    return "BLOCK" if shared >= BLOCK_THRESHOLD else "WARN" if shared >= WARN_THRESHOLD else "ALLOW"
+
+
+def _anomaly_report(text: str) -> dict | None:
+    """
+    T0, the hidden-content signal (L1 review, config.L1_ANOMALY_TIER, off until measured): `hiding_report` with the
+    hidden text reduced to its length (a payload must not be echoed downstream), or None when the tier is off.
+
+    When INVISIBLE carriers (Unicode tag characters, variation-selector runs) decode to >= 4 characters, the cascade
+    lifts the score to L1's WARN anchor BEFORE the judge band, so the judge reads the input: readable text a person
+    cannot see has no benign use in a prompt, document or tool output, but it is evidence of concealment, not of an
+    injection. What it says is scored by the other tiers on the unhide view (L1_CANON_V2), which BLOCK if it is one.
+    """
+    import sentinel.config as cfg
+    if not getattr(cfg, "L1_ANOMALY_TIER", False):
+        return None
+    from sentinel.core.text_canonicalize import hiding_report
+    rep = hiding_report(text)
+    rep["hidden_text_chars"] = len(rep.pop("hidden_text"))
+    return rep
+
+
+_NEW_TIERS_CACHE: dict | None = None
+
+
+def _new_tier_anchors() -> dict:
+    """Conformal anchors of the perplexity and multilingual signals (core/artifacts/l1_new_tiers.json); {} if absent."""
+    global _NEW_TIERS_CACHE
+    if _NEW_TIERS_CACHE is None:
+        import json
+        from pathlib import Path
+        p = Path(__file__).resolve().parents[1] / "core" / "artifacts" / "l1_new_tiers.json"
+        try:
+            _NEW_TIERS_CACHE = json.loads(p.read_text(encoding="utf-8"))
+        except Exception as e:                                        # noqa: BLE001
+            logger.warning(f"new-tier anchors unavailable: {e}")
+            _NEW_TIERS_CACHE = {}
+    return _NEW_TIERS_CACHE
+
+
+def _extra_model_evidence(raw_windows: list[str], raw_embeddings) -> tuple[float, str] | None:
+    """
+    The attack bank (config.L1_ATTACK_BANK) and the multilingual Tier 2 (config.L1_TIER2_MULTILINGUAL), both OFF until
+    measured. Each raw value is mapped onto L1's axis by its OWN conformal anchor (benign 99th percentile -> L1's WARN
+    anchor; strictly monotone) and capped just below BLOCK, so neither can block alone; the higher is returned with
+    its reason, or None when both are off / unavailable.
+    """
+    import sentinel.config as cfg
+    from sentinel.core.safety_guard import map_to_layer_axis
+    warn, top = cfg.l1_warn_threshold(), cfg.L1_BLOCK_THRESHOLD - 1e-6
+    best = None
+    if getattr(cfg, "L1_ATTACK_BANK", False):
+        from sentinel.core import attack_bank
+        m = attack_bank.margins(raw_embeddings)
+        tau = attack_bank.tau()
+        if m is not None and tau is not None and len(m):
+            v = map_to_layer_axis(float(np.max(m)), tau, warn, top)
+            best = (v, f"Close to known attacks rather than to benign text (attack-bank margin {float(np.max(m)):.3f})")
+    if getattr(cfg, "L1_TIER2_MULTILINGUAL", False):
+        from sentinel.core import multilingual
+        tau = _new_tier_anchors().get("multilingual", {}).get("tau_cos")
+        s = multilingual.max_similarity(raw_windows)
+        if s is not None and tau is not None:
+            v = map_to_layer_axis(s, tau, warn, top)
+            if best is None or v > best[0]:
+                best = (v, f"Multilingual similarity to injection phrasing (cos {s:.3f})")
+    return best
+
+
+def _perplexity_floor(text: str) -> tuple[float, str, int] | None:
+    """
+    New mechanism 3 (config.L1_PERPLEXITY_TIER, OFF until measured): a windowed GPT-2 perplexity at or above its
+    conformal anchor (benign 99th percentile) lifts the score to L1's WARN anchor, a CLEARABLE floor (benign code,
+    URLs and IDs spike too; a benign hosted verdict removes it). (score, reason, tier_used=6) or None.
+    """
+    import sentinel.config as cfg
+    if not getattr(cfg, "L1_PERPLEXITY_TIER", False):
+        return None
+    tau = _new_tier_anchors().get("perplexity", {}).get("tau_nats")
+    if tau is None:
+        return None
+    from sentinel.core.perplexity import windowed_nll
+    r = windowed_nll(text)
+    if r is None or r["max_window"] < tau:
+        return None
+    return (cfg.l1_warn_threshold(),
+            f"Token-level perplexity spike (window NLL {r['max_window']:.2f} >= {tau:.2f} nats)", 6)
+
+
+async def _layer1_injection_check(text: str, source: str = "user", anomaly: dict | None = None) -> L1Result:
     """
     Run four-tier injection classification on user input text.
     Returns L1Result with score, threat class, explanation, and each
     tier's own pre-fusion score (see `tier_scores`).
     """
+    # L1_LLM_PROBE: load the local judge BEFORE the Tier-2/3 classifiers on the first call. Its 4-bit load reads the
+    # fp16 checkpoint through system RAM; doing that after Prompt Guard / PIGuard are resident on an 8 GB machine
+    # crashed one run (exit 139, 2026-10-30). Load order only; no decision changes.
+    import sentinel.config as _cfg0
+    if getattr(_cfg0, "L1_LLM_PROBE", False) and source == "user":
+        from sentinel.core.local_judge import get_local_judge
+        get_local_judge()
+
     # Check for obfuscated injections first. Every decodable span is checked when
     # L1_DECODE_ALL_CANDIDATES is on; off reproduces the first-span-only behaviour.
     import sentinel.config as _cfg1
@@ -742,13 +991,19 @@ async def _layer1_injection_check(text: str, source: str = "user") -> L1Result:
                 score=0.92,
                 threat_class="OBFUSCATED_INJECTION",
                 confidence=0.92,
-                reason=f"{kind} obfuscated injection: {plain}",
+                reason=f"{kind} obfuscated injection: {_snippet(plain)}",
                 tier_used=1,
                 tier_scores=_tier_scores(tier1=1.0),
             )
 
     # Tier 1: regex fast path (+ spoofed control-channel markers, L1_SPOOF_MARKERS)
     tier1_reason = _tier1_reason(text)
+    # L1 review B3 (L1_TIER1_SOFT): a hit on ONLY the lexical TIER1_SOFT patterns does not return; it sets a floor
+    # inside the judge band below and the cascade continues.
+    soft_reason = None
+    import sentinel.config as _cfgs
+    if tier1_reason and getattr(_cfgs, "L1_TIER1_SOFT", False) and _tier1_reason(text, exclude_soft=True) is None:
+        soft_reason, tier1_reason = tier1_reason, None
     # TOOL OUTPUTS ADDRESSED TO THE AI (RCA 2 fix validation, config.L1_TOOL_OUTPUT_ADDRESSEE). Text in a tool's
     # output that addresses the AI system ("<INFORMATION> This is an important message ...", "###(system_message)",
     # "Ignore your previous instructions") is an indirect injection by definition. F-T3 stopped Tier 3 from
@@ -795,8 +1050,19 @@ async def _layer1_injection_check(text: str, source: str = "user") -> L1Result:
     # homoglyph substitution — see text_canonicalize.py's module docstring
     # for why Tier 2 needed this and Tier 1's regex check alone didn't
     # cover it).
-    canon_text = canonicalize(text)
-    windows = split_into_windows(text) + split_into_windows(canon_text)
+    # L1 review B2 (L1_CANON_V2, off): Tier 2's canonical windows and Tier 3's inputs also read the unhide view.
+    import sentinel.config as _cfgv2
+    canon_v2 = getattr(_cfgv2, "L1_CANON_V2", False)
+    unhidden = None
+    if canon_v2:
+        from sentinel.core.text_canonicalize import unhide
+        unhidden = unhide(text)
+    canon_text = canonicalize(unhidden) if canon_v2 else canonicalize(text)
+    raw_windows = split_into_windows(text)
+    # L1 review B4 (L1_DECODED_VIEWS_ALL_TIERS, off): decoded plaintexts used to meet only the Tier-1 regex, so a
+    # decoded paraphrase no regex lists was never scored. They now join the Tier-2 windows and the Tier-3 inputs.
+    model_views = _model_views(decoded)
+    windows = raw_windows + split_into_windows(canon_text) + [w for v in model_views for w in split_into_windows(v)]
     window_embeddings = get_model().encode(windows)
     similarities = cosine_similarity(window_embeddings, _get_injection_embeddings())
     max_sim = float(np.max(similarities))
@@ -810,6 +1076,7 @@ async def _layer1_injection_check(text: str, source: str = "user") -> L1Result:
     # this session). Skipped cleanly if the model isn't available.
     pg_score = 0.0
     pg_reason = None
+    tier3_scored, tier3_error = 0, False
     prompt_guard = _get_prompt_guard()
     if prompt_guard is not None:
         try:
@@ -819,23 +1086,31 @@ async def _layer1_injection_check(text: str, source: str = "user") -> L1Result:
                 fields = tool_output_fields(text)
             else:
                 fields = [text]
+            if unhidden is not None and unhidden != text:
+                extra = (tool_output_fields(unhidden) if source == "tool_output"
+                         and getattr(_cfg3, "L1_TOOL_OUTPUT_TIER3", "whole") == "fields" else [unhidden])
+                fields = fields + [f for f in extra if f not in fields]
+            fields = fields + model_views
             pg_score = 0.0
             for field in fields:
-                fs = prompt_guard.predict(field).score
-                # Tier 3 classifier selection (2026-09-22). `L1_TIER3_MODE` defaults to
-                # "prompt_guard", where `tier3_score` returns its input unchanged — so
-                # the shipped path is byte-identical and pays nothing. The other modes
-                # publish on THIS SAME axis by construction (they map back through
-                # Prompt Guard's own benign quantiles), so `L1_WARN_THRESHOLD` and the
-                # judge band below keep meaning what they were calibrated to mean.
-                # See layer1_tier3.py for why that mapping is the load-bearing part.
-                if L1_TIER3_MODE != "prompt_guard":
-                    from sentinel.layers.layer1_tier3 import tier3_score
-                    fs = tier3_score(field, pg_raw=fs)
-                pg_score = max(pg_score, fs)
+                # L1 review B1 (L1_TIER3_WINDOWED): both classifiers truncate at 512 tokens and keep the HEAD, so
+                # anything after ~400 words was never read. Long fields are scored as overlapping windows.
+                for seg in _tier3_segments(prompt_guard, field):
+                    fs = prompt_guard.predict(seg).score
+                    # Tier 3 classifier selection (2026-09-22). `L1_TIER3_MODE` "prompt_guard" makes
+                    # `tier3_score` return its input unchanged. The other modes publish on THIS SAME axis by
+                    # construction (they map back through Prompt Guard's own benign quantiles, or multiply by a
+                    # probability), so `L1_WARN_THRESHOLD` and the judge band below keep meaning what they were
+                    # calibrated to mean. See layer1_tier3.py for why that mapping is the load-bearing part.
+                    if L1_TIER3_MODE != "prompt_guard":
+                        from sentinel.layers.layer1_tier3 import tier3_score
+                        fs = tier3_score(seg, pg_raw=fs)
+                    pg_score = max(pg_score, fs)
+                    tier3_scored += 1
             if pg_score > max_sim:
                 pg_reason = f"Prompt Guard flagged this text (score={pg_score:.2f})"
         except Exception as e:
+            tier3_error = True
             logger.warning(f"Prompt Guard inference failed, using Tier 2 score only: {e}")
 
     combined_sim = max(max_sim, pg_score)
@@ -843,13 +1118,87 @@ async def _layer1_injection_check(text: str, source: str = "user") -> L1Result:
 
     # Record each tier's own score before fusion. `prompt_guard is None`
     # means the model never loaded, which is genuinely different from it
-    # running and returning 0.0 — see _tier_scores' docstring.
+    # running and returning 0.0 — see _tier_scores' docstring. L1 review B15: a Tier 3 that raised before scoring
+    # anything did not run either (it used to be recorded as a 0.0, "evidence of absence").
+    tier3_ran = prompt_guard is not None and not (tier3_error and tier3_scored == 0)
     tier_scores = _tier_scores(
-        tier1=0.0,
+        tier1=1.0 if soft_reason else 0.0,
         tier2=max_sim,
-        tier3=pg_score if prompt_guard is not None else None,
+        tier3=pg_score if tier3_ran else None,
         tier4=None,
     )
+
+    # L1 review new mechanisms 4 / 6 (off): the attack bank and the multilingual Tier 2 are MODEL evidence, each
+    # mapped by its own conformal anchor onto L1's axis and capped below BLOCK.
+    extra = _extra_model_evidence(raw_windows, window_embeddings[:len(raw_windows)])
+    if extra is not None and extra[0] > combined_sim:
+        combined_sim, pg_reason, tier_used = extra[0], extra[1], 2
+    model_score = combined_sim
+
+    # FLOORS: evidence that an input deserves the judge's read, not that it is an injection. Each lifts the score to
+    # a level inside the judge band so the judge below reads it.
+    #   CLEARABLE (a benign hosted verdict removes it): a soft Tier-1 hit (B3, L1_TIER1_SOFT_SCORE) and a perplexity
+    #     spike (new mechanism 3, the WARN anchor) -- both have ordinary benign causes (wording; code, IDs, hashes);
+    #   KEPT (T0): text carried by invisible characters (the WARN anchor) -- concealment has no benign use.
+    soft_cleared = None
+    floors = []                                   # (score, reason, tier_used, clearable)
+    if soft_reason:
+        floors.append((float(getattr(_cfgs, "L1_TIER1_SOFT_SCORE", 0.70)),
+                       f"{soft_reason} (lexical pattern; judged rather than blocked)", 1, True))
+    ppl_floor = _perplexity_floor(text)
+    if ppl_floor is not None:
+        floors.append(ppl_floor + (True,))
+    if anomaly is not None and anomaly.get("strong"):
+        floors.append((_cfgs.l1_warn_threshold(),
+                       f"Invisible characters carry hidden text ({anomaly.get('hidden_text_chars', 0)} chars)", 0,
+                       False))
+    kept_floor = max([f[0] for f in floors if not f[3]], default=0.0)
+    floor_reason = None
+    if floors:
+        top = max(floors, key=lambda f: f[0])
+        if top[0] > combined_sim:
+            combined_sim, pg_reason, tier_used = top[0], top[1], top[2]
+            floor_reason = top[1]
+    # True when the score now rests on a clearable floor alone (nothing else would hold it this high).
+    floor_clearable = floor_reason is not None and combined_sim > max(model_score, kept_floor)
+
+    # L1 redesign (scratch/rca/l1/TT_REDESIGN.md; config.L1_LLM_PROBE, off until its gate passes). With the hosted judge
+    # off nothing decided the judge band, and every off-the-shelf classifier is no more confident on the TensorTrust
+    # misses than on benign trigger-word text. A LOCAL instruction-tuned model reads the text under the hosted judge's
+    # own policy; a linear probe on its residual stream at the answer position (external training data only, threshold
+    # calibrated on benign pools) is MODEL evidence: when it fires the score is lifted to WARN (the hosted judge, when
+    # on, may still raise it). Run only below WARN (above it the input is already flagged) and only on USER text: the
+    # threshold was calibrated on user prompts, not on tool outputs or documents (their distribution is not covered).
+    import sentinel.config as _cfgp
+    if (getattr(_cfgp, "L1_LLM_PROBE", False) and source == "user"
+            and combined_sim < _cfgp.l1_warn_threshold()):
+        from sentinel.core.local_judge import local_judge_read
+        lj = local_judge_read(text)
+        tau = _cfgp.L1_LLM_PROBE_TAU if _cfgp.L1_LLM_PROBE_TAU is not None else (lj or {}).get("probe_tau")
+        if lj is not None and lj.get("probe") is not None and tau is not None:
+            tier_scores["tier4_local_probe"] = lj["probe"]
+            if lj["probe"] > tau:
+                combined_sim = _cfgp.l1_warn_threshold()
+                model_score = max(model_score, combined_sim)
+                floor_clearable = False
+                pg_reason = f"Local judge probe flagged this text (score={lj['probe']:.3f} > {tau:.3f})"
+                tier_used = 4
+
+    # L1 review B11 (L1_TIER3_VERIFIER, off). Above the judge band the judge never runs, so a benign trigger-word text
+    # on which Tier 3 saturates (~0.99; the NotInject / WildJailbreak-benign false positives layer1_tier3.py calls
+    # irreducible) was a BLOCK with no second read. When Tier 3 ALONE carries the block (no Tier-1 hit, Tier 2 not
+    # itself in the INJECTION band), the hosted judge is asked; a benign verdict holds the score just below BLOCK, i.e.
+    # at WARN. Never to ALLOW, so a manipulated judge buys an attacker a warning, not a pass. No verdict -> unchanged.
+    if (getattr(_cfgs, "L1_TIER3_VERIFIER", False) and not soft_reason and tier3_ran
+            and pg_score >= _cfgs.L1_BLOCK_THRESHOLD and max_sim <= L1_SEMANTIC_HIGH):
+        from sentinel.layers.layer1_llm_judge import llm_judge_check
+        verdict = await llm_judge_check(_judge_text(text, raw_windows, similarities[:len(raw_windows)]))
+        tier_scores["tier4_judge"] = verdict
+        if verdict is not None and verdict < 0.5:
+            combined_sim = min(combined_sim, _cfgs.L1_BLOCK_THRESHOLD - 1e-6)
+            pg_reason = (f"Prompt Guard alone flagged this (score={pg_score:.2f}); the LLM judge read it as benign "
+                         f"(score={verdict:.2f}), so it is held at WARN")
+            tier_used = 4
 
     # Tier 4: LLM judge slow-path — only for genuinely ambiguous cases
     # (SUSPICIOUS band, between MEDIUM and HIGH), not every request. Same
@@ -860,7 +1209,14 @@ async def _layer1_injection_check(text: str, source: str = "user") -> L1Result:
     # timeout) means "skip", never treated as score 0.
     if L1_SEMANTIC_MEDIUM < combined_sim <= L1_SEMANTIC_HIGH:
         from sentinel.layers.layer1_llm_judge import llm_judge_check
-        judge_score = await llm_judge_check(text)
+        judge_score = await llm_judge_check(_judge_text(text, raw_windows, similarities[:len(raw_windows)]))
+        hosted_verdict = judge_score
+        import sentinel.config as _cfgl
+        if judge_score is None and getattr(_cfgl, "L1_LOCAL_JUDGE", False):
+            # v7: no hosted judge (off / no key / outage) -> the local guard's Jailbreak reading (safety_guard)
+            from sentinel.core.safety_guard import local_jailbreak_score
+            judge_score = local_jailbreak_score(text)
+            tier_scores["tier4_local"] = judge_score
         # Recorded whenever the judge actually returned a value, even if it
         # did not win the max — that is precisely the signal a calibrated
         # fusion needs and the current max() rule throws away.
@@ -868,6 +1224,14 @@ async def _layer1_injection_check(text: str, source: str = "user") -> L1Result:
         if judge_score is not None and judge_score > combined_sim:
             combined_sim = judge_score
             pg_reason = f"LLM judge flagged this text (score={judge_score:.2f})"
+            tier_used = 4
+        elif floor_clearable and hosted_verdict is not None and hosted_verdict < 0.5:
+            # A clearable floor existed only because of a lexical match or a perplexity spike; a benign HOSTED verdict
+            # explains it away and the model evidence (and any kept floor) stands alone. (The local guard's 0.0 means
+            # "not the Jailbreak category", too weak to remove a floor.)
+            combined_sim = max(model_score, kept_floor)
+            pg_reason = f"{floor_reason}: the LLM judge read it as ordinary usage (score={hosted_verdict:.2f})"
+            soft_cleared = pg_reason
             tier_used = 4
         elif judge_score is not None and judge_score < 0.5:
             # B-9 (2026-09-25), OPT-IN: a benign verdict may pull an in-band score just
@@ -958,7 +1322,7 @@ async def _layer1_injection_check(text: str, source: str = "user") -> L1Result:
         score=combined_sim,
         threat_class="CLEAN",
         confidence=1.0 - combined_sim,
-        reason="No injection patterns detected",
+        reason=soft_cleared or "No injection patterns detected",
         tier_used=tier_used,
         tier_scores=tier_scores,
         safety_score=safety_score,

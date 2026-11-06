@@ -127,7 +127,8 @@ def _name_tokens(name: str) -> list[str]:
     return [t for t in re.split(r"[^a-z0-9]+", s.lower()) if t]
 
 
-def capability(tool_name: str) -> str:
+def capability_from_name(tool_name: str) -> str | None:
+    """The capability the tool NAME alone gives, or None when it gives none (then capability() defaults)."""
     name = (tool_name or "").strip().lower()
     if name in EXPLICIT_CAPABILITY:
         return EXPLICIT_CAPABILITY[name]
@@ -142,7 +143,82 @@ def capability(tool_name: str) -> str:
         cap = SECURITY                         # sharing / changing credentials or access
     if cap in (COMMUNICATE, WRITE, None) and _MONEY & set(toks):
         cap = TRANSFER                         # sending / placing money
-    return cap or WRITE     # unknown: a side effect is assumed, but not a high-impact one
+    return cap
+
+
+# Tool DESCRIPTIONS from a registered schema (proxy request `tools`, evaluator tool sets): context for the local
+# alignment check only. A description never changes a tool's capability: the 2026-11-01 attempt to read "read-only"
+# from descriptions downgraded 55 ASB attacker tools (of 67), and L4 never blocks reads.
+_TOOL_DESC: dict[str, str] = {}
+
+
+def register_tool_specs(specs: list[dict]) -> None:
+    for t in specs or []:
+        if t.get("name"):
+            _TOOL_DESC[t["name"].strip().lower()] = (t.get("description") or "").strip()[:400]
+
+
+def tool_description(tool_name: str) -> str:
+    return _TOOL_DESC.get((tool_name or "").strip().lower(), "")
+
+
+_NORM = re.compile(r"[^a-z0-9]+")
+
+
+def _content_copied_from_third_party(params, chunks, min_len: int = 24) -> bool:
+    """Is a CONTENT argument (lineage.CONTENT_FIELDS) a verbatim copy of this session's third-party text?"""
+    from .authz.lineage import CONTENT_FIELDS
+    content = {k: v for k, v in (params or {}).items() if str(k).lower() in CONTENT_FIELDS}
+    return bool(content) and _args_copied_from_third_party(content, chunks, min_len)
+
+
+def _args_copied_from_third_party(params, chunks, min_len: int = 24) -> bool:
+    """Does any argument value (>= min_len normalised characters) occur verbatim in this session's third-party text?"""
+    texts = [_NORM.sub(" ", str(c.get("text") or "").lower()) for c in (chunks or [])]
+    if not texts:
+        return False
+    stack = [params]
+    while stack:
+        v = stack.pop()
+        if isinstance(v, dict):
+            stack.extend(v.values())
+        elif isinstance(v, (list, tuple)):
+            stack.extend(v)
+        elif v is not None:
+            s = _NORM.sub(" ", str(v).lower()).strip()
+            if len(s) >= min_len and any(s in t for t in texts):
+                return True
+    return False
+
+
+_CAP_REG: dict = {"path": None, "map": {}}
+
+
+def _capability_registry() -> dict:
+    """L4 v11 (config.L4_CAPABILITY_REGISTRY): the OPERATOR's declared capability per tool name -- trusted configuration,
+    like annotations from a server the operator installed. Never derived from a tool's own description at run time
+    (attacker-controlled text: 112 / 664 ASB attacker tools read as analysis-only, results.md §21.10)."""
+    import json as _json
+    import sentinel.config as cfg
+    path = str(getattr(cfg, "L4_CAPABILITY_REGISTRY", "") or "")
+    if path != _CAP_REG["path"]:
+        m = {}
+        if path:
+            try:
+                raw = _json.loads(open(path, encoding="utf-8").read())
+                m = {str(k).strip().lower(): str(v).upper() for k, v in raw.items()
+                     if str(v).upper() in (READ, WRITE, COMMUNICATE, TRANSFER, DESTROY, SECURITY, EXECUTE, EGRESS, READ_SENSITIVE)}
+            except Exception:                                   # noqa: BLE001
+                m = {}
+        _CAP_REG.update(path=path, map=m)
+    return _CAP_REG["map"]
+
+
+def capability(tool_name: str) -> str:
+    declared = _capability_registry().get((tool_name or "").strip().lower())
+    if declared:
+        return declared                                       # the operator's declaration wins
+    return capability_from_name(tool_name) or WRITE     # unknown: a side effect is assumed, not a high-impact one
 
 
 # Parameters through which a call's EFFECT or DESTINATION is chosen. Content parameters
@@ -346,6 +422,17 @@ def sink_context_windows(v: str, chunks: list[dict], width: int | None = None) -
         for p in _value_positions(v, low):
             out.append((c.get("chunk_id"), raw[max(0, p - w): p + len(v) + w]))
     return out
+
+
+def _nsa_window_injected(v: str, chunks: list[dict], tau: float = 0.5) -> bool:
+    """L4 v9d: does any text window around `v` read as an injection (the short-text scorer at its native 0.5
+    boundary)? AgentDojo's bill: the injection REPLACES the payee slot, so the injected IBAN is the document's only
+    candidate; what remains different is the instruction text around it."""
+    for _cid, win in sink_context_windows(v, chunks):
+        sc = window_injection_score(win)
+        if sc is not None and sc >= tau:
+            return True
+    return False
 
 
 def window_injection_score(window: str) -> float | None:
@@ -554,6 +641,51 @@ async def audit_action(tool_name: str, parameters: dict, reasoning_trace: str | 
     utext = user_text(history)
 
     requested, why_req = action_requested(tool_name, cap, utext)
+    # A MODEL contract in force for this user text (L4_AUTHZ_CONTRACT=llm | local: the user's words + the tool schema,
+    # written before any data was read) can ADD "requested" for a side effect the lexicon did not recognise (ASB: 81 / 100
+    # legitimate calls held as unrequested writes with the lexicon alone). It never removes the lexicon's evidence: a
+    # weak contract model that forgets an obvious action ("pay the bill" -> send_money) would otherwise turn a legitimate
+    # call into a hard block (AgentDojo benign replay, 2026-11-01: 4 tasks). A tool the contract does not list is still
+    # held for confirmation by the authorization step below.
+    _mc = None
+    if getattr(cfg, "L4_AUTHZ", False) and cap in SIDE_EFFECT:
+        from .authz import active_contract as _active_contract
+        _mc = _active_contract(session_id, utext)
+        if _mc is not None and getattr(_mc, "source", "lexicon") not in ("llm", "local"):
+            _mc = None
+        if _mc is not None and not requested and _mc.requested(tool_name):
+            requested, why_req = True, f"intent contract ({_mc.source}): in the user's request"
+    # Local per-call alignment (config.L4_ALIGNMENT_LOCAL, authz/alignment.py) for a side effect the user's request may
+    # imply but that no model contract lists: RESCUED only when the local model confidently says the request implies
+    # this call with these arguments; otherwise it is held or blocked below exactly as before. A call whose arguments
+    # are COPIED from third-party tool output is driven by that data and is never rescued (ASB RCA, results.md §20.16:
+    # all 107 rescued attacks carried the injected instruction as their argument).
+    rescued_by_alignment = False
+    _unlisted = _mc is None or not _mc.requested(tool_name)
+    if (cap in SIDE_EFFECT and _unlisted and (not requested or _mc is not None)
+            and getattr(cfg, "L4_ALIGNMENT_LOCAL", False)):
+        if _args_copied_from_third_party(params, chunks):
+            why_req = f"{why_req}; local alignment check skipped: arguments copied from third-party content"
+        else:
+            from sentinel.core.model_executor import run_model
+            from .authz.alignment import alignment_log_odds
+            _lo = await run_model(alignment_log_odds, utext, tool_name, params, tool_description(tool_name))
+            if _lo is not None and _lo >= float(getattr(cfg, "L4_ALIGNMENT_LOCAL_MIN_LOG_ODDS", 2.0)):
+                requested, rescued_by_alignment = True, True
+                why_req = f"local alignment check: the user's request implies this call (log-odds {_lo:.1f})"
+    # Alignment VETO: a REQUESTED side effect whose arguments are copied from third-party content is checked against the
+    # user's request; a confident "no" (log-odds <= L4_ALIGNMENT_VETO_MAX_LOG_ODDS) holds it for confirmation. AgentDojo
+    # dev replay (2026-11-01): an injected create_calendar_event with the attacker's arguments ran as the user's own
+    # requested action (the local contract binds no arguments; the hosted one does).
+    alignment_veto = None
+    if (requested and not rescued_by_alignment and cap in SIDE_EFFECT and getattr(cfg, "L4_ALIGNMENT_LOCAL", False)
+            and _args_copied_from_third_party(params, chunks)):
+        from sentinel.core.model_executor import run_model
+        from .authz.alignment import alignment_log_odds
+        _lv = await run_model(alignment_log_odds, utext, tool_name, params, tool_description(tool_name))
+        if _lv is not None and _lv <= float(getattr(cfg, "L4_ALIGNMENT_VETO_MAX_LOG_ODDS", -2.0)):
+            alignment_veto = (f"the local alignment check says this call, with arguments copied from third-party content, "
+                              f"does not serve the user's request (log-odds {_lv:.1f}); confirm with the user")
     judge_used = None
     if (not requested and cap in SIDE_EFFECT | {READ_SENSITIVE}
             and getattr(cfg, "L4_ALIGNMENT_JUDGE", False)):
@@ -576,6 +708,7 @@ async def audit_action(tool_name: str, parameters: dict, reasoning_trace: str | 
     sinks = []
     max_ratio = 0.0
     data_destinations = []        # RCA 2 F-A3: destinations taken from third-party data, not named by the user
+    dest_values = []
     utext_fold = _fold_identifier(utext)
     for path, v in sink_leaves(cap, params):
         pname = path.split(".")[0].split("[")[0]
@@ -584,6 +717,7 @@ async def audit_action(tool_name: str, parameters: dict, reasoning_trace: str | 
             max_ratio = max(max_ratio, ratio)
         if src == "context" and _DESTINATION.match(pname) and _fold_identifier(v) not in utext_fold:
             data_destinations.append(path)
+            dest_values.append(v)
         sinks.append({"param": path, "source": src, "chunk_id": cid})
     srcs = {s["source"] for s in sinks}
 
@@ -661,13 +795,40 @@ async def audit_action(tool_name: str, parameters: dict, reasoning_trace: str | 
     delegated = (not requested) and user_delegates(utext)
     confirm = []
     if cap != READ and not attack_evidence:
-        if delegated and cap in (HIGH_IMPACT | {COMMUNICATE}):
+        nsa = getattr(cfg, "L4_NAMED_SOURCE_AUTHORITY", False) and getattr(cfg, "L4_AUTHZ", False)
+        nsa_defer = False
+        if nsa:
+            # L4 v9: a destination the user typed, a system of record holds, or that passes the named-source test is
+            # left to the authz matrix (which applies its payee / role rules); v9c: when the authz contract says the
+            # user handed the task to a document, the lexicon's unrequested / delegated / copied-content holds on a
+            # COMMUNICATE / WRITE call defer to authz (which checks every argument; consequential families keep them)
+            from .authz.decide import named_source_ok, system_or_user_value, t0_anchors
+            from .authz import active_contract as _ac
+            keep = [(pth, v) for pth, v in zip(data_destinations, dest_values)
+                    if not (system_or_user_value(session_id, v, utext)
+                            or (named_source_ok(session_id, v, utext,
+                                                t0_anchors(session_id, params, pth.split(".")[0].split("[")[0], utext))
+                                and not _nsa_window_injected(v, chunks)))]
+            data_destinations = [pth for pth, _ in keep]
+            _c = _ac(session_id, utext)
+            nsa_defer = bool(_c is not None and _c.delegated and cap in (COMMUNICATE, WRITE))
+        if nsa_defer:
+            pass
+        elif delegated and cap in (HIGH_IMPACT | {COMMUNICATE}):
             confirm.append("the user delegated this to instructions in third-party data; confirm with the user")
         elif (not requested and getattr(cfg, "L4_HOLD_UNREQUESTED_COMMUNICATE", False)
               and (cap == COMMUNICATE or (cap == EGRESS and _carries_data(params)))):
             confirm.append("unrequested communication / data-carrying egress; confirm with the user")
         elif not requested and cap == WRITE and getattr(cfg, "L4_HOLD_UNREQUESTED_WRITE", False):
             confirm.append("unrequested write (reservation / record change); confirm with the user")
+        if alignment_veto:
+            confirm.append(alignment_veto)
+        # Copied-content confirmation (config.L4_COPIED_CONTENT_CONFIRM): a side effect whose FREE-TEXT content (body,
+        # content, message, title, description, ...) is a verbatim copy of third-party text acts on the data, not on the
+        # user's words. Data VALUES copied from records (addresses, ids, names) are left to the lineage matrix.
+        if (cap in SIDE_EFFECT and getattr(cfg, "L4_COPIED_CONTENT_CONFIRM", False) and not nsa_defer
+                and _content_copied_from_third_party(params, chunks)):
+            confirm.append("free-text content of this call is copied from third-party content; confirm with the user")
         data_caps = {c.strip() for c in str(getattr(cfg, "L4_DATA_SINK_CONFIRM", "OFF")).upper().split(",")}
         if requested and cap in data_caps and data_destinations:
             confirm.append(f"destination taken from third-party data, not named by the user "
@@ -683,11 +844,15 @@ async def audit_action(tool_name: str, parameters: dict, reasoning_trace: str | 
     # arguments, authorised by the user's request and the trust matrix -- whatever influenced the model? It
     # can only tighten the verdict above: a block stays a block, an allow can become a confirmation or a block.
     authz = None
-    if getattr(cfg, "L4_AUTHZ", False) and cap in SIDE_EFFECT:
+    if getattr(cfg, "L4_AUTHZ", False) and (cap in SIDE_EFFECT or (cap == EGRESS and getattr(cfg, "L4_AUTHZ_EGRESS_SENSITIVE", False))):
         from .authz import authorize, active_contract, lexicon_contract, record_call, BLOCK, CONFIRM
         contract = active_contract(session_id, utext) or lexicon_contract(utext, [tool_name])
+        if rescued_by_alignment and not contract.requested(tool_name):
+            from .authz.contract import Contract as _Contract   # the rescue counts as requested here too
+            contract = _Contract(actions={**contract.actions, tool_name: {"max_calls": None, "args": {}}},
+                                 delegated=contract.delegated, constraints=contract.constraints, source=contract.source,
+                                 rejected={t: v for t, v in getattr(contract, "rejected", {}).items() if t != tool_name})
         authz = authorize(session_id, tool_name, params, utext, contract)
-        record_call(session_id, tool_name, params)
         if authz.decision == BLOCK and (should_execute or requires_confirmation):
             should_execute, requires_confirmation = False, False
             score, threat, auth = max(score, S_BLOCK), "UNAUTHORIZED_ACTION", "UNAUTHORIZED_ARGUMENT"
@@ -698,6 +863,40 @@ async def audit_action(tool_name: str, parameters: dict, reasoning_trace: str | 
             reasons.extend(f"authz: {r}" for r in authz.reasons)
         elif authz.decision != "allow":
             reasons.extend(f"authz: {r}" for r in authz.reasons)
+        # L4 v9d: an argument the named-source test allowed (document text, T2, strict sink) is held again when the
+        # text around it reads as an injection -- the document the user named may itself carry the attack
+        if (getattr(cfg, "L4_NAMED_SOURCE_AUTHORITY", False) and should_execute and authz.decision == "allow"):
+            from .authz.decide import STRICT as _STRICT
+            hit = [a for a in authz.args if a.get("tier") == "T2" and a.get("class") in _STRICT
+                   and a.get("decision") == "allow" and _nsa_window_injected(str(a.get("value", "")), chunks)]
+            if hit:
+                should_execute, requires_confirmation = False, True
+                score, threat = max(score, S_HOLD), "CONFIRMATION_REQUIRED"
+                reasons.append("authz: " + ", ".join(a["param"] for a in hit)
+                               + " from a named document whose surrounding text reads as an injection")
+        # v8 RCA (a05: ~83 legitimate calls per templated family hard-blocked): the chunk-level rule above blocks a
+        # value because it APPEARS in a flagged tool output -- but an injected output still carries the legitimate data
+        # the task needs. When field-level provenance places that same argument in a user-typed (T0) or system-of-
+        # record (T1) field, the chunk-level premise is false for it. Only chunk MEMBERSHIP is overridden; a value that
+        # sits inside an instruction block ("ctx:") stays blocked (selection attacks), as do named-in and reasoning flags.
+        if (getattr(cfg, "L4_AUTHZ_FIELD_LEVEL_OVERRIDE", False) and threat == "RAG_INJECTION"
+                and not should_execute and not requires_confirmation and authz.decision != BLOCK
+                and not reasoning_flags and not (not requested and named_in)):
+            membership = {s["param"].split(".")[0].split("[")[0] for s in sinks
+                          if s["source"] == "untrusted" and not str(s.get("chunk_id") or "").startswith("ctx:")}
+            context_hits = [s for s in sinks if s["source"] == "untrusted" and str(s.get("chunk_id") or "").startswith("ctx:")]
+            trusted_args = {a["param"] for a in authz.args if a.get("tier") in ("T0", "T1")}
+            if membership and not context_hits and membership <= trusted_args:
+                reasons.append("authz: field-level provenance places " + ", ".join(sorted(membership))
+                               + " in a user / system-of-record field; chunk-level flag overridden")
+                if authz.decision == CONFIRM:
+                    requires_confirmation, threat, score = True, "CONFIRMATION_REQUIRED", S_HOLD
+                else:
+                    should_execute, threat, score, auth = True, "CLEAN", _BASE.get(cap, 0.3), SOURCE_EXPLICIT
+        # v7 review R6: only a call that can still run counts toward the user's call bound -- a hard-blocked call
+        # used to consume it, so the user's own later call needed a confirmation
+        if should_execute or requires_confirmation or not getattr(cfg, "L4_AUTHZ_COUNT_ONLY_RUNNABLE", False):
+            record_call(session_id, tool_name, params)
 
     risk = ("CRITICAL" if score >= S_BLOCK else "HIGH" if score >= S_WARN
             else "MEDIUM" if score >= 0.5 else "LOW")

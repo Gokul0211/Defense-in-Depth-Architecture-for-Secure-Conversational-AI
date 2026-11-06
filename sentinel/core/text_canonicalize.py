@@ -74,3 +74,157 @@ def canonicalize(text: str) -> str:
     text = "".join(_CONFUSABLES.get(c, c) for c in text)
     text = text.lower()
     return "".join(_LEET_MAP.get(c, c) for c in text)
+
+
+# =====================================================================================================================
+# L1 REVIEW B2 (2026-10-27; scratch/rca/l1/L1_REVIEW.md): the "unhide" view.
+# =====================================================================================================================
+# `canonicalize` strips only four zero-width code points. The hiding techniques below pass through it untouched, and
+# Tier 3 (Prompt Guard / PIGuard) never read even the canonical form:
+#   * Unicode TAG characters U+E0000-E007F ("ASCII smuggling"): an invisible shadow copy of ASCII that people do not
+#     see and LLMs read (Goodside 2024; Robust Intelligence; Microsoft 2026-09-03);
+#   * VARIATION-SELECTOR smuggling: bytes encoded as runs of U+FE00-FE0F / U+E0100-E01EF after one visible character;
+#   * bidi controls (U+202A-202E, U+2066-2069, "Trojan Source") and other invisible format characters;
+#   * homoglyphs mixed into Latin words (Cyrillic / Greek look-alikes);
+#   * LETTER SPACING ("i g n o r e ..."), the published Prompt-Guard-86M bypass (99.8 % evasion;
+#     meta-llama/llama-models issue #50).
+# `unhide` reverses all of them WITHOUT lowercasing or leetspeak folding, so it is a fair input for the Tier-3
+# classifiers too; `canonicalize_v2` = canonicalize(unhide(text)) for Tiers 1 / 2. Text with none of these is returned
+# unchanged, so the views cost nothing on ordinary input.
+
+_TAG_BASE = 0xE0000
+_BLACK_FLAG = "\U0001F3F4"
+_CANCEL_TAG = "\U000E007F"
+# invisible format characters stripped by `unhide` (bidi controls, word joiner / invisible operators, soft hyphen,
+# Mongolian vowel separator, BOM, LRM / RLM / ALM, the four zero-width characters)
+_INVISIBLE_RE = re.compile("[\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\u00ad\u180e\ufeff\u061c]")
+_BIDI_OVERRIDE_RE = re.compile("[\u202a-\u202e\u2066-\u2069]")
+_VS_RE = re.compile("[\ufe00-\ufe0f\U000e0100-\U000e01ef]+")
+# runs of >= 8 single letters / digits, each followed by ONE separator (or a 2-3-space word gap)
+_SPACED_RUN_RE = re.compile(r"(?<![A-Za-z0-9])(?:[A-Za-z0-9](?:[ ._*|/-]| {2,3})){7,}[A-Za-z0-9](?![A-Za-z0-9])")
+_WORD_RE = re.compile(r"\w+", re.UNICODE)
+_LATIN_RE = re.compile(r"[A-Za-z]")
+_CONFUSABLE_CHARS = frozenset(_CONFUSABLES)
+
+
+def _vs_byte(c: str) -> int:
+    cp = ord(c)
+    return cp - 0xFE00 if cp <= 0xFE0F else cp - 0xE0100 + 16
+
+
+def decode_tag_chars(text: str) -> tuple[str, int]:
+    """(text with TAG characters decoded to ASCII, number of tag characters decoded).
+
+    Emoji subdivision flags (U+1F3F4 + tag letters + U+E007F, e.g. the flags of England / Scotland / Wales) are the one
+    legitimate use; they are kept as the bare black flag and not counted."""
+    if not any(_TAG_BASE <= ord(c) <= _TAG_BASE + 0x7F for c in text):
+        return text, 0
+    out, n, i = [], 0, 0
+    while i < len(text):
+        c = text[i]
+        if c == _BLACK_FLAG:
+            j = i + 1
+            while j < len(text) and _TAG_BASE + 0x20 <= ord(text[j]) <= _TAG_BASE + 0x7E:
+                j += 1
+            if j > i + 1 and j < len(text) and text[j] == _CANCEL_TAG:
+                out.append(c)
+                i = j + 1
+                continue
+        cp = ord(c)
+        if _TAG_BASE + 0x20 <= cp <= _TAG_BASE + 0x7E:
+            out.append(chr(cp - _TAG_BASE))
+            n += 1
+        elif _TAG_BASE <= cp <= _TAG_BASE + 0x7F:
+            pass                                            # language tag / cancel tag outside a flag: drop
+        else:
+            out.append(c)
+        i += 1
+    return "".join(out), n
+
+
+def decode_variation_selectors(text: str, min_run: int = 4) -> tuple[str, str]:
+    """(text with VS runs replaced, the hidden text they carried). A run of >= `min_run` variation selectors is read
+    as bytes (U+FE00-FE0F = 0-15, U+E0100-E01EF = 16-255) and decoded as UTF-8; shorter runs (emoji presentation
+    selectors, CJK ideographic variation sequences) are simply removed."""
+    hidden = []
+
+    def _sub(m):
+        run = m.group(0)
+        if len(run) < min_run:
+            return ""
+        s = bytes(_vs_byte(c) for c in run).decode("utf-8", errors="ignore")
+        s = "".join(ch for ch in s if ch.isprintable() or ch in "\n\t")
+        if s.strip():
+            hidden.append(s)
+            return f" {s} "
+        return ""
+
+    return _VS_RE.sub(_sub, text), " ".join(hidden)
+
+
+def _fold_mixed_script_word(m) -> str:
+    w = m.group(0)
+    if _LATIN_RE.search(w) and any(c in _CONFUSABLE_CHARS for c in w):
+        return "".join(_CONFUSABLES.get(c, c) for c in w)
+    return w
+
+
+def collapse_spaced_letters(text: str) -> tuple[str, list[str]]:
+    """(text with spaced-letter runs collapsed, the collapsed runs). Single separators inside a run are removed and
+    a 2-3-space gap becomes one space, so "i g n o r e   a l l" reads "ignore all"."""
+    runs = []
+
+    def _sub(m):
+        s = re.sub(r" {2,3}", "\x00", m.group(0))
+        s = re.sub(r"[ ._*|/-]", "", s).replace("\x00", " ")
+        runs.append(s)
+        return s
+
+    return _SPACED_RUN_RE.sub(_sub, text), runs
+
+
+def unhide(text: str) -> str:
+    """The text with every hiding technique above reversed; NOT lowercased or leet-folded (a fair Tier-3 input)."""
+    if not text:
+        return text or ""
+    t, _ = decode_tag_chars(text)
+    t, _ = decode_variation_selectors(t)
+    t = _INVISIBLE_RE.sub("", t)
+    t = unicodedata.normalize("NFKC", t)
+    t = _WORD_RE.sub(_fold_mixed_script_word, t)
+    t, _ = collapse_spaced_letters(t)
+    return t
+
+
+def canonicalize_v2(text: str) -> str:
+    """canonicalize(unhide(text)): the Tier-1 / Tier-2 view with the B2 hiding techniques reversed."""
+    return canonicalize(unhide(text))
+
+
+def hiding_report(text: str) -> dict:
+    """Counts of each hiding technique in `text` (the T0 anomaly signal, config.L1_ANOMALY_TIER).
+
+    `hidden_text` is what INVISIBLE carriers (tag characters, variation-selector runs) decoded to. `strong` is set
+    when they carried >= 4 characters: readable text that a person cannot see has no benign use in a prompt, a
+    document or a tool output. Visible obfuscation (spacing, mixed scripts, bidi overrides) is counted but is not
+    `strong` on its own -- it only makes the unhide view worth scanning."""
+    text = text or ""
+    tag_text, n_tags = decode_tag_chars(text)
+    tag_hidden = "".join(chr(ord(c) - _TAG_BASE) for c in text if _TAG_BASE + 0x20 <= ord(c) <= _TAG_BASE + 0x7E)
+    if n_tags == 0:
+        tag_hidden = ""
+    _, vs_hidden = decode_variation_selectors(tag_text)
+    _, runs = collapse_spaced_letters(text)
+    mixed = sum(1 for m in _WORD_RE.finditer(text)
+                if _LATIN_RE.search(m.group(0)) and any(c in _CONFUSABLE_CHARS for c in m.group(0)))
+    hidden = " ".join(s for s in (tag_hidden.strip(), vs_hidden.strip()) if s)
+    return {
+        "tag_chars": n_tags,
+        "variation_selector_text": len(vs_hidden.strip()),
+        "bidi_overrides": len(_BIDI_OVERRIDE_RE.findall(text)),
+        "invisible_chars": len(_INVISIBLE_RE.findall(text)),
+        "spaced_runs": len(runs),
+        "mixed_script_words": mixed,
+        "hidden_text": hidden,
+        "strong": len(hidden.replace(" ", "")) >= 4,
+    }

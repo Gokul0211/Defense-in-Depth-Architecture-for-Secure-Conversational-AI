@@ -77,7 +77,7 @@ from pathlib import Path
 _ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_LOGDIR = _ROOT / "scratch" / "agentdojo_live"
 DEFAULT_MODEL = "gemini-3.1-flash-lite"
-CONFIGS = ("none", "pi_detector", "dida", "dida_l4", "dida_redact")
+CONFIGS = ("none", "pi_detector", "dida", "dida_l4", "dida_redact", "dida_filter")
 # DIDA keeps process-global state (L2 store, threat bus, one asyncio loop): episodes of the DIDA
 # family must never overlap, so each holds this lock for its whole duration.
 _DIDA_LOCK = threading.Lock()
@@ -385,6 +385,7 @@ def make_dida_elements():
         def query(self, query, runtime, env=EmptyEnv(), messages=[], extra_args={}):
             layer2_reset()
             ep = _ep()
+            _authz_episode_start(ep.sid if ep else "live_unknown", query, runtime)
             with _defense():
                 r = _run(layer1_check(query))
                 l1 = rescale_layer_score(r.score, cfg.l1_warn_threshold(), cfg.L1_BLOCK_THRESHOLD,
@@ -419,7 +420,7 @@ def make_dida_elements():
 
         def __init__(self, on_block: str = "withhold"):
             super().__init__()
-            assert on_block in ("withhold", "pass", "redact")
+            assert on_block in ("withhold", "pass", "redact", "filter")
             self.on_block = on_block
 
         def query(self, query, runtime, env=EmptyEnv(), messages=[], extra_args={}):
@@ -466,6 +467,9 @@ def make_dida_elements():
                                              "was not executed."))
                     continue
                 out, err = runtime.run_function(env, tc.function, tc.args)
+                if getattr(cfg, "L4_AUTHZ", False) and out is not None:
+                    from sentinel.layers.layer4_agentic.authz import record_tool_output
+                    record_tool_output(sid, tc.function, dict(tc.args), out, query)   # structured, as an API returns
                 text = self.output_formatter(out)
                 if text.strip():
                     with _defense():                             # /sentinel/agent/tool_response
@@ -478,7 +482,18 @@ def make_dida_elements():
                         track_sensitive_values(session, text)
                     if ep:
                         ep.rec["outputs_scanned"] += 1
-                    if self.on_block != "pass" and l1r.score >= cfg.BLOCK_THRESHOLD:
+                    if self.on_block == "filter" and l1r.score >= cfg.l1_tool_output_block():
+                        from sentinel.core.tool_output_filter import filter_output
+                        f = _run(filter_output(text))
+                        if f.status == "filtered":
+                            text = f.text
+                            if ep:
+                                ep.rec["outputs_filtered"] = ep.rec.get("outputs_filtered", 0) + 1
+                        else:
+                            if ep:
+                                ep.rec["outputs_withheld"] += 1
+                            text = "<Data omitted: the security layer detected a prompt injection in this tool output>"
+                    elif self.on_block not in ("pass", "filter") and l1r.score >= cfg.l1_tool_output_block():
                         spans = _instruction_blocks(text) if self.on_block == "redact" else []
                         if spans:
                             for a0, b0 in reversed(spans):
@@ -492,7 +507,55 @@ def make_dida_elements():
                 results.append(res(text, err))
             return query, runtime, env, [*messages, *results], extra_args
 
-    return DidaInputGate, DidaToolsExecutor
+    class DidaAnswerGuard(BasePipelineElement):
+        """v8 L6 (config L6_ANSWER_GUARD): the agent's FINAL answer passes the answer-provenance guard before
+        AgentDojo scores it, so goals that live only in the answer text are measured with the defence in place."""
+
+        def query(self, query, runtime, env=EmptyEnv(), messages=[], extra_args={}):
+            if getattr(cfg, "L6_ANSWER_GUARD", "off") == "off" or not messages or messages[-1]["role"] != "assistant":
+                return query, runtime, env, messages, extra_args
+            last = messages[-1]
+            blocks = last.get("content") or []
+            text = "".join(b.get("content", "") for b in blocks if isinstance(b, dict) and b.get("type") == "text")
+            if not text.strip():
+                return query, runtime, env, messages, extra_args
+            from sentinel.layers.layer6_answer import check_answer
+            ep = _ep()
+            rep = check_answer(ep.sid if ep else "live_unknown", text, query)
+            if ep:
+                ep.rec["answer_findings"] = rep.findings
+            if rep.changed:
+                new = dict(last)
+                new["content"] = [text_content_block_from_string(rep.text)]
+                messages = [*messages[:-1], new]
+            return query, runtime, env, messages, extra_args
+
+    return DidaInputGate, DidaToolsExecutor, DidaAnswerGuard
+
+
+def _authz_episode_start(sid: str, query: str, runtime) -> None:
+    """Action authorization (config.L4_AUTHZ) needs the episode's provenance store reset and the intent contract
+    registered from the user prompt + the tool schema, exactly as the proxy does (app._authz_prepare). Without this
+    the store is empty and every argument value is untraceable (v7 review: the live harness predated authz)."""
+    import sentinel.config as cfg
+    if not getattr(cfg, "L4_AUTHZ", False):
+        return
+    from sentinel.layers.layer4_agentic.authz import reset_lineage, set_contract, llm_contract
+    from sentinel.layers.layer4_agentic.authz import contract as cmod
+    reset_lineage(sid)
+    cmod.clear(sid)
+    if getattr(cfg, "L4_AUTHZ_CONTRACT", "lexicon") != "llm":
+        return
+    specs = []
+    for f in runtime.functions.values():
+        try:
+            params = list(f.parameters.model_json_schema().get("properties", {}))
+        except Exception:                                             # noqa: BLE001
+            params = []
+        specs.append({"name": f.name, "description": f.description or "", "params": params})
+    c = _run(llm_contract(query, specs))          # the DIDA worker's loop (see _run)
+    if c is not None:
+        set_contract(sid, query, c)
 
 
 def build_pipeline(config: str, llm, model: str):
@@ -506,10 +569,11 @@ def build_pipeline(config: str, llm, model: str):
     elif config == "pi_detector":
         p = AgentPipeline([sysm, InitQuery(), llm,
                            ToolsExecutionLoop([ToolsExecutor(), make_pi_detector(), llm])])
-    elif config in ("dida", "dida_l4", "dida_redact"):
-        Gate, Exe = make_dida_elements()
-        exe = Exe(on_block={"dida": "withhold", "dida_l4": "pass", "dida_redact": "redact"}[config])
-        p = AgentPipeline([sysm, InitQuery(), Gate(), llm, ToolsExecutionLoop([exe, llm])])
+    elif config in ("dida", "dida_l4", "dida_redact", "dida_filter"):
+        Gate, Exe, Answer = make_dida_elements()
+        exe = Exe(on_block={"dida": "withhold", "dida_l4": "pass", "dida_redact": "redact",
+                            "dida_filter": "filter"}[config])
+        p = AgentPipeline([sysm, InitQuery(), Gate(), llm, ToolsExecutionLoop([exe, llm]), Answer()])
     else:
         raise ValueError(config)
     p.name = f"{model}-{config}"
@@ -595,13 +659,15 @@ def run(args):
     from agentdojo.logging import LOGGER_STACK, OutputLogger
     from agentdojo.task_suite.load_suites import get_suites
 
-    adm.MODEL_NAMES.setdefault(args.model, "AI model developed by Google")    # fix 3
+    provider = getattr(args, "provider", "gemini")
+    adm.MODEL_NAMES.setdefault(args.model, "AI model developed by Google" if provider == "gemini"
+                               else "AI model developed by OpenAI")    # fix 3
     _install_network_counter()
 
     logdir = Path(args.logdir)
     logdir.mkdir(parents=True, exist_ok=True)
     configs = args.configs.split(",")
-    run_cfg = {"model": args.model, "temperature": args.temperature, "thinking": args.thinking,
+    run_cfg = {"model": args.model, "provider": provider, "temperature": args.temperature, "thinking": args.thinking,
                "configs": configs, "late_configs": args.late_configs, "late_from": args.late_from,
                "pairs": args.pairs, "benign": args.benign, "rpm": args.rpm,
                "version": args.version, "attack": "important_instructions",
@@ -615,10 +681,24 @@ def run(args):
                 sys.exit(f"--logdir already holds a run with {k}={old.get(k)!r}; use a new --logdir")
     prev.write_text(json.dumps(run_cfg, indent=1), encoding="utf-8")
 
-    keys = [k.strip() for k in os.getenv("GEMINI_API_KEYS", "").split(",") if k.strip()]
-    pool = KeyPool(keys, args.rpm, args.wait_for_reset)
-    pipes = {c: build_pipeline(c, make_llm(pool, args.model, args.temperature, args.thinking), args.model)
-             for c in configs}
+    if provider == "groq":
+        # second provider / model family (v7, row #16): an OpenAI-compatible endpoint through agentdojo's own
+        # OpenAILLM element. One client per pipeline; the OpenAI client retries 429 / 5xx with back-off.
+        import openai
+        from agentdojo.agent_pipeline.llms.openai_llm import OpenAILLM
+        gkeys = [k.strip() for k in os.getenv("GROQ_API_KEYS", os.getenv("GROQ_API_KEY", "")).split(",") if k.strip()]
+        if not gkeys:
+            sys.exit("GROQ_API_KEYS is empty (.env)")
+        pipes = {}
+        for i, c in enumerate(configs):
+            client = openai.OpenAI(base_url="https://api.groq.com/openai/v1", api_key=gkeys[i % len(gkeys)],
+                                   max_retries=8, timeout=120)
+            pipes[c] = build_pipeline(c, OpenAILLM(client, args.model, temperature=args.temperature or 0.0), args.model)
+    else:
+        keys = [k.strip() for k in os.getenv("GEMINI_API_KEYS", "").split(",") if k.strip()]
+        pool = KeyPool(keys, args.rpm, args.wait_for_reset)
+        pipes = {c: build_pipeline(c, make_llm(pool, args.model, args.temperature, args.thinking), args.model)
+                 for c in configs}
     suites = get_suites(args.version)
     jobs = build_jobs(args, suites)
     deadline = time.time() + args.hours * 3600 if args.hours else None
@@ -832,6 +912,8 @@ def summarize(args) -> dict:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=DEFAULT_MODEL)
+    ap.add_argument("--provider", default="gemini", choices=["gemini", "groq"],
+                    help="agent model provider; groq = OpenAI-compatible endpoint (e.g. --model openai/gpt-oss-120b)")
     ap.add_argument("--temperature", type=float, default=None,
                     help="default: the model's own (Google recommends 1.0 for Gemini 3)")
     ap.add_argument("--thinking", default=None, help="Gemini 3 thinking_level (low/high); default: model's")

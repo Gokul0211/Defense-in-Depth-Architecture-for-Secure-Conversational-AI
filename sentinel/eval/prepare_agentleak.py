@@ -66,7 +66,7 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_SOURCE = "C:/Users/gokul/AppData/Local/Temp/agentleak_scratch"
+_DEFAULT_SOURCE = "scratch/rca/l5/ext_data/agentleak_src"   # shallow clone, 2026-11-06 (user-approved)
 _OUT_DIR = Path(__file__).parent / "data" / "agentleak"
 
 
@@ -106,6 +106,13 @@ def _extract_sample(trace: dict) -> dict | None:
             "n_c1_messages": len(c1_messages),
             "official_c1_leaked": trace.get("results", {}).get("c1_leaked"),
             "vault_text": vault_text,
+            # 2026-11-06 (results.md §21.6): the field structure the L5 field policy needs -- which vault field each
+            # value belongs to, which fields the task may disclose (AgentLeak's allowed_set), and the user's request
+            # (values the user typed are not a leak). Earlier preps kept only the joined values.
+            "vault_fields": {str(k): str(v) for k, v in vault.items() if v is not None},
+            "allowed_fields": list((trace.get("input", {}).get("allowed_set") or {}).get("fields") or []),
+            "forbidden_fields": list((trace.get("input", {}).get("allowed_set") or {}).get("forbidden_fields") or []),
+            "request": str(trace.get("input", {}).get("request") or ""),
         },
     }
 

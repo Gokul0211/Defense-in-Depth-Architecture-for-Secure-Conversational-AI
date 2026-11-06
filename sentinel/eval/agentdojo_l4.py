@@ -316,11 +316,16 @@ async def _authz_begin(sid: str, prompt: str, suite) -> None:
     from sentinel.layers.layer4_agentic.authz import contract as cmod
     reset_lineage(sid)
     cmod.clear(sid)
-    if getattr(cfg, "L4_AUTHZ_CONTRACT", "lexicon") == "llm":
-        c = await llm_contract(prompt, tool_specs(suite))
+    mode = str(getattr(cfg, "L4_AUTHZ_CONTRACT", "lexicon")).lower()
+    if mode in ("llm", "local"):          # "local": the local model writes it (authz.contract.local_contract)
+        from sentinel.layers.layer4_agentic.authz import model_contract
+        from sentinel.layers.layer4_agentic.action_policy import register_tool_specs
+        specs = tool_specs(suite)
+        register_tool_specs(specs)        # descriptions: context for the local alignment check
+        c = await model_contract(prompt, specs)
         if c is not None:
             set_contract(sid, prompt, c)
-            CONTRACT_STATS["llm"] += 1
+            CONTRACT_STATS[mode] = CONTRACT_STATS.get(mode, 0) + 1
         else:
             CONTRACT_STATS["fallback"] += 1
 
@@ -342,6 +347,17 @@ def _authz_row(act: dict):
 
 
 _L1_MEMO: dict = {}
+_FILTER_MEMO: dict = {}
+
+
+async def _filtered(text: str):
+    """v7 P3 field-level withholding of one output, memoised (same output text -> same result)."""
+    if text not in _FILTER_MEMO:
+        from sentinel.core.tool_output_filter import filter_output
+        _FILTER_MEMO[text] = await filter_output(text)
+        if len(_FILTER_MEMO) > 20000:
+            _FILTER_MEMO.clear()
+    return _FILTER_MEMO[text]
 
 
 async def _withheld(text: str) -> bool:
@@ -355,7 +371,7 @@ async def _withheld(text: str) -> bool:
     if text not in _L1_MEMO:
         from sentinel.layers.layer1 import layer1_check
         r = await layer1_check(text, harm_head=False, source="tool_output")
-        _L1_MEMO[text] = r.score >= cfg.BLOCK_THRESHOLD
+        _L1_MEMO[text] = r.score >= cfg.l1_tool_output_block()
         if len(_L1_MEMO) > 20000:
             _L1_MEMO.clear()
     return _L1_MEMO[text]
@@ -510,22 +526,35 @@ async def run_effect(version: str, max_pairs: int | None, family: str, mode: str
                     _authz_record(sid, call.function, params, result, ut.PROMPT)
                 log.append({"tool": call.function, "label": label, "outcome": outcome,
                             "confirm": bool(verdict and verdict.requires_confirmation),
+                            "why": (verdict.reason[:400] if verdict and not verdict.should_execute else None),
                             "authz": _authz_row(getattr(verdict, "action", None) or {}) if verdict else None})
                 text = str(result) if result is not None else ""
                 withheld = False
+                original = text
                 if text.strip() and mode != "none":
                     ch = await layer2_ingest(text, source="tool_response", session_id=sid)
                     if cfg.l2_tool_response_flagged(ch["metadata"]):
                         flagged.append(ch)
                     withheld = await _withheld(text)
-                return text, withheld
+                    log[-1]["output"] = "withheld" if withheld else "clean"
+                    if withheld and getattr(cfg, "TOOL_OUTPUT_POLICY", "withhold") == "filter":
+                        # v7 P3: replace only the flagged prose fields; the agent sees the rest
+                        f = await _filtered(text)
+                        log[-1]["output"] = f.status
+                        log[-1]["fields"] = [f.fields_withheld, f.fields_total]
+                        if f.status == "filtered":
+                            text, withheld = f.text, False
+                return text, withheld, original
 
             injected, withheld_inj = False, False
             for call in calls:
-                text, withheld = await step(call, "benign")
-                if it is not None and not injected and marker in text:
+                text, withheld, original = await step(call, "benign")
+                # v7 review (a05): "reached" is decided on the ORIGINAL output; the agent sees `text`. A pair whose
+                # injected text the field filter removed is a DEFENDED pair, not an unreachable one (it used to drop
+                # out of the denominator: 398 -> 394 in a05's candidate rows).
+                if it is not None and not injected and marker in original:
                     injected = True
-                    if withheld:
+                    if withheld or marker not in text:
                         withheld_inj = True              # the agent never sees the injection: no injected calls
                     else:
                         for ic in inj_calls:
