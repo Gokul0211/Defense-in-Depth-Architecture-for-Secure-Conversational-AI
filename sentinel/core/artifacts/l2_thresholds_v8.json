@@ -1,0 +1,28 @@
+{
+ "tau_code": 1.4402787685394287,
+ "tau_other_routed": 0.07350099086761475,
+ "tau_other_export": null,
+ "policy_md5": "05a02bd07210905a13ebf49257174c42",
+ "alpha": 0.01,
+ "groups": [
+  "cal_table",
+  "cal_news",
+  "cal_oasst",
+  "cal_code",
+  "cal_insert",
+  "cal_email_enron_d",
+  "cal_paste2"
+ ],
+ "reading": {
+  "translated_view": "A1+A2+A3",
+  "canonical_whitespace": true
+ },
+ "shipped": {
+  "tau_code": 1.440278172492981,
+  "tau_other_routed": 0.4619978666305542,
+  "tau_other_export": 0.673397421836853
+ },
+ "calibrated": "2026-11-07T03:44",
+ "built_by": "scratch/rca/l2/l2p59_cal_v8.py",
+ "record": "results.md \u00a722"
+}

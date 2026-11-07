@@ -1864,6 +1864,30 @@ L2_LOCAL_PROBE_ROUTING = os.getenv("L2_LOCAL_PROBE_ROUTING", "true").lower() == 
 # nl 0.898 -> 0.949, de / fr / es 0.95-1.00, zh 0.916 (unchanged); FP pasted 1.76 %, code 0.68 %, translated benign 0.
 # ON by default since 2026-11-03 (user decision; results.md §20.19). No model -> no view (fail soft).
 L2_LOCAL_TRANSLATE_VIEW = os.getenv("L2_LOCAL_TRANSLATE_VIEW", "true").lower() == "true"
+# L2 v8 candidates (results.md §22, scratch/rca/l2/L2_PLAN.md; OFF until measured on VAL / TEST):
+# A1 non-Latin script runs inside any line are translated (+ CJK sentence splitting); A2 Han-script units go to the
+# dedicated opus-mt-zh-en model (user-approved download, 2026-11-06); D2 document readings stop after the deepest probe
+# layer (identical decisions; tool outputs keep the full pass).
+# L2 v8 adopted as the default 2026-11-07 (user decision after the t11 read, results.md §22.1: the three residual rows
+# -- nl recall 0.919, translated-benign zh 4.35 % / nl 2.08 % -- accepted as manageable).
+L2_TRANSLATE_SCRIPT_RUNS = os.getenv("L2_TRANSLATE_SCRIPT_RUNS", "true").lower() == "true"
+L2_TRANSLATE_ZH_EN = os.getenv("L2_TRANSLATE_ZH_EN", "true").lower() == "true"
+# A3 (VAL RCA l2p64): one more reading with Han-script units translated by the local LLM (mood kept); off until measured
+L2_TRANSLATE_ZH_LLM = os.getenv("L2_TRANSLATE_ZH_LLM", "true").lower() == "true"
+# D2 adopted 2026-11-06 (live parity l2p57: 0 / 300 mismatches in probe value, bin, tau and decision; detector
+# mean 0.562 -> 0.369 s, p95 1.376 -> 0.981 s): default on.
+L2_LOCAL_EARLY_EXIT = os.getenv("L2_LOCAL_EARLY_EXIT", "true").lower() == "true"
+# C1: documents are read in whitespace normal form (text_canonicalize.canonical_whitespace); only meaningful together
+# with thresholds recalibrated on that form (L2_LOCAL_THRESHOLDS_V8 -> core/artifacts/l2_thresholds_v8.json).
+L2_CANONICAL_WHITESPACE = os.getenv("L2_CANONICAL_WHITESPACE", "true").lower() == "true"
+L2_LOCAL_THRESHOLDS_V8 = os.getenv("L2_LOCAL_THRESHOLDS_V8", "true").lower() == "true"
+# D3: in authoritative mode, a full-length document the local detector answered skips the soft scorers (Prompt Guard
+# document threat + instruction density: 78 % of ingest time, l2p60); identical routing by construction. Off until parity.
+# D3 adopted 2026-11-07 (l2p66 parity: 0 / 300 mismatches in quarantined / review_flagged / trust score; ingest
+# mean 2.485 -> 0.620 s, p95 5.555 -> 1.194 s): default on.
+L2_SKIP_SOFT_WHEN_AUTHORITATIVE = os.getenv("L2_SKIP_SOFT_WHEN_AUTHORITATIVE", "true").lower() == "true"
+# R2-3: the other-bin routed probe refit with translation / paraphrase augmentation (core/artifacts/l2_doc_probe_v9.npz)
+L2_LOCAL_PROBE_V9 = os.getenv("L2_LOCAL_PROBE_V9", "false").lower() == "true"
 # llama-3.1-8b-instant is retired on Groq (404, 2026-10-29); qwen/qwen3.8-27b answers the checks directly (~50 tokens).
 L2_LLM_CHECK_MODEL = os.getenv("L2_LLM_CHECK_MODEL", "qwen/qwen3.8-27b").strip()
 # N6: "shared" (public ingests are retrievable when their score admits them) | "review" (public KB documents are held

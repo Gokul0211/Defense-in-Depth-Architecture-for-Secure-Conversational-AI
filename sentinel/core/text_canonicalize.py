@@ -62,6 +62,23 @@ _CONFUSABLES: dict[str, str] = {
 _LEET_MAP = {"0": "o", "1": "i", "3": "e", "4": "a", "5": "s", "@": "a"}
 
 
+_UNICODE_SPACES_RE = re.compile("[\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000]")
+_TRAILING_WS_RE = re.compile(r"[ \t]+(?=\n)")
+_BLANK_RUN_RE = re.compile(r"\n{3,}")
+
+
+def canonical_whitespace(text: str) -> str:
+    """Whitespace-only normal form (L2 C1, results.md §22): CRLF / CR -> LF, Unicode spaces -> ' ', trailing spaces
+    and tabs per line removed, runs of 3+ line breaks -> 2, outer whitespace stripped. Changes nothing but whitespace,
+    so a document and the same document with different outer / trailing whitespace read identically (real-runner t9:
+    leading / trailing whitespace alone flipped 10 / 458 middle-position decisions)."""
+    t = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    t = _UNICODE_SPACES_RE.sub(" ", t)
+    t = _TRAILING_WS_RE.sub("", t)
+    t = _BLANK_RUN_RE.sub("\n\n", t)
+    return t.strip()
+
+
 def canonicalize(text: str) -> str:
     """
     Normalize unicode, strip invisible characters, fold homoglyphs,

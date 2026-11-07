@@ -98,6 +98,10 @@ def probe_score(probe: dict, captured: dict) -> tuple[float, list[float]] | None
     return (max(zs) if probe["combine"] == "max_z" else ps[0]), ps
 
 
+class _StopForward(Exception):
+    """Raised by the one-call hook of read_template(stop_after_layer=L): the probes have what they need."""
+
+
 class LocalJudge:
     def __init__(self, model_id: str, probe: dict | None = None):
         import torch
@@ -218,7 +222,11 @@ class LocalJudge:
                 hooked.add(L)
         self._hooked = hooked
 
-    def read_template(self, name: str, *slots: str) -> dict:
+    def read_template(self, name: str, *slots: str, stop_after_layer: int | None = None) -> dict:
+        """One reading under template `name`. stop_after_layer=L (L2 D2, config.L2_LOCAL_EARLY_EXIT): the forward pass
+        stops right after decoder layer L (hidden_states index L) -- the capture hooks on layers <= L have fired, the
+        remaining layers and the LM head are skipped; the result then has no judge read-out (log_odds / p_yes None).
+        The probe values are identical by construction (same computation up to layer L)."""
         torch = self.torch
         t = self.templates[name]
         body = []
@@ -232,15 +240,28 @@ class LocalJudge:
         x = torch.tensor([body], device="cuda:0")
         pos = torch.arange(n0, n0 + len(body), device="cuda:0")[None]
         self._captured = {}
+        stop_handle, out = None, None
+        if stop_after_layer is not None:
+            def _stop(m, i, o):
+                raise _StopForward()
+            # registered AFTER the capture hooks, so on layer L the capture runs first, then the stop
+            stop_handle = self.model.model.layers[stop_after_layer - 1].register_forward_hook(_stop)
         try:
             with torch.no_grad():
                 out = self.model(input_ids=x, past_key_values=t["cache"], use_cache=True, position_ids=pos,
                                  cache_position=pos[0], logits_to_keep=1)
+        except _StopForward:
+            out = None
         finally:
+            if stop_handle is not None:
+                stop_handle.remove()
             t["cache"].crop(n0)
-        lp = torch.log_softmax(out.logits[0, -1].float(), -1)
-        ly, ln = torch.logsumexp(lp[self.yes], 0), torch.logsumexp(lp[self.no], 0)
-        res = {"p_yes": float(torch.sigmoid(ly - ln)), "log_odds": float(ly - ln), "probe": None}
+        if out is None:
+            res = {"p_yes": None, "log_odds": None, "probe": None, "stopped_after_layer": stop_after_layer}
+        else:
+            lp = torch.log_softmax(out.logits[0, -1].float(), -1)
+            ly, ln = torch.logsumexp(lp[self.yes], 0), torch.logsumexp(lp[self.no], 0)
+            res = {"p_yes": float(torch.sigmoid(ly - ln)), "log_odds": float(ly - ln), "probe": None}
         pr = t.get("probe")
         if pr is not None and pr.get("probes"):
             sc = probe_score(pr, self._captured)

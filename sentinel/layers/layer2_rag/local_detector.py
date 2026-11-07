@@ -74,7 +74,10 @@ def load_routed_probe(path: Path | None = None) -> dict | None:
     """OTHER-bin probe of the routed detector (L2 v6 round, scratch/rca/l2/l2p45_export_v6.py): trained with middle-
     position and translated injections, its own layer and threshold. The code bin and tool outputs keep the main
     artifact. Same policy-md5 guard."""
-    path = path or _ART / "l2_doc_probe_v6.npz"
+    if path is None:
+        import sentinel.config as _c9
+        # L2 round 2 (R2-3): the translation-robust refit, when selected on VAL and switched on
+        path = _ART / ("l2_doc_probe_v9.npz" if getattr(_c9, "L2_LOCAL_PROBE_V9", False) else "l2_doc_probe_v6.npz")
     prov = path.with_suffix(".provenance.json")
     if not path.exists():
         return None
@@ -106,6 +109,25 @@ def decide(art: dict, probe_decision: float, judge_log_odds: float, text: str, t
     return {"bin": b, "score": float(score), "tau": float(tau), "fired": bool(score > tau)}
 
 
+def _apply_thresholds_v8(art: dict, routed: dict | None) -> None:
+    """L2 v8 (config.L2_LOCAL_THRESHOLDS_V8): thresholds recalibrated on canonical-whitespace text with the second
+    pasted-passage CAL group (scratch/rca/l2/l2p59_cal_v8.py). The artifact records the document-policy md5 and the
+    probe artifacts it was calibrated for; any mismatch leaves the shipped thresholds in place."""
+    p = _ART / "l2_thresholds_v8.json"
+    if not p.exists():
+        logger.warning("L2_LOCAL_THRESHOLDS_V8 set but l2_thresholds_v8.json is missing; shipped thresholds kept")
+        return
+    t = json.loads(p.read_text(encoding="utf-8"))
+    if t.get("policy_md5") != policy_md5():
+        logger.warning("l2_thresholds_v8 calibrated under another document policy; shipped thresholds kept")
+        return
+    art["tau_code"] = float(t["tau_code"])
+    if routed is not None and t.get("tau_other_routed") is not None:
+        routed["tau_other"] = float(t["tau_other_routed"])
+    if t.get("tau_other_export") is not None:
+        art["tau_other"] = float(t["tau_other_export"])
+
+
 _ready = False
 _art = None
 _routed = None              # other-bin probe when L2_LOCAL_PROBE_ROUTING is on (read once, with the template)
@@ -116,7 +138,14 @@ _HIDING_KEYS = ("tag_chars", "variation_selector_text", "bidi_overrides", "invis
 
 
 def _read_one(j, doc: str, tool: bool) -> dict | None:
-    r = j.read_template("l2doc", doc)
+    import sentinel.config as _c
+    if not tool and getattr(_c, "L2_LOCAL_EARLY_EXIT", False):
+        # L2 D2: documents are decided by the probes alone (layers <= the deepest probe layer); tool outputs keep the
+        # full pass because their score uses the judge's final-layer log-odds
+        deepest = max([_art["layer"]] + ([_routed["layer"]] if _routed is not None else []))
+        r = j.read_template("l2doc", doc, stop_after_layer=deepest)
+    else:
+        r = j.read_template("l2doc", doc)
     v = j._captured.get(_art["layer"])
     if v is None:
         return None
@@ -156,11 +185,19 @@ def local_doc_read(text: str, tool: bool = False) -> dict | None:
                     return None
                 import sentinel.config as cfg
                 _routed = load_routed_probe() if getattr(cfg, "L2_LOCAL_PROBE_ROUTING", False) else None
+                if getattr(cfg, "L2_LOCAL_THRESHOLDS_V8", False):
+                    _apply_thresholds_v8(_art, _routed)
                 layers = [_art["layer"]] + ([_routed["layer"]] if _routed and _routed["layer"] != _art["layer"] else [])
                 j.add_template("l2doc", DOC_POLICY, USER_FMT, escape=_escape)
                 j.set_template_probe("l2doc", {"layers": layers, "probes": [], "combine": "none", "tau": None})
                 _ready = True
             body = (text or "")[len(PREFIX):] if (text or "").startswith(PREFIX) else (text or "")
+            import sentinel.config as _cw
+            if not tool and getattr(_cw, "L2_CANONICAL_WHITESPACE", False):
+                # L2 C1: every reading of a DOCUMENT starts from the whitespace normal form (thresholds recalibrated on
+                # the same form, core/artifacts/l2_thresholds_v8.json); tool outputs are unchanged
+                from sentinel.core.text_canonicalize import canonical_whitespace
+                body = canonical_whitespace(body)
             views = [PREFIX + body]
             from sentinel.core.text_canonicalize import hiding_report, unhide
             hr = hiding_report(body)               # only when a hiding technique is present: unhide's NFKC step alone
@@ -180,6 +217,13 @@ def local_doc_read(text: str, tool: bool = False) -> dict | None:
                 tv_ = translated_view(body)
                 if tv_ is not None and PREFIX + tv_ not in views:
                     views.append(PREFIX + tv_)
+                if getattr(_cfg, "L2_TRANSLATE_ZH_LLM", False):
+                    # A3: one more reading with the Han units translated by the local LLM, mood kept (VAL RCA l2p64:
+                    # every remaining zh miss was an MT that turned the injected command into a noun phrase)
+                    from .translate_view import llm_zh_view
+                    lv_ = llm_zh_view(body)
+                    if lv_ is not None and PREFIX + lv_ not in views:
+                        views.append(PREFIX + lv_)
             unread = 0
             if len(j._ids(_escape(body))) > READ_CAP_TOKENS:
                 from .chunking import chunk_text

@@ -226,10 +226,19 @@ async def ingest_chunk(text: str, source: str, session_id: str | None = None,
     # stored in metadata and never used.
     l1_score: float | None = None
 
+    # L2 D3 (config.L2_SKIP_SOFT_WHEN_AUTHORITATIVE; scratch/rca/l2/l2p60 profile: Prompt Guard's document-threat scorer
+    # was 65 % and instruction density 13 % of the ingest time). In "authoritative" mode the detector's decision REPLACES
+    # the soft verdict and the anchors depend only on the bin (content type), so for a full-length document the
+    # detector answered, the soft scorers are skipped: same bin, same anchors, same trust score and routing.
+    # Short documents keep their own path (cheap, and their bin depends on it).
+    from .document_threat import _MIN_DOC_CHARS
+    _skip_soft = (_ld_mode == "authoritative" and ld is not None and len(text) >= _MIN_DOC_CHARS
+                  and getattr(_cfgd, "L2_SKIP_SOFT_WHEN_AUTHORITATIVE", False))
+
     # 2. Calculate instruction density
     # L2 review C8: model work runs in a worker thread (L2_SCORE_IN_THREAD), so a long document no longer blocks the
     # event loop -- and with it every other request -- while it is scored.
-    density_score = await _run_scoring(calculate_instruction_density, text)
+    density_score = None if _skip_soft else await _run_scoring(calculate_instruction_density, text)
 
     # 3. Calculate Trust Score.
     #
@@ -245,7 +254,11 @@ async def ingest_chunk(text: str, source: str, session_id: str | None = None,
     import sentinel.config as _cfg
 
     threat_detail = None
-    if getattr(_cfg, "L2_DOCUMENT_THREAT_SCORER", False):
+    if _skip_soft and getattr(_cfg, "L2_DOCUMENT_THREAT_SCORER", False):
+        from sentinel.core.content_type import detect_content_type as _dct
+        threat_detail = {"threat": 0.0, "available": True, "content_type": str(_dct(text)),
+                         "soft_scorer": "skipped: the authoritative local detector answered (L2 D3)"}
+    elif getattr(_cfg, "L2_DOCUMENT_THREAT_SCORER", False):
         from .document_threat import document_threat_score
 
         if getattr(_cfg, "L2_SHORT_BIN_BY_SOURCE", False):
@@ -257,7 +270,7 @@ async def ingest_chunk(text: str, source: str, session_id: str | None = None,
     # L2 review C14 / N5 (L2_UNHIDE, off): the classifiers read raw text, so Unicode tag characters, variation-selector
     # payloads, bidi / invisible characters and spaced-out letters reached them unchanged. When the unhide view
     # (text_canonicalize.unhide, the same view L1 uses) differs, it is scored too and the higher threat stands.
-    if (threat_detail is not None and threat_detail["available"] and getattr(_cfg, "L2_UNHIDE", False)):
+    if (threat_detail is not None and threat_detail["available"] and getattr(_cfg, "L2_UNHIDE", False) and not _skip_soft):
         from sentinel.core.text_canonicalize import unhide
         from .document_threat import document_threat_score as _dts
         _u = unhide(text)

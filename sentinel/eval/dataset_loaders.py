@@ -1745,6 +1745,18 @@ def _load_tensortrust_fresh7(split: str = "test", limit: int | None = None, cach
     return cached
 
 
+def _load_tensortrust_fresh8(split: str = "test", limit: int | None = None, cache: bool = True) -> EvalDataset:
+    """Cache-only: tt15_fresh_test.py --v8 (raw dump v2; single-defender successes >= 5 words; excludes everything near
+    both benchmarks and all seven earlier fresh sets). Built 2026-11-07 for the L1 v12 round (TEST); untouched."""
+    cached = _load_from_cache_capped("tensortrust_fresh8", split, limit)
+    if cached is None:
+        raise FileNotFoundError("tensortrust_fresh8 is built by scratch/rca/l1/tt15_fresh_test.py --v8")
+    return cached
+
+
+_REGISTRY["tensortrust_fresh8"] = {
+    "loader": "_load_tensortrust_fresh8", "layer": "L1", "hf_path": "qxcv/tensor-trust", "license": "MIT",
+    "description": "Eighth fresh TensorTrust set (raw dump v2), single-defender >= 5 words, near-duplicate filtered vs all earlier"}
 _REGISTRY["tensortrust_fresh7"] = {
     "loader": "_load_tensortrust_fresh7", "layer": "L1", "hf_path": "qxcv/tensor-trust", "license": "MIT",
     "description": "Seventh fresh TensorTrust set (raw dump v2), single-defender >= 5 words, near-duplicate filtered vs all earlier"}

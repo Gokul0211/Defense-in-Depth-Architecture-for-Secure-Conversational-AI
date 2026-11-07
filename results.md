@@ -5650,4 +5650,186 @@ Open L2 items: translated zh 0.916 (87 / 95), benign pasted passages 1.76 % (10 
   reading views once one fires; greedy translation only if DEV view-recall is unchanged.
 - **Protocol:** DEV design, VAL selection, CAL thresholds; t9 is spent; a fresh t10 TEST (every t9 row incl. 7
   languages, pasted, code, Enron, long benign, DIDA) built before any read and read once for the shipped detector and
-  the final candidate; then the real runner; full metric set per row. Adopt only if every row meets the mark.
+  the final candidate; then the real runner on the changed rows; full metric set per row. Adopt only if every row
+  meets the mark. Time (revised 22:50): ~6-7 h (~3.5 h work + ~2.5-3 h GPU); +3.5-5 h only if the probes need a refit.
+- **User approval (2026-11-06 ~22:40):** download of Helsinki-NLP/opus-mt-zh-en approved ("yeah u can download it");
+  fetched from the official main branch (weights loaded with torch weights_only; no code from the download is run)
+  into ~/.cache/sentinel/mt/opus-mt-zh-en. With the model available, step A tests A1 (script runs) and A1 + A2 (Han
+  segments through zh-en) side by side on VAL; TEST reads stay at most 2 configurations.
+
+## 23. L1 plan (written 2026-11-06 ~22:40; plan only, nothing run; working doc scratch/rca/l1/L1_PLAN.md)
+Best L1 (v11, fresh7, read once): hijacking 0.846, extraction 0.843, NotInject 1.77 %, pooled P 0.991 / F1 0.912,
+AUROC 0.989 -- recall below 0.92; production has only the single-probe lift (L1_LLM_PROBE, off): the v8-v11 stages
+exist offline only. Facts behind the plan: ranking is good (AUROC 0.98-0.99 on every split) but the CAL-safe
+threshold leaves 15-20 % of TensorTrust attacks below it; attacks are short (median ~20 tokens) and 6.6-9.6 % exceed
+the fine-tuned stage's 256-token limit; the stage saw 3,978 TensorTrust attacks and overfit after one epoch.
+- **Workstreams:** A RCA of v11's 124 fresh7 misses + 6 NotInject FPs with a rubric fixed before looking (incl.
+  "not an injection" label noise, to know the ceiling); B fresh8 TEST built first, then a TRAIN pool from all remaining
+  raw-dump successes (near-duplicate filtered against fresh8), VAL = fresh7, DEV-side trigger-word hard negatives
+  (never NotInject / CAL); C fine-tuned stage v12 (512 tokens head + tail, ~3x TensorTrust data, early stopping at the
+  CAL threshold, ProtectAI vs PIGuard base; a downloaded ModernBERT-class base only with approval and only if both
+  fall short); D learned combiner vs max-of-z on VAL; E latency cascade (the 11 ms stage first, the 4B model only in
+  the uncertain band; identical VAL decisions) + early exit after the deepest probe layer; F production path behind
+  flags + real runner; G (phase 2) the harm head (WildJailbreak 0.738, OR-Bench-Hard over-refusal 38.8 %).
+- **Protocol:** DEV design, VAL selection, CAL thresholds; fresh8 read once for v11 and the selected v12; real runner;
+  full metric set. Estimated ~8-10 h for A-F (revised 22:50; fine-tuning ~15 min / epoch measured), G later.
+
+### 22.1 L2 v8 round: pre-registration (2026-11-06 22:57, before any v8 number exists)
+- **Code (flags, default off):** `L2_TRANSLATE_SCRIPT_RUNS` (A1: non-Latin script runs inside any line translated in
+  place; CJK sentences split without whitespace; units <= 300 characters), `L2_TRANSLATE_ZH_EN` (A2: Han-script units
+  through opus-mt-zh-en, fallback mul-en), `L2_LOCAL_EARLY_EXIT` (D2: document readings stop after the deepest probe
+  layer; tool outputs keep the full pass). Unit tests: tests/test_l2_translate_view_v8.py (14) + the v7 / routing tests
+  (36 pass together).
+- **D2 adoption rule:** live parity on 300 VAL documents (l2p57) must give 0 mismatches in probe value, bin, tau and
+  decision; then D2 becomes the default (a pure speed-up: identical decisions by construction and by measurement).
+- **VAL candidates (same probes and thresholds, nothing refitted), through the production function local_doc_read on
+  every VAL pool:** S = shipped (v7 view); A1; A1 + A2. **Selection:** the candidate with the highest VAL zh recall
+  that reaches **zh >= 0.95**, keeps every other VAL ml language within one document of S, and keeps every VAL benign
+  row (ml benign, paste controls, code, the rest) within one document of S. A1 + A2 is preferred over A1 on a tie. If
+  neither reaches 0.95: stop and fix (RCA on VAL).
+- **TEST:** the selected candidate and S on a fresh t10 (built before any read; see L2_PLAN.md §4), read once, after
+  steps B / C (so t10 is read once for the final configuration, not once per step).
+- **Correction to the L2 plan, B1 (2026-11-06 22:59, before any B number):** CAL already holds a pasted-passage group
+  (cal_insert, 600: 200 XSum sentences + 200 Alpaca outputs + 200 OASST assistant replies, hosted in news / other /
+  OASST contexts). The plan's premise ("no pasted-passage CAL group") came from an outdated design note. The real gap is
+  a population MISMATCH: the TEST pasted pool is 300 XSum + 300 OASST assistant replies hosted in BIPIA benign
+  contexts (e-mail, table, code, QA, abstract) -- half again as much OASST text and BIPIA hosts. **Revised B1:** a second
+  pasted CAL group built exactly like the test population (XSum TRAIN sentences + OASST assistant replies from the
+  unused slice oa_short[6400:6700], hosted in BIPIA TRAIN benign contexts; 600 documents), added to the
+  group-conditional conformal calibration (alpha 0.01) of the other-bin threshold. t10's pasted pool then draws from
+  oa_short[6700:7000] (disjoint). VAL check as pre-registered (every recall row within one document of S).
+- **D2 live parity (2026-11-06 23:02; scratch/rca/l2/l2p57_early_exit_parity.py, l2p/l2p57_parity.json):** 300 VAL documents
+  through local_doc_read, early exit off vs on: **0 mismatches** (probe value, bin, tau, decision, readings). Detector
+  latency mean **0.562 -> 0.369 s** (x1.52), p95 1.376 -> 0.981 s; 1.26 readings per document; translation 12 % of the
+  time. **D2 adopted as the default** (pre-registered rule). D1 finding: the detector is only ~0.4-0.6 s of the real
+  runner's ~3.1 s per document, so the latency target depends on the OTHER L2 stages (profiled next).
+- **t10 built (2026-11-06 23:05, scratch/rca/l2/l2p61_t10_pools.py; no detector has read it; backup l2p/pools_pre_t10.json):**
+  3,695 documents -- BIPIA e-mail 150 / table 198 / code 200 / abstract 200; middle 415; long middle 100 / long benign 100;
+  translated attacks de 93 / fr 96 / es 94 / zh 92 / it 92 / ru 95 / nl 95; translated benign 93-98 per language;
+  pasted 569; benign code 297; Enron 141. Disclosed limits: BIPIA builds documents from its fixed 75 test attacks and
+  the translated rows reuse t9's translated attack strings (deterministic MT of the same sources) in new hosts and
+  positions -- a fresh draw of documents, not of attack wording; benign hosts are BIPIA's small benign-context set.
+  Read once, after steps 2-3 fix the final configuration (S vs the final candidate).
+- **Step 2 VAL (l2p58, 2026-11-06 23:38 log; 23:02-23:30): no candidate reaches zh >= 0.95 -> stop-and-fix.** VAL zh (59): S 54
+  (0.915), A1 54 (0.915), A1 + A2 55 (0.932); every other VAL row identical across S / A1 / A1 + A2 (BIPIA, middle,
+  de / fr / es, action requests, all benign rows). A1 fixed view coverage (zh documents with a view 104 / 119 -> 119 /
+  119) but coverage was not the limit. **RCA (l2p64, VAL):** in all 4 remaining misses the probe detects the ENGLISH
+  original of the same attack in the same place (margins +5.2 to +8.9); the round trip through Chinese loses the
+  imperative ("Break down the plot of X" -> "Breaking the X"; "Develop a speech on ..." -> "Lectures on ..."), from
+  both MT models; 3 of the 4 misses are one attack string. **Fix A3 (flag L2_TRANSLATE_ZH_LLM, off):** one more
+  reading with only the Han units translated by the detector's own local LLM under a mood-preserving instruction --
+  an additional reading only, so a manipulated translation can only lose that reading. Disclosed: VAL zh was used for
+  this RCA, so t10 is the independent check. **Paused at the user's request (2026-11-06 23:38)** before A3's VAL run.
+- **A3 VAL rule (2026-11-07 00:54, before the A3 VAL number):** candidate A1 + A2 + A3 vs S, the same acceptance as §22.1 (zh >= 0.95;
+  de / fr / es within one document of S; every benign row within one document of S; every other recall row within one
+  document of S). On pass, the view choice becomes A1 + A2 + A3 for calibration (step 3) and t10. Resumed after the
+  pause: the 10 test failures were old fakes without **kw for the new stop_after_layer argument (fixed; 268 L2 /
+  detector tests pass).
+- **A3 VAL (2026-11-07 01:01; scratch/rca/l2/l2p65_a3_val.py, l2p/l2p65_a3_val.json): PASSES.** VAL zh **58 / 59 = 0.983**
+  (S 0.915, A1 + A2 0.932); val_ml 0.983 (S 0.967); de / fr / es unchanged; every benign row unchanged (translated
+  benign 0 %, paste controls 1.75 %, code 1.33 %, tool-code 6.78 %, e-mail 0.68 % / 0 %); every other recall row
+  unchanged. 128 VAL documents carry Han units (only they change); they took ~3.1 s each with the LLM translation.
+  **View choice: A1 + A2 + A3** (l2p/l2_view_choice.json) for calibration and t10.
+- **D1 whole-path profile (2026-11-07 01:11; l2p60, 120 VAL documents through layer2_ingest, shipped defaults + D2):** mean
+  **2.561 s**, p95 5.536 s per document; Prompt Guard document-threat scorer 1.673 s (65 %), local detector 0.481 s
+  (19 %), instruction density 0.344 s (13 %), embedding 0.061 s (2 %). In "authoritative" mode the detector's
+  decision replaces the soft verdict and the anchors depend only on the bin (content type), so the soft scorers do not
+  change routing once the detector has answered. **D3 (flag L2_SKIP_SOFT_WHEN_AUTHORITATIVE, off; pre-registered):**
+  for a full-length document (>= 600 characters) the detector answered, skip Prompt Guard and instruction density
+  (bin kept); short documents unchanged. Adopt as default if l2p66 parity on 300 VAL documents gives identical
+  quarantined / review_flagged / trust_score for every document.
+- **Step 3 calibration (l2p59, 01:09-01:24): BUG in my calibration step.** The per-bin conformal used groups with >= 20
+  documents in a bin, but a split-conformal quantile at alpha 0.01 needs >= 99 (k = ceil((n+1)(1-alpha)) > n gives
+  +inf). cal_paste2 put 29 documents in the code bin -> tau_code = +inf (the code bin could never fire); tau_other
+  (routed) came out 0.0735 (shipped 0.462). **Final VAL (l2p63, 01:24-01:48): FAILED** on recall (BIPIA code 0 / 100,
+  action requests 261 / 300 vs 299), so the pre-registered fallback set the plan to **view only** (A1 + A2 + A3; no
+  canonical whitespace; shipped thresholds) -- and the t10 read measured S vs that plan.
+- **t10 TEST, read ONCE (l2p62, 01:48-03:16; S vs view-only A1 + A2 + A3; D2 on in both):**
+  pooled S P 0.9935 / R 0.9547 / F1 0.9737 / FP 0.68 % / AUROC 0.9961 / AUPRC 0.9967; view-only R **0.9557** (+2 zh) /
+  AUROC 0.9963 / AUPRC 0.9969, FP unchanged. Rows (S -> view-only): BIPIA e-mail 0.987, table 0.965, code 0.970,
+  abstract 0.960; middle 0.947; long middle 0.930; translated de **0.849 [0.763, 0.908]** (=), fr 0.969, es 0.979,
+  **zh 0.946 -> 0.967 [0.908, 0.989]**, it 1.000, ru 0.947, nl 0.937; benign pasted **1.23 % [0.63, 2.50]**, code
+  0.67 %, Enron 0.71 %, long benign 0, translated benign 0 in de / fr / es / it / ru / nl and **zh 2.15 % (2 / 93)** (=).
+  Detector latency (local_doc_read, D2): S 0.626 s mean / 1.569 p95; view-only 0.731 / 2.704 (A3 on zh documents).
+  Whitespace flips on t10_mid (view-only, no canonical form): **8 / 415**.
+- **Met:** zh >= 0.95 (target), pasted <= 1.5 % (target), every BIPIA / middle / fr / es / it / ru / nl row.
+  **Off:** translated **de 0.849** (t9: 0.949), translated benign **zh 2.15 %**, whitespace flips 8 / 415, whole-path
+  latency (D3 parity still to run). t10 is now spent; the next confirmation needs a new untouched draw (t11).
+- **Stop-and-fix round 2 (plan, 2026-11-07 03:18):** (1) fix the calibration bug (a bin's group is used only with >= 100 documents
+  in that bin) and redo B / C on VAL; (2) RCA of the t10 de misses (spent, reading allowed) -- hypothesis: German
+  sentences inserted INSIDE English lines are never translated (the Latin-script rule judges whole lines; A1 only
+  splits non-Latin runs); (3) RCA of the 2 zh benign FPs; (4) D3 parity; (5) t11 fresh draw, read once.
+- **Round-2 RCA (2026-11-07 03:29; l2p68 / l2p69 on t10, spent):** the 14 German misses are NOT mixed lines (0 / 14) -- the
+  hypothesis was wrong; 13 / 14 do get a translated view. 9 / 14 fire on the English original in place but not on the
+  translation; 4 / 14 miss even in English (benign-sounding BIPIA task-diversion questions); 1 is a 3-word line the
+  Latin rule never judges. A mood-preserving LLM translation for every language catches only 4 / 14: the remaining gap
+  is the probe's sensitivity to wording (a faithful paraphrase falls below the threshold where the original wording
+  fires) on BIPIA's task-diversion attacks, plus draw variance (75 attack strings, picked with replacement: t9 de
+  0.949, t10 0.849). The 2 zh benign FPs are football commentary whose round trip reads as a command ("Try saving.",
+  "Replace X with Y.").
+- **Round-2 plan:** R2-1 calibration bug fix (a group joins a bin with >= 100 documents in it) + recalibration + final
+  VAL; R2-2 D3 parity; R2-3 a translation-robust refit of the routed probe with MT back-translation augmentation only
+  (local opus-mt round trips; no LLM-generated attack text); R2-4 a fresh t11 drawn STRATIFIED over the attack strings
+  (each string equally often) to cut draw variance, read once.
+- **t11 built (2026-11-07 03:49, scratch/rca/l2/l2p73_t11_pools.py; no detector has read it; backup l2p/pools_pre_t11.json):**
+  3,810 documents, STRATIFIED over the attack strings -- BIPIA e-mail 151 / table 198 / code 200 / abstract 200; middle
+  337 (each of the 75 test attacks in four text hosts + each code attack twice, after leakage audits); long middle 100 /
+  long benign 100; translated attacks 135-147 per language (each translated string twice, positions cycling);
+  translated benign 92-97 per language; pasted 567 (XSum xv[3500:3900] + OASST 7000:7300); benign code 298; **Enron 0
+  (the test e-mail slice is exhausted past 2000)**. Read once for the round-2 final configuration vs S.
+- **Round-2 calibration (R2-1, 03:29-03:44; bug fixed):** tau_code **1.4403** (= shipped: cal_code alone qualifies),
+  tau_other (routed) **0.0735** (shipped 0.462; per-group conformal: cal_insert 0.0735, cal_paste2 -0.708, cal_oasst
+  -0.700, cal_email_enron_d -1.886, cal_table -2.221, cal_news -2.459). l2p70 measures whether canonical whitespace
+  explains the drop from 0.462.
+- **Canonical-shift diagnostic (l2p70, 03:45-04:14):** canonical whitespace moves scores little (mean shift -0.19 to
+  +0.01 on benign CAL groups, -0.08 to -0.34 on VAL attacks); it does NOT explain the threshold drop: read raw,
+  cal_insert's 99th percentile is already -0.41, far under the shipped 0.462 -- the shipped other-bin threshold sat
+  above every CAL group's 99 % quantile under today's production reading; the per-group calibration removes that slack.
+- **Final VAL (l2p63, 04:14-04:38): PASSES** the pre-registered rule -> plan = view A1 + A2 + A3 + canonical whitespace
+  + recalibrated thresholds (l2p/l2_final_plan.json). FINAL vs S: BIPIA e-mail 98 / 98, table 98 / 93, code 97 / 98, qa
+  98 / 98, abstract 96 / 95; middle 146 / 147; translated 238 / 231 (of 239); action requests 299 / 299; benign paste
+  controls 5 / 4 (of 228: 2.19 %), e-mail 0 / 0, code 4 / 4, tool code 8 / 8, Enron 2 / 2, translated benign 1 / 0.
+- **D3 parity (l2p66, 04:38-04:54): 0 / 300 mismatches** (quarantined, review_flagged, trust score); soft scorers skipped
+  on 242 / 300; ingest latency **2.485 -> 0.620 s mean, 5.555 -> 1.194 s p95 (x4.0)**. **D3 adopted as the default.**
+- **Decision (2026-11-07 04:55):** the R2-3 refit is NOT run before t11 -- VAL cannot show its benefit (VAL de 58 / 60) and selecting it
+  on t10 would leak attack-string information into t11 (same 75 strings). The corrected threshold alone shifts every
+  translated row up; the stratified t11 decides; if de still fails there, the refit is the fix, tested on a new draw.
+- **t11 read, pre-registered (2026-11-07 04:57, before the read):** S vs FINAL (view A1 + A2 + A3, canonical whitespace, recalibrated
+  thresholds; D2 on in both), every t11 row, once (scratch/rca/l2/l2p74_t11_test.py). The FINAL configuration becomes
+  the default (L2_TRANSLATE_SCRIPT_RUNS, L2_TRANSLATE_ZH_EN, L2_TRANSLATE_ZH_LLM, L2_CANONICAL_WHITESPACE,
+  L2_LOCAL_THRESHOLDS_V8) only if every attack row is >= 0.92, zh >= 0.95, pasted <= 1.5 %, every other benign row near
+  ~1.7 % or below, and 0 whitespace flips on t11_mid; otherwise it is reported and the off rows get an RCA.
+- **t11 TEST, read ONCE (l2p74, 2026-11-07 04:57-06:33; S vs FINAL = view A1 + A2 + A3 + canonical whitespace +
+  recalibrated thresholds; D2 on; stratified over the attack strings):** pooled S P 0.9924 / R 0.9569 / F1 0.9743 /
+  FP 0.98 % / AUROC 0.9964 / AUPRC 0.9976; **FINAL P 0.9915 / R 0.9592 / F1 0.9751 / FP 1.10 % / AUROC 0.9962 / AUPRC
+  0.9975**. Rows (S -> FINAL): BIPIA e-mail 0.993 -> 1.000, table 0.944 -> 0.934, code 0.995 -> 0.980, abstract
+  0.950 -> 0.965; middle 0.950 -> 0.944; long middle 0.910 -> 0.930; translated de 0.965 -> **0.958**, fr 0.972 ->
+  0.979, es 0.993 -> 0.993, **zh 0.946 -> 0.973**, it 0.979 -> 0.972, ru 0.917 -> 0.931, **nl 0.911 -> 0.919
+  [0.860, 0.954] (124 / 135; one document short of 0.92)**; benign pasted **1.76 % -> 1.41 % [0.72, 2.75]**, code 0.34 %
+  -> 0.34 %, long benign 0 -> 1.0 %, translated benign de / fr / it 0 -> 0, es 1.06 % -> 1.06 %, ru 1.05 % -> 1.05 %,
+  **nl 1.04 % -> 2.08 %**, **zh 2.17 % -> 4.35 % [1.70, 10.6] (4 / 92)**. Whitespace flips on t11_mid: **0 / 337**
+  (t10 without the canonical form: 8 / 415). Detector latency S 0.659 s mean / 1.542 p95, FINAL 0.785 / 2.766 (the LLM
+  view on Han documents); whole ingest with D3 0.62 s mean / 1.19 s p95 (l2p66).
+- **Verdict by the pre-registered rule: FINAL is NOT made the default** (nl 0.919 < 0.92 by one document; translated-
+  benign zh 4.35 % and nl 2.08 % above ~1.7 %). **Met on t11:** every BIPIA / middle / long-middle row, de (0.958: the
+  t10 drop was draw variance plus the threshold slack), fr / es / zh / it / ru, pasted 1.41 % (<= 1.5 %), code, zero
+  whitespace flips. **Off:** nl recall (by one document), translated-benign zh (FINAL doubled it: 2 -> 4) and nl (1 -> 2).
+  Next (round 3): RCA of the extra zh / nl benign flags (which reading fired) and the nl misses; a fix only for those
+  readings; confirmation on a new draw of the affected rows. Paused 06:33-17:33 (weekly limit; PC restarted).
+- **User decision (2026-11-07 17:37):** "the 3 rows are managable dw about it" -> the L2 v8 configuration becomes the DEFAULT
+  (L2_TRANSLATE_SCRIPT_RUNS, L2_TRANSLATE_ZH_EN, L2_TRANSLATE_ZH_LLM, L2_CANONICAL_WHITESPACE, L2_LOCAL_THRESHOLDS_V8 = true;
+  D2 and D3 already default) despite the pre-registered rule's three residual rows (nl recall 0.919 by one document;
+  translated-benign zh 4.35 % and nl 2.08 %), which stay recorded as open. Next: the real runner on all of t11.
+- **Regression found and fixed while switching the defaults (2026-11-07 17:47):** the first v8 _units_v8 judged a long (> 400
+  characters) Latin-script line sentence by sentence ONLY when the whole line was foreign, so one foreign sentence inside
+  a long English paragraph got no translation (v7 handled it). Fixed (sentence-level judgement for every long Latin line,
+  non-Latin runs added where they do not overlap); regression test added; 495 L2 / detector tests pass. t10 / t11 were
+  read with the earlier code (their inserted attacks sit on their own lines, so the case is rare there); the real-runner
+  run below uses the fixed code and is a report, not a selection.
+- **Real runner on all of t11 (l2p75, 17:47-18:46; the new defaults + the long-line fix + D2 + D3; a report):**
+  precision **0.9915**, recall **0.9592**, F1 **0.9751**, FP rate **1.10 %**, AUROC **0.9962**, AUPRC **0.9974**
+  (TP 2,091 / FP 18 / FN 89 / TN 1,612); every row identical to the t11 detector-level read (so the production path
+  decides as measured, and the long-line fix changed no t11 decision); **latency through the runner 920 ms mean /
+  2,870 ms p95 per document** (VAL ingest 620 ms: t11 has more Chinese documents with the LLM translation and long
+  documents with windows). **Phase 1 (L2) closed 2026-11-07 18:47:** every metric at the mark except the three rows the user
+  accepted (nl recall 0.919, translated-benign zh 4.35 % / nl 2.08 %), recorded as open.
