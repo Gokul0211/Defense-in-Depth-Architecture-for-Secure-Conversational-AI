@@ -1,0 +1,29 @@
+{
+ "version": "v12",
+ "created": "2026-11-08 04:28",
+ "ens3_probe_md5": "56a5d823bcf8968c60f97466e0044f3f",
+ "combine": "max",
+ "rule": "max",
+ "tau": 4.082516193389893,
+ "t_auth": 2.5,
+ "w_protectai": 0.25,
+ "pai_mu": -8.90116693885709,
+ "pai_sd": 8.539548003084878,
+ "stack": null,
+ "ft": {
+  "base": "piguard",
+  "zmu": -6.721294403076172,
+  "zsd": 3.493988275527954,
+  "maxlen": 512,
+  "epoch": 2.0
+ },
+ "d24_file": "l1_d24_probe.npz",
+ "deepest_layer": 24,
+ "b_skip": 2.303022623062134,
+ "provenance": {
+  "fine_tune": "scratch/rca/l1/tt52_finetune_v12.py (piguard)",
+  "combiner": "tt53_combiner.py",
+  "test": "tt54_v12_test.py (tensortrust_fresh8, read once)",
+  "doc": "results.md \u00a723"
+ }
+}

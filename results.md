@@ -5038,6 +5038,17 @@ Protocol: tool response ingested through L2 (session-scoped) → the attacker's 
   p = 2e-13. Correction to §20.17's wording: "zero held-out effects for a declining user" is a count; against the
   shipped configuration's 3 it is not a significant difference on its own.
 - L2 intervals / AUROC / precision for the t9 TEST rows: computed after the end-to-end runner frees the machine (§21.2).
+- **Derived metrics, no re-runs (added 2026-11-07 22:10; user: "i dont wanna run any more tests again ... calculate
+  others from the previous values ... if we need more metrics like accuracy use that also").** Accuracy, balanced
+  accuracy and MCC are computed for every board row from its STORED TP / FP / FN / TN (scratch/metrics/all_layers_board.py
+  `derived`, rendered next to F1); nothing was re-run. Accuracy >= 0.92 and balanced accuracy >= 0.95 are implied by the
+  mark (recall >= 0.92 and FP <= 1.7 % give both at any class mix) and are checked; MCC depends on the class mix and
+  has no own cut-off. Fixed at the same time: the board's L1 round tables (v8-v12) judged only the lower recall and
+  NotInject FP; their verdict now checks every metric (both recall rows, all three benign FP rows, pooled precision /
+  accuracy / balanced accuracy, AUROC, latency; probe-based configurations carry the stored 4B probe-stage latency).
+  L2 the same way: the runner files' stored true / false positive / negative counts (e2e_v7_*, e2e_v8_t11_all), the
+  t9 card's stored tp / fp with its class totals; the t9 / t10 / t11 pooled lines and runner rows now carry the
+  every-metric verdict (latency included). L2 v8 production (t11, all 3,810 documents): every pooled metric met.
 
 ### 20.19 L2 v7: translated-to-English reading, and the L2 shipped defaults switched (2026-11-03)
 - **Mechanism** (`layer2_rag/translate_view.py`; pre-registered in L2_REDESIGN.md): every non-English prose segment
@@ -5833,3 +5844,212 @@ the fine-tuned stage's 256-token limit; the stage saw 3,978 TensorTrust attacks 
   2,870 ms p95 per document** (VAL ingest 620 ms: t11 has more Chinese documents with the LLM translation and long
   documents with windows). **Phase 1 (L2) closed 2026-11-07 18:47:** every metric at the mark except the three rows the user
   accepted (nl recall 0.919, translated-benign zh 4.35 % / nl 2.08 %), recorded as open.
+
+### 23.1 L1 v12 step A: audit of v11's fresh7 misses and NotInject false positives (labelled 2026-11-07 19:05-19:10)
+Rubric pre-registered in TT_REDESIGN.md §18 before any text was read; labels in scratch/rca/l1/tt50b_audit_labels.py,
+numbers in scratch/rca/l1/final/tt50b_audit_labels.json (texts stay local in tt50_audit.json).
+- **Misses (v11 on fresh7, 124 of 800; seeded sample of 40):** GENUINE **26 / 40 = 0.65** (Wilson 95 % 0.50-0.78; ~81
+  of 124), NOT-INJ **8 / 40 = 0.20** (0.11-0.35; ~25), OBFUSC **5 / 40 = 0.125** (0.05-0.26; ~16), OTHER 1 / 40,
+  TRUNC **0** (mechanical: 0 of all 124 misses exceed 256 tokens; miss median 13 tokens vs 21 for detected attacks).
+- **Inside GENUINE (descriptive, not pre-registered):** 8 direct (say / reveal / replace the instructions), 10 indirect
+  (a question, a story, a translation or a false "already authorised" premise that elicits "Access Granted"), 8
+  context-dependent extraction requests ("summarise / translate / repeat the above") that are only attacks because the
+  defence prompt sits above them -- the same words are an everyday request in a normal chat.
+- **NotInject false positives (6):** TRIGGER 5 (benign questions with injection vocabulary), BORDER 1 (asks the assistant
+  to disregard content); all 6 fired through arm A (shipped tiers, not held by AUTH); one of them also crossed the
+  score threshold, by 0.001.
+- **Ceiling:** with NOT-INJ removed, the best attainable recall on the raw fresh labels is **0.969** (0.946-0.984), so
+  0.92 is attainable in principle; v11's recall on real injections only is 0.872 (0.859-0.893).
+- **Fix map (pre-registered):** GENUINE -> more and harder TensorTrust training data (v12's 10,732-text pool, ~2.7x
+  v11's); OBFUSC -> normalised views in training; TRUNC -> none needed on fresh splits (the 512 head + tail stays as
+  cheap insurance); NOT-INJ -> a benchmark-label limit, reported. The false positives come from arm A (5 of 6 only
+  from arm A), so they move mainly with the AUTH soft-tier rule, not with the new stages. Nothing here changes a threshold.
+
+### 23.2 L1 v12 steps E and F: pre-registration (2026-11-07 19:12, before any v12 checkpoint number is read)
+- **E, latency cascade (flag-free rule change, decided on VAL):** for a user text, arm A runs as shipped; then the
+  fine-tuned stage (z_FT) and ProtectAI (for z_S1); the 4B local read (ENS3 + D24) runs only when it can change the
+  decision. Skipped exactly when (i) z_FT > tau (flagged either way) or (ii) arm A fired on a hard Tier-1 reason (not
+  soft, so AUTH cannot hold it). Skipped approximately when (iii) arm A did not fire and z_FT < b_skip. b_skip is the
+  largest value that gives decisions IDENTICAL to the full rule on VAL (fresh7) and on all three CAL pools; ties of
+  the rule are broken toward running the local read. If tt53 keeps the learned stack, (i) is dropped (no exact
+  bound) and b_skip is chosen the same way on the stack. Reported on TEST from the same single fresh8 read: decision
+  mismatches vs the full rule, the share of texts that need the local read, latency.
+- **E, early exit:** the local read stops after decoder layer 24 (the deepest ENS3 / D24 layer of 36), as L2's D2.
+  Adopted only with 0 decision mismatches and max |z| difference <= 1e-3 on 300 VAL texts (live parity).
+- **F, production path:** flag `L1_STACK_V12` (default off) in layer1.py, user text only, applied to the final arm-A
+  score: hold below WARN when arm A fired, no hard Tier-1 reason, and z_S1 < 2.5 (AUTH); lift to WARN when the v12
+  score > tau. It supersedes the single-probe lift (L1_LLM_PROBE) when both are on. Thresholds and z-statistics in
+  sentinel/core/artifacts/l1_stack_v12.json; the fine-tuned weights stay outside git (~/.cache/sentinel/l1-ft-v12).
+  Real runner (no hosted calls) on fresh8 + NotInject 339 + Alpaca eval 500 + DIDA benign 53 after tt54: a report
+  of the production path; its decisions must match tt54's per text (any mismatch is investigated before reporting).
+  Default on only if the real runner reproduces tt54 and tt54's v12 meets the mark on every row (recall >= 0.92 on
+  hijacking and extraction, FP near ~1.7 %); otherwise it stays off and the gap is the open item.
+- **Paused at the user's request (2026-11-07 19:39).** The ProtectAI-base fine-tune (tt52) was stopped after its first checkpoint:
+  epoch 0.5 after 32.9 min, VAL hijacking 0.794 / extraction 0.713 (mean 0.754, below v10's 0.804 on the same VAL),
+  every CAL group within v10 + 0.5 point, shared tau 6.15 (v10: max-of-z over S1 / D24 only); log kept as
+  scratch/rca/l1/final/tt52_protectai_partial_20261107_1938.log. Not a result: one half-trained checkpoint. On resume the
+  fine-tune restarts from scratch (no optimizer state is saved); both bases then run as pre-registered.
+- **Resumed 2026-11-07 21:12** (user: "continue"); tt52 restarted from scratch, the killed run's weights moved aside
+  (head/ft_v12_protectai_killed_1938, not a result).
+- **D amendment (pre-registered 2026-11-07 21:16, before any combiner number exists and before the restarted fine-tune's
+  first checkpoint).** A review of tt53 before its first run found that 4,899 of the 5,379 spent TensorTrust attacks
+  the stack was to be fitted on are in the v12 fine-tune's training pool (train_tt_v12), and its 6,000 DEV negatives
+  are drawn from the same 19,973 as the fine-tune's 14,000. A stack fitted on them sees the fine-tuned stage separate
+  its own training texts and over-weights it, so D would not be a fair test. Changes: (1) the stack is fitted only on
+  texts the fine-tuned stage never saw: the spent attacks with no exact or near duplicate (tt51's test: normalised
+  match or 5-shingle Jaccard >= 0.5) in train_tt_v12, and the DEV negatives in neither the fine-tune's 14,000 (tt52,
+  seed 52) nor D24's 14,000 (tt46, seed 46). D24 still saw most of those attacks and ENS3 saw DEV v4 negatives; that
+  residual bias can only lower the stack's VAL result, never the TEST read. (2) A second challenger with no fitted
+  weights: the mean (z_ens3 + z_D24 + z_FT) / sqrt(3). Under max-of-z the component with the heaviest benign CAL tail
+  sets the shared threshold (the killed run's epoch-0.5 checkpoint: tau 6.15), and an average dilutes a tail that only
+  one component carries. Both challengers use the same rule (AUTH hold, CAL conformal tau). Kept = the best VAL mean
+  among the challengers whose every CAL group is <= the max rule's rate + 0.5 point, and only if it beats the max rule
+  on VAL; otherwise the max rule. For either linear rule the cascade drops shortcut (i). In production both are the
+  existing `stack` combine (weights + bias over [z_ens3, z_D24, z_FT]); no code path changes. Reported as diagnostics
+  only (never used to select): each component alone inside the same rule at its own CAL tau.
+  Fit-set sizes (dry count 21:20, no model): 110 of the 4,778 unique spent attacks have no exact or near duplicate
+  in train_tt_v12 (66 TensorTrust extraction benchmark, 44 hijacking benchmark; none from fresh .. fresh6), and 1,819
+  of the 19,973 DEV negatives are in neither sample. Small for a 4-parameter fit: the unfitted mean is the check on it.
+- **TEST gate (pre-registered 2026-11-07 21:44, before any tt53 number; the restarted fine-tune's epoch-0.5 checkpoint
+  had VAL mean 0.681, tau 5.52).** fresh8 is the last untouched TensorTrust split, so it is read only if tt53's selected
+  v12 beats v11 on the same VAL (fresh7: v11 hijacking 0.846 / extraction 0.8433, mean 0.8447, tt49_v11_test.json) with
+  every CAL group <= v10 + 0.5 point. Otherwise fresh8 stays unread, v12 is logged as not adopted, and the RCA follows
+  (stop-and-fix) with fresh8 kept for the fixed candidate. Script: scratch/rca/l1/tt53b_gate.py -> final/tt53b_gate.json.
+  Diagnostics added to tt53 at the same time (never used to select): per rule, the CAL group that binds tau and, for
+  the max rule, the component carrying the binding benign text. Reason: the conformal tau at alpha 0.01 is the k-th
+  order statistic, k = ceil((n + 1) * 0.99): the MAXIMUM of the 191 synthetic trigger texts, the 2nd highest of the 200
+  OASST trigger texts, the 3rd highest of the 300 Alpaca texts, so one benign outlier on any component sets the shared tau.
+- **Adoption rule made explicit for EVERY metric (2026-11-07 21:54, user: "every metric should meet the threshold we
+  set"; before any v12 number).** The F rule above named recall and FP only. v12 is adopted (L1_STACK_V12 default on)
+  only if, on the untouched rows, ALL of the board's thresholds (scratch/metrics/render_board.py) pass: recall >= 0.92
+  on hijacking AND extraction; FP <= ~1.7 % on NotInject, Alpaca eval AND DIDA benign; pooled precision >= 0.90;
+  AUROC >= 0.90; whole-L1 latency through the real runner mean <= 1 s per text (tt57; p95 reported). F1 / AUPRC and
+  every Wilson interval are reported with the rest. Any single failing metric -> not adopted, logged, stop-and-fix.
+  Added 22:10 (derived from the counts, no re-run): pooled accuracy >= 0.92 and balanced accuracy >= 0.95; MCC reported.
+- **Engineering notes during tt52 (2026-11-07 22:34).** (1) Speed: ProtectAI's second half epoch took 51 min vs 28 for
+  the first: after the epoch-0.5 checkpoint scoring ~2.5 GB of GPU memory spilled into shared system RAM (235 MB of
+  7.9 GB free). tt52 now releases the CUDA cache after each checkpoint (no computation changes); this applies from the
+  PIGuard run on, the running ProtectAI process keeps its old code. (2) Run-to-run spread: the killed and the restarted
+  ProtectAI runs (same seeds, same data) scored VAL mean 0.754 and 0.681 at epoch 0.5. GPU / fp16 non-determinism moves
+  a checkpoint by several points, so a single run per base is weak evidence for the base comparison; recorded for the RCA.
+- **tt52 checkpoints so far (VAL = fresh7; every CAL group within v10 + 0.5 point at every checkpoint).** ProtectAI
+  (complete, final/tt52_protectai.json): epoch 0.5 hij 0.726 / ext 0.637 (mean 0.681, tau 5.52); **1.0: 0.830 / 0.803
+  (0.817, tau 3.89) = selected**; 1.5: 0.808 / 0.750 (0.779, tau 3.88); 2.0: 0.800 / 0.727 (0.763, tau 4.40) -- peaks
+  at one epoch, then overfits (as v11). PIGuard (run stopped at the pause, NOT a result): epoch 0.5 0.846 / 0.817
+  (0.831, tau 3.42); 1.0 0.858 / 0.870 (0.864, tau 3.29), the first checkpoint above v11 (0.8447) on VAL; its lighter
+  benign tail (lower tau at every stage) fits the RCA hypothesis that the fine-tuned stage's trigger-word benign tail
+  sets the shared threshold. Still below the mark (0.92).
+- **Paused at the user's request (2026-11-08 01:04).** tt52_piguard stopped after its epoch-1.0 checkpoint (22.5 min per
+  half epoch with the cache fix). Log kept (final/tt52_piguard_partial_20261108_0104.log); weights moved aside
+  (head/ft_v12_piguard_killed_0104), not a result. On resume PIGuard restarts from scratch (~1.5 h) as pre-registered,
+  then chain16 (tests, D, gate, the one fresh8 read, export, parity, runner, tt57).
+- **Resumed 2026-11-08 02:47** (user: "continue"). Before the PIGuard restart tt52 was made resumable at half-epoch
+  boundaries (no computation changes): after every checkpoint it saves the model / head, optimizer, scheduler, grad
+  scaler, python + torch RNG states, the epoch's data order and the checkpoint log (atomic write,
+  head/resume_v12_<base>.pt, deleted when the run completes); the best weights are written after that state, and a
+  resumed run re-writes them if a kill fell between the two saves. A further pause now costs at most one half epoch.
+- **Next-round TEST data, built first (rule fixed 2026-11-08 before 02:53, the STATUS time of the build, before any v13 design or number).** After the one
+  fresh8 read no untouched TensorTrust split is left outside the v12 training pool (train_tt_v12 holds every remaining
+  raw-dump success). scratch/rca/l1/tt58_fresh9.py carves **tensortrust_fresh9** out of that pool by tt15's v5+ rule
+  (kind recovered from raw dump v2 as tt51 built the pool; >= 5 words; normalised match or word 5-gram Jaccard >= 0.5
+  against both benchmarks, fresh .. fresh8 and the texts already picked; seed 9; 500 hijack-type + 300 extraction-type)
+  and writes head/train_tt_v13.json = the pool minus fresh9 minus every near-duplicate of a fresh9 text. fresh9 is
+  read by no detector until the next round's single TEST read; it can never test a configuration containing the v12
+  fine-tuned stage (trained on it).
+  Built 02:53 (final/tt58_fresh9.log): 500 + 300 picked from 8,381 candidates (2,812 skipped as near-duplicates of an
+  earlier set or of a pick); train_tt_v13 = 9,846 attacks (5,916 hijack-type / 3,930 extraction-type; 886 removed).
+
+### 23.3 L1 v12 round: selection, D, the gate and the one fresh8 TEST read (2026-11-08 04:20-04:28)
+**Selection (VAL = fresh7; final/tt52_*.json).** ProtectAI base: best epoch 1.0, hij 0.830 / ext 0.803 (mean 0.817).
+PIGuard base (restarted run): 0.5 -> 0.826, 1.0 -> 0.843, 1.5 -> 0.821, **2.0 -> 0.856 / 0.860 (0.858, tau 4.08)
+selected** (every CAL group within v10 + 0.5 point at every checkpoint). **D (final/tt53_combiner.json):** max
+0.858 (reproduces tt52 exactly) > held-out stack 0.853 (tau 5.22) > mean 0.839 (tau 5.20) -> **max kept**. Diagnostics:
+fine-tuned stage alone 0.839 (tau 4.08), S1 alone 0.778 (3.20), D24 alone 0.752 (2.98). Every rule's tau is bound by
+the synthetic trigger CAL group (192 texts: its maximum), and for the max rule the binding benign text is carried by
+z_FT: the shared tau equals the fine-tuned stage's own (4.08), so S1 / D24 run at 4.08 instead of ~3. Cascade: b_skip
+2.30, 0 mismatches on VAL / CAL, local-read share 14.6-16.3 % of VAL attacks, 18.8 % synthetic, 9.5 % OASST, 0.3 %
+Alpaca. **Gate (final/tt53b_gate.json): open** (0.858 > v11's 0.8447 on the same VAL; CAL within limits).
+**TEST, fresh8 read once (final/tt54_v12_test.json; 500 hijacking + 300 extraction, untouched until 04:26):**
+
+| configuration | hijacking recall [95 % CI] | extraction recall [95 % CI] | NotInject FP [95 % CI] | Alpaca FP | DIDA FP | P | R | F1 | acc / bal acc | MCC | AUROC / AUPRC |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| shipped arm A | 0.436 [0.393, 0.480] | 0.427 [0.372, 0.483] | 3.24 % [1.82, 5.72] | 0.20 % | 0 % | 0.967 | 0.433 | 0.598 | 0.725 / 0.710 | 0.512 | -- |
+| v11 | 0.812 [0.775, 0.844] (406 / 500) | 0.807 [0.758, 0.847] (242 / 300) | 1.77 % [0.81, 3.81] (6) | 0 % | 0 % | 0.991 | 0.810 | 0.891 | 0.907 / 0.902 | 0.824 | 0.988 / 0.989 |
+| **v12** (PIGuard fine-tune, max rule) | **0.824** [0.788, 0.855] (412) | **0.850** [0.805, 0.886] (255) | **3.54 %** [2.04, 6.08] (12) | 0 % | 0 % | 0.982 | 0.834 | 0.902 | 0.914 / 0.910 | 0.836 | 0.988 / 0.988 |
+| v12 + cascade (production rule) | identical decisions (0 mismatches on every row) | | | | | | | | | | |
+
+Cascade on TEST: the 4B read ran for 17.6 % / 17.0 % of the attacks, 19.8 % of NotInject, 1.2 % of Alpaca, 0 % of DIDA.
+**Verdict: NOT adopted** (tt54 verdict lists every failing metric): hijacking 0.824 and extraction 0.850 < 0.92; NotInject
+FP 3.54 % > 1.7 %; accuracy 0.914 < 0.92; balanced accuracy 0.910 < 0.95. Precision 0.982, AUROC 0.988, Alpaca / DIDA
+FP meet the mark. v12 adds recall (+1.2 / +4.3 points over v11) but doubles NotInject false positives (6 -> 12) while
+CAL predicted no change; both versions lose 2-3.5 points from fresh7 to fresh8.
+**Cause (stop-and-fix log):** (1) the threshold is one benign text: the synthetic CAL group's maximum, carried by the
+fine-tuned stage, so the stage's trigger-word benign tail caps every component's recall; (2) that same over-defense
+reaches NotInject (trigger words the small CAL pools do not cover): CAL -> TEST shift on the benign side; (3) selection
+on one run per base is noisy (identical-seed runs differ by 2-7 points). NotInject is the benign TEST row of every
+round, so its false-positive texts are NOT read for the RCA (that would be tuning on test); the over-defense is measured
+on DEV-side trigger-word texts instead. Next: the v13 round (draft scratch/rca/l1/V13_DRAFT.md: PIGuard fine-tune with
+DEV-side trigger-word hard negatives, two seeds, <= 1.5 epochs; VAL = fresh8 (now spent), TEST = fresh9). The real-runner
+report of the v12 production path (F) follows below when tt57 lands.
+**F, the production path through the real runner (2026-11-08 04:30-05:56; final/tt57_runner_v12.json; flags
+L1_STACK_V12 + cascade + early exit, which tt56 adopted: 0 mismatches and 0.0 max |z| difference on 300 VAL texts, stack
+213 -> 181 ms mean):** fresh8 only (the report was cut there: v12 is not adopted, and the three benign runners would add
+~1.5 h). **Parity with the TEST read: 0 arm-A and 0 stack mismatches on all 800 texts** (production = offline decisions).
+Recall 0.824 / 0.850 as tt54. **Latency OFF: whole L1 6,363 ms mean / 6,212 p50 / 8,706 p95 per text**; the v12 stage
+alone 368 ms mean / 887 ms p95 (17.4 % of texts needed the 4B read). Cause: with the 4B model configured, "auto"
+placement moves arm A's guard, ProtectAI and the separate harm head (Qwen3Guard-0.6B, fp32 ~2.4 GB) to the CPU on this
+4 GB card, and the machine pages (147 MB of 8 GB RAM free). The shipped arm A alone ran at 419 ms mean with the GPU
+placement (chain15). Open item for every L1 candidate: the whole-L1 latency (the stage itself fits the budget).
+(A handoff kill at 05:56 made the NotInject runner report "ok" through the Git Bash env wrapper; no runner finished and
+no result file was written; the false .done marker was removed: final/STATUS 05:56.)
+
+### 23.4 L1 v13 round: pre-registration (2026-11-08 04:33, before any v13 number exists)
+**Why (§23.3 RCA):** the shared tau is the synthetic trigger CAL group's maximum, carried by the fine-tuned stage; the
+same over-defense doubled NotInject false positives on TEST; one run per base is noisy. Research: hard-negative
+augmentation reduces over-defense where recalibration does not (PIDS-Bench); PIGuard's gain is anti-over-defense
+training and PIGuard beat ProtectAI at every v12 checkpoint.
+- **Data roles.** TEST = **tensortrust_fresh9** (built 02:53 from the v12 pool, untouched; §23.2) + NotInject 339 +
+  Alpaca eval 500 + DIDA benign 53, read ONCE. VAL = **fresh8** (spent by the v12 TEST read) for selection; fresh7
+  reported as a diagnostic only. CAL = the same three pools as v10-v12 (unchanged, so the v12 numbers stay comparable).
+  TRAIN: head/train_tt_v13.json (9,846 TensorTrust attacks: fresh9 and its near-duplicates removed) + 6,000 DEV
+  positives + 14,000 DEV negatives + **trigger-word hard negatives (DEV side only)**: (a) benign messages generated by
+  the LOCAL Qwen3-4B-Instruct-2507 with the published NotInject method and this project's trigger list / prompts
+  (scratch/rca/l1/tt59_gen_benign.py; 320 prompts x 8; exact duplicates and anything within cosine 0.90 of ANY
+  evaluation benign or CAL text dropped; NotInject's list never consulted, no NotInject sample shown); (b) OASST2
+  trigger candidates rows 200+ (432; CAL uses rows 0-199); (c) Alpaca pseudo-train partition (md5 % 100 >= 20, never
+  evaluated) with trigger vocabulary (440).
+- **Fine-tuned stage v13** (tt52_finetune_v12.py --v13 --seed 0 / 1): PIGuard base, 512-token head + tail, lr 1.5e-5,
+  2 epochs, batch 8 x 2, checkpoints every half epoch, two seeds (data-order / DEV-sample / dropout seeds 60 and 61).
+  Per seed: selected = best VAL (fresh8) mean recall among checkpoints whose every CAL group <= v10 + 0.5 point.
+- **Rule:** (A AND NOT (soft AND z_S1 < 2.5)) OR max(z_S1, z_D24, z_FT) > tau (the max rule kept by v12's D), tau = CAL
+  conformal alpha 0.01, max over the three groups. z_FT = the better seed's, or the two-seed mean of CAL-standardised
+  z only if it beats the better seed by >= 1 point of VAL mean (it doubles the stage's GPU memory and time).
+- **Gate:** fresh9 is read only if the selected v13 beats v12's fresh8 result (hijacking 0.824 / extraction 0.850,
+  mean 0.837, tt54) on VAL with every CAL group within v10 + 0.5 point; otherwise fresh9 stays unread.
+- **TEST read (once):** arm A (shipped), v11 (its stage never saw fresh9) and v13; v12 cannot be read on fresh9 (its
+  stage trained on those texts). Every metric with the every-metric verdict (§23.2). Then the production path through
+  the real runner (parity + latency). Adopted only if every metric of every row passes (§23.2, 21:54 / 22:10 rules).
+
+### 23.5 L1H harm head v2 on the local 4B model (workstream G): pre-registration (2026-11-08 08:42, before any number)
+**Why:** the shipped harm head (Qwen3Guard-Gen-0.6B, separate, on by default) is OFF on its own rows (WildJailbreak
+recall 0.738 / FP 4.29 %, OR-Bench-Hard over-refusal 38.82 %, slow 1.2-2.8 s) and, with the 4B model on the 4 GB card,
+it runs on the CPU (~2.4 GB fp32), the main cause of the 6.4 s whole-L1 latency (§23.3 F).
+- **Signal:** a linear readout of harmful intent from the local 4B model's last-token hidden states under the L1 judge
+  template: the SAME forward pass the injection stack makes (early exit after layer 24), so no second model is loaded.
+- **Data (built 08:28-08:41, blind to every detector; scratch/rca/l1h/h01_harm_data.py -> data_v1.json):** WildGuardMix
+  train + OR-Bench-80k + OR-Bench-toxic, de-duplicated, and anything within normalised match / word 5-gram Jaccard
+  >= 0.5 / MiniLM cosine >= 0.90 of ANY evaluation text (WildJailbreak, OR-Bench-Hard, Alpaca 500 / 2,000, NotInject,
+  DIDA) or L1 CAL text removed (146). TRAIN 23,100 (harmful: 6,500 adversarial, 4,000 vanilla, 600 OR-Bench-toxic;
+  benign: 4,000 adversarial-benign, 4,000 vanilla, 4,000 OR-Bench-80k). VAL 2,500 (1,000 adversarial harmful, 500
+  vanilla harmful, 500 adversarial benign, 500 OR-Bench-80k). CAL: cal_overrefusal 1,000 (OR-Bench-80k) + cal_adv_benign
+  1,000 (WildGuardMix adversarial unharmful) + the L1 CAL pools (Alpaca 300, synthetic trigger 192, OASST trigger 200).
+- **Candidates (fitted on TRAIN on the GPU):** class-balanced logistic probes on layer 16, 20, 24 and the concatenation
+  16+20+24, C in {0.01, 0.05, 0.2}. **Threshold:** CAL conformal alpha 0.01, max over the five groups. **Selection:**
+  best VAL harmful recall (adversarial + vanilla, pooled) at that threshold; VAL benign FP reported.
+- **Gate:** TEST is read only if the selected probe's VAL harmful recall beats the shipped head's on the same VAL at the
+  shipped head's own WARN threshold (scored once on VAL).
+- **TEST (read once):** WildJailbreak 2,210 (2,000 adversarial harmful + 210 adversarial benign), OR-Bench-Hard 1,319,
+  Alpaca 2,000, NotInject 339; every metric with the every-metric verdict, then latency through the real runner with
+  the readout served from the injection stack's 4B pass. Adopted (replacing the Qwen3Guard head) only if every metric
+  of every L1H row passes; the shipped head's stored numbers are the baseline (no re-run).
+

@@ -1617,6 +1617,16 @@ L1_LLM_PROBE_TAU = float(os.environ["L1_LLM_PROBE_TAU"]) if os.getenv("L1_LLM_PR
 L1_LOCAL_LLM_MODEL = os.getenv("L1_LOCAL_LLM_MODEL", "Qwen/Qwen3-4B-Instruct-2507")
 # A pre-quantized (NF4) copy of that model, written by scratch/rca/l1/tt22_prequantize.py; used when present.
 L1_LOCAL_LLM_DIR = os.getenv("L1_LOCAL_LLM_DIR", "~/.cache/sentinel/qwen3-4b-instruct-2507-nf4")
+# L1 v12 stack (sentinel/layers/layer1_stack.py; scratch/rca/l1/TT_REDESIGN.md §18, results.md §23): for USER text, after
+# the shipped tiers, a fine-tuned DeBERTa-v3 stage + the local 4B read (ENS3 + a layer-24 domain probe) + ProtectAI v2:
+# AUTH hold (arm A fired, no hard Tier-1 reason, z_S1 < 2.5 -> below WARN) and a lift to WARN when max(z) > tau (CAL
+# conformal, alpha 0.01). Artifact core/artifacts/l1_stack_v12.json; weights outside git (L1_FT_V12_DIR). OFF until measured.
+L1_STACK_V12 = os.getenv("L1_STACK_V12", "false").lower() == "true"
+L1_FT_V12_DIR = os.getenv("L1_FT_V12_DIR", "~/.cache/sentinel/l1-ft-v12")
+# step E: the 4B read only when it can change the decision (b_skip chosen on VAL: identical VAL / CAL decisions)
+L1_STACK_CASCADE = os.getenv("L1_STACK_CASCADE", "true").lower() == "true"
+# step E: the 4B read stops after the deepest probe layer (24 of 36); adopted only after live parity (0 mismatches)
+L1_STACK_EARLY_EXIT = os.getenv("L1_STACK_EARLY_EXIT", "false").lower() == "true"
 # v8 L6 Answer-Provenance Guard (sentinel/layers/layer6_answer): off | report | enforce. Traces links / addresses /
 # reader-directed instructions in the assistant's reply to their source (scratch/rca/v7/LAYERS_V8.md). OFF.
 L6_ANSWER_GUARD = os.getenv("L6_ANSWER_GUARD", "off").strip().lower()

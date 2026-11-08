@@ -41,6 +41,7 @@ def local_model_configured() -> bool:
         return False
     return (str(getattr(cfg, "L2_LOCAL_DETECTOR", "off")).lower() != "off"
             or bool(getattr(cfg, "L1_LOCAL_JUDGE", False)) or bool(getattr(cfg, "L1_LLM_PROBE", False))
+            or bool(getattr(cfg, "L1_STACK_V12", False))
             or str(getattr(cfg, "L4_AUTHZ_CONTRACT", "")).lower() == "local"
             or bool(getattr(cfg, "L4_ALIGNMENT_LOCAL", False)))
 

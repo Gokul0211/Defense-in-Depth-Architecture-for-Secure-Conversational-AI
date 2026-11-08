@@ -1754,6 +1754,19 @@ def _load_tensortrust_fresh8(split: str = "test", limit: int | None = None, cach
     return cached
 
 
+def _load_tensortrust_fresh9(split: str = "test", limit: int | None = None, cache: bool = True) -> EvalDataset:
+    """Cache-only: scratch/rca/l1/tt58_fresh9.py (2026-11-08): carved out of the v12 training pool by tt15's v5+ rule
+    (>= 5 words; near-duplicate filtered vs both benchmarks and fresh .. fresh8); the next pool excludes it and its
+    near-duplicates. TEST for the round after v12; never valid for a configuration that contains the v12 fine-tune."""
+    cached = _load_from_cache_capped("tensortrust_fresh9", split, limit)
+    if cached is None:
+        raise FileNotFoundError("tensortrust_fresh9 is built by scratch/rca/l1/tt58_fresh9.py")
+    return cached
+
+
+_REGISTRY["tensortrust_fresh9"] = {
+    "loader": "_load_tensortrust_fresh9", "layer": "L1", "hf_path": "qxcv/tensor-trust", "license": "MIT",
+    "description": "Ninth fresh TensorTrust set, carved out of the v12 pool (>= 5 words, near-dup filtered vs all earlier)"}
 _REGISTRY["tensortrust_fresh8"] = {
     "loader": "_load_tensortrust_fresh8", "layer": "L1", "hf_path": "qxcv/tensor-trust", "license": "MIT",
     "description": "Eighth fresh TensorTrust set (raw dump v2), single-defender >= 5 words, near-duplicate filtered vs all earlier"}

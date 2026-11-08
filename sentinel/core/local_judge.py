@@ -161,23 +161,43 @@ class LocalJudge:
             ids = ids[:h] + self._ids(" ... ") + ids[-h:]
         return ids + self.suf
 
-    def read(self, text: str) -> dict:
+    def read(self, text: str, stop_after_layer: int | None = None, hidden_layers: tuple = ()) -> dict:
+        """One reading under the L1 judge policy. stop_after_layer=L (L1 v12 step E, config.L1_STACK_EARLY_EXIT): the
+        forward pass stops right after decoder layer L, as read_template's (the probe values are identical by
+        construction; p_yes / log_odds / answer_mass are then None). hidden_layers: the captured last-token vectors of
+        these (hooked) layers are returned under res["hidden"] (the v12 domain probe reads layer 24)."""
         torch = self.torch
         body = self._body(text)
         n0 = len(self.pre)
         x = torch.tensor([body], device="cuda:0")
         pos = torch.arange(n0, n0 + len(body), device="cuda:0")[None]
         self._captured = {}
+        stop_handle, out = None, None
+        if stop_after_layer is not None:
+            def _stop(m, i, o):
+                raise _StopForward()
+            # registered AFTER the capture hooks, so on layer L the capture runs first, then the stop
+            stop_handle = self.model.model.layers[stop_after_layer - 1].register_forward_hook(_stop)
         try:
             with torch.no_grad():
                 out = self.model(input_ids=x, past_key_values=self.cache, use_cache=True, position_ids=pos,
                                  cache_position=pos[0], logits_to_keep=1)
+        except _StopForward:
+            out = None
         finally:
+            if stop_handle is not None:
+                stop_handle.remove()
             self.cache.crop(n0)
-        lp = torch.log_softmax(out.logits[0, -1].float(), -1)
-        ly, ln = torch.logsumexp(lp[self.yes], 0), torch.logsumexp(lp[self.no], 0)
-        res = {"p_yes": float(torch.sigmoid(ly - ln)), "log_odds": float(ly - ln),
-               "answer_mass": float(torch.exp(ly) + torch.exp(ln)), "probe": None}
+        if out is None:
+            res = {"p_yes": None, "log_odds": None, "answer_mass": None, "probe": None,
+                   "stopped_after_layer": stop_after_layer}
+        else:
+            lp = torch.log_softmax(out.logits[0, -1].float(), -1)
+            ly, ln = torch.logsumexp(lp[self.yes], 0), torch.logsumexp(lp[self.no], 0)
+            res = {"p_yes": float(torch.sigmoid(ly - ln)), "log_odds": float(ly - ln),
+                   "answer_mass": float(torch.exp(ly) + torch.exp(ln)), "probe": None}
+        if hidden_layers:
+            res["hidden"] = {L: self._captured[L] for L in hidden_layers if L in self._captured}
         if self.probe is not None:
             sc = probe_score(self.probe, self._captured)
             if sc is not None:
@@ -299,14 +319,15 @@ def get_local_judge():
     return _singleton
 
 
-def local_judge_read(text: str) -> dict | None:
-    """{p_yes, log_odds, answer_mass, probe} for one text, or None when the local judge cannot run."""
+def local_judge_read(text: str, **kw) -> dict | None:
+    """{p_yes, log_odds, answer_mass, probe} for one text, or None when the local judge cannot run. kw:
+    stop_after_layer / hidden_layers (LocalJudge.read)."""
     j = get_local_judge()
     if j is None:
         return None
     try:
         with _lock:
-            return j.read(text)
+            return j.read(text, **kw)
     except Exception as e:                                  # noqa: BLE001
         logger.warning(f"local injection judge failed on one input: {e}")
         try:

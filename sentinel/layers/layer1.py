@@ -854,6 +854,10 @@ async def layer1_check(text: str, harm_head: bool = True, source: str = "user") 
     result = await _layer1_injection_check(text, source=source, anomaly=anomaly)
     result.anomaly = anomaly
     import sentinel.config as cfg
+    if getattr(cfg, "L1_STACK_V12", False) and source == "user":
+        # L1 v12 (layer1_stack.py; results.md §23): AUTH hold / lift on the final arm-A score, user text only
+        from sentinel.layers.layer1_stack import apply_stack
+        apply_stack(result, text)
     if harm_head and getattr(cfg, "L1_HARM_HEAD", "off") == "separate":
         result.harm_score, result.harm_source = await _harm_head(text)
         # RCA 2 F-H1: name the category of a flagged request, so the alert can be routed (or thresholded)
@@ -971,7 +975,7 @@ async def _layer1_injection_check(text: str, source: str = "user", anomaly: dict
     # fp16 checkpoint through system RAM; doing that after Prompt Guard / PIGuard are resident on an 8 GB machine
     # crashed one run (exit 139, 2026-10-30). Load order only; no decision changes.
     import sentinel.config as _cfg0
-    if getattr(_cfg0, "L1_LLM_PROBE", False) and source == "user":
+    if (getattr(_cfg0, "L1_LLM_PROBE", False) or getattr(_cfg0, "L1_STACK_V12", False)) and source == "user":
         from sentinel.core.local_judge import get_local_judge
         get_local_judge()
 
@@ -1170,7 +1174,7 @@ async def _layer1_injection_check(text: str, source: str = "user", anomaly: dict
     # on, may still raise it). Run only below WARN (above it the input is already flagged) and only on USER text: the
     # threshold was calibrated on user prompts, not on tool outputs or documents (their distribution is not covered).
     import sentinel.config as _cfgp
-    if (getattr(_cfgp, "L1_LLM_PROBE", False) and source == "user"
+    if (getattr(_cfgp, "L1_LLM_PROBE", False) and source == "user" and not getattr(_cfgp, "L1_STACK_V12", False)
             and combined_sim < _cfgp.l1_warn_threshold()):
         from sentinel.core.local_judge import local_judge_read
         lj = local_judge_read(text)
