@@ -1,29 +1,30 @@
 {
- "version": "v12",
- "created": "2026-11-08 04:28",
+ "version": "v15",
+ "created": "2026-11-08 15:59",
  "ens3_probe_md5": "56a5d823bcf8968c60f97466e0044f3f",
  "combine": "max",
  "rule": "max",
- "tau": 4.082516193389893,
+ "tau": 5.430551052093506,
  "t_auth": 2.5,
+ "t_auth2": 1.0,
  "w_protectai": 0.25,
  "pai_mu": -8.90116693885709,
  "pai_sd": 8.539548003084878,
  "stack": null,
  "ft": {
   "base": "piguard",
-  "zmu": -6.721294403076172,
-  "zsd": 3.493988275527954,
+  "zmu": -8.275699615478516,
+  "zsd": 2.6226613521575928,
   "maxlen": 512,
-  "epoch": 2.0
+  "epoch": 1.5,
+  "seed": 61
  },
  "d24_file": "l1_d24_probe.npz",
  "deepest_layer": 24,
- "b_skip": 2.303022623062134,
+ "b_skip": 5.430551052093506,
  "provenance": {
-  "fine_tune": "scratch/rca/l1/tt52_finetune_v12.py (piguard)",
-  "combiner": "tt53_combiner.py",
-  "test": "tt54_v12_test.py (tensortrust_fresh8, read once)",
-  "doc": "results.md \u00a723"
+  "fine_tune": "scratch/rca/l1/tt52_finetune_v12.py piguard --v15 --seed 1 --adam8 --halves 3",
+  "selection_and_test": "tt67_v14_test.py --v15 (VAL fresh8; tensortrust_fresh10 read once)",
+  "doc": "results.md \u00a723.11"
  }
 }

@@ -164,6 +164,10 @@ class Leaf:
                            # each "Label: value" line's value) -- never a substring of them
     direct: bool = True    # T2 content leaves: the user typed this read's locator (False: named one hop away,
                            # through another document -- L4_NAMED_SOURCE_AUTHORITY never counts those)
+    raw: str = ""          # content leaves: the value as received (line breaks kept), for L6's structured span
+                           # (results.md §26.2); never used for matching here
+    seq: int = 0           # which tool output of the session produced this leaf (1, 2, ...): L6 first-seen taint
+                           # (results.md §26.4); never used for matching here
 
 
 PROSE_WORDS = 10           # a "structural" line this long is text someone wrote (a channel NAME carrying an
@@ -188,6 +192,7 @@ class Session:
     sensitive: dict = field(default_factory=dict)   # folded value -> category ("credential" / "personal")
     records: list = field(default_factory=list)     # (batch, tool, {field: folded value}) rows, for target criteria
     batches: int = 0
+    outputs: int = 0                                # tool outputs recorded so far (Leaf.seq)
 
 
 _NUM_LINE = re.compile(r"^\s*([A-Za-z][A-Za-z _\-]{0,40}?)\s*:\s*(-?\d+(?:[.,]\d+)?)\b")
@@ -408,6 +413,8 @@ def record_tool_output(session_id: str, tool: str, params: dict, output, user_te
         if len(_s.records) > _MAX_LEAVES:
             del _s.records[: len(_s.records) - _MAX_LEAVES]
     s = session(session_id)
+    s.outputs += 1
+    seq = s.outputs
     n = 0
     for fname, val, is_key, is_dval in raw:
         text = fold(str(val).replace("\r", ""))
@@ -416,8 +423,9 @@ def record_tool_output(session_id: str, tool: str, params: dict, output, user_te
         _record_sensitive(s, fname, str(val), base != T1 and not is_key)
         # structure only means something for a declared system of record: every field of any other tool is text
         content = base != T1 or (fname in CONTENT_FIELDS and not is_key) or (vals_content and is_dval)
+        _raw = str(val).replace("\r", "")
         if content:
-            s.leaves.append(Leaf(content_tier, None, tool, fname, text, False, (), direct))
+            s.leaves.append(Leaf(content_tier, None, tool, fname, text, False, (), direct, _raw, seq))
             n += 1
             continue
         role = roles.get(fname) if fname in roles else (roles.get("_value") if fname in ("_value", "_key") else None)
@@ -425,10 +433,10 @@ def record_tool_output(session_id: str, tool: str, params: dict, output, user_te
         short = tuple(a for a in atoms if len(a.split()) < PROSE_WORDS)
         prose = [a for a in atoms if len(a.split()) >= PROSE_WORDS]
         if short:
-            s.leaves.append(Leaf(base, role, tool, fname, text, True, short))
+            s.leaves.append(Leaf(base, role, tool, fname, text, True, short, seq=seq))
             n += 1
-        for a in prose:
-            s.leaves.append(Leaf(content_tier, None, tool, fname, a, False, (), direct))
+        for a in prose:                               # the whole value keeps its raw text (L6 v3, §26.2)
+            s.leaves.append(Leaf(content_tier, None, tool, fname, a, False, (), direct, _raw if a == text else "", seq))
             n += 1
     if len(s.leaves) > _MAX_LEAVES:
         del s.leaves[: len(s.leaves) - _MAX_LEAVES]

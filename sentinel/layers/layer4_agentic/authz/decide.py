@@ -288,6 +288,18 @@ def authorize(session_id: str, tool: str, params: dict, utext: str, contract=Non
                 if cls == CONTENT and "literal" in b and _shortened_from(params[p], b["literal"]):
                     continue           # the agent shortened the user's own phrase ("Hiking Trip" from "hiking trip
                                        # with Mark"); content that ADDS words still mismatches
+                _multi = not spec.get("max_calls") or spec["max_calls"] > 1        # unbounded or more than one call
+                if (getattr(cfg, "L4_CONTRACT_USER_NAMED", False) and cls != CONTENT and _multi
+                        and not matches_literal(b, params[p])):
+                    # L4 v12 (results.md §25.2): the structured contract binds ONE literal per argument, so "message
+                    # Dora and Eve" binds recipient = "Dora" and the call to Eve looked unspecified. A value the user
+                    # TYPED as a whole word in their own request is the user's authority (tier T0); with more than one
+                    # call allowed it counts as specified. Injected values come from documents (T2 / T3), never from
+                    # the user's words, so they stay caught.
+                    leaves = [str(v).strip() for v in _leaves(params[p]) if str(v).strip()]
+                    if leaves and all(len(v) >= 2 and _re.search(r"(?<!\w)" + _re.escape(v) + r"(?!\w)", utext or "", _re.I)
+                                      for v in leaves):
+                        continue
                 if not matches_literal(b, params[p]):
                     # The contract is an LLM's reading of the user's words and can be wrong in FORMAT ("read" for the
                     # schema's "r", 2026-10-21 benign replay), so a mismatch alone only asks the user. It blocks when

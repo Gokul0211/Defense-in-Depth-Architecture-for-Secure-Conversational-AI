@@ -460,8 +460,11 @@ async def proxy_completions(request: Request):
     session = await threat_bus.get_session(session_id)
     session.l2_flagged_chunks.extend(flagged)
     session.l2_flagged_chunks.extend(l2_tool_flagged)
+    from sentinel.core.data_minimizer import track_tool_output
     for t in tool_texts:
-        track_sensitive_values(session, t)
+        # a structured record is minimized against the request when L5_INFERRED_POLICY is on (results.md §24);
+        # otherwise the shipped heuristic tracking (unchanged)
+        track_tool_output(session, t, user_input)
 
     # Track candidate sensitive values (name- and identifier-shaped) seen
     # in retrieved RAG content this session — feeds L5's provenance-based
@@ -1875,7 +1878,9 @@ async def agent_tool_response(request: Request):
     # person's name, case number, or account identifier that would be a
     # leak if it showed up in unrelated output later (see
     # sensitive_value_extractor.py's module docstring).
-    track_sensitive_values(session, response_text)
+    from sentinel.core.data_minimizer import track_tool_output
+    _req = [str(t.get("content", "")) for t in (body.get("history") or []) if t.get("role") == "user"]
+    track_tool_output(session, response_text, _req[-1] if _req else "")
 
     import sentinel.config as _tcfg
     if l1_result.score >= _tcfg.l1_tool_output_block() and getattr(_tcfg, "TOOL_OUTPUT_POLICY", "withhold") == "filter":

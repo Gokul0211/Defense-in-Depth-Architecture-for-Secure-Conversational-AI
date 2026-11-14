@@ -915,6 +915,19 @@ L5_POLICY_PHRASE_MATCH = os.getenv("L5_POLICY_PHRASE_MATCH", "true").lower() == 
 # in the output; allowed-field values and values the user typed are not a leak and do not trip the PII redaction
 # either. Without a declared policy L5 is unchanged (heuristic value extraction).
 L5_FIELD_POLICY = os.getenv("L5_FIELD_POLICY", "false").lower() == "true"
+# L5 INFERRED FIELD POLICY (2026-11-11, results.md §24; off until measured). For a session WITHOUT a declared policy, the
+# local data minimizer (core/data_minimizer.py, the cached 4B model, field names only) infers which fields of a
+# retrieved record the task needs; fields with P(needed) >= L5_INFERRED_POLICY_T are allowed and every other value is
+# enforced exactly as a declared policy. A declared policy always takes precedence.
+L5_INFERRED_POLICY = os.getenv("L5_INFERRED_POLICY", "false").lower() == "true"
+L5_INFERRED_POLICY_T = float(os.getenv("L5_INFERRED_POLICY_T", "0.5"))      # selected on VAL (results.md §24)
+# L5 TASK-POLICY LIBRARY (2026-11-11, results.md §24.2): a JSON list of example tasks {request, fields, allowed} -- the
+# operator's policy declared once per task TYPE. A record's fields take the majority decision of the k most similar
+# library tasks (masked-request MiniLM similarity >= s_min); uncovered fields fall back to the data minimizer when
+# L5_INFERRED_POLICY is on, else they count as private. Empty = off. A declared per-session policy takes precedence.
+L5_POLICY_LIBRARY = os.getenv("L5_POLICY_LIBRARY", "")
+L5_POLICY_LIBRARY_K = int(os.getenv("L5_POLICY_LIBRARY_K", "3"))
+L5_POLICY_LIBRARY_SMIN = float(os.getenv("L5_POLICY_LIBRARY_SMIN", "0.7"))
 
 # Layer 4 — Decision Threshold (InjecAgent-calibrated, additive ceiling)
 # Youden's J-optimal on audit_tool_call()'s final_score once tool-response
@@ -1509,6 +1522,10 @@ L4_SINK_CONTEXT_SPAN_MAX = int(os.getenv("L4_SINK_CONTEXT_SPAN_MAX", "1200"))
 # pass per reply and has no validation corpus yet (MHJ replies are gated, RCA 2 §H).
 L5_HARM_CHECK = os.getenv("L5_HARM_CHECK", "off").strip().lower()
 L5_HARM_TAU = float(os.getenv("L5_HARM_TAU", os.getenv("L1_HARM_TAU", "0.6737")))
+# results.md §28 / §28.2: with L5_HARM_CHECK report / enforce, read the reply with the SHARED local 4B (template
+# "l5harm", artifact core/artifacts/l5_harm_local.npz, its own tau) instead of the CPU 0.6B guard. Off until a round
+# meets its gate; the artifact is exported only from an adopted round (scratch/rca/l1h/v4_06_export.py).
+L5_HARM_LOCAL = os.getenv("L5_HARM_LOCAL", "false").lower() == "true"
 # F-H1: report the guard's harm CATEGORY when the harm head fires (one extra forward, flagged prompts only).
 L1_HARM_REPORT_CATEGORY = os.getenv("L1_HARM_REPORT_CATEGORY", "true").lower() == "true"
 # RCA 2 fix validation: the ignore/override addressee cue's left edge treats "_" as a separator, so
@@ -1583,6 +1600,10 @@ L4_NAMED_SOURCE_ANCHOR = os.getenv("L4_NAMED_SOURCE_ANCHOR", "false").lower() ==
 # L4 v11 candidate (results.md §21.13): path to an OPERATOR-declared capability registry ({tool name: READ / WRITE /
 # ...}); declared tools take that capability, undeclared tools keep the name rule (unknown -> WRITE). Empty = off.
 L4_CAPABILITY_REGISTRY = os.getenv("L4_CAPABILITY_REGISTRY", "")
+# L4 v12 candidate (results.md §25.2): the structured local contract binds ONE literal per argument ("message Dora and Eve"
+# -> recipient = "Dora"); with this on, a value the user typed as a whole word in their own request counts as specified
+# for a tool the contract lets run more than once (user authority, tier T0). OFF until measured.
+L4_CONTRACT_USER_NAMED = os.getenv("L4_CONTRACT_USER_NAMED", "false").lower() == "true"
 # L4 v7 candidate (pre-registered in results.md §20.17): least privilege for the LOCAL contract -- an unrequested
 # consequential call (transfer / delete / security / execute / booking) whose tool the local selection rejected at
 # log-odds <= L4_AUTHZ_LOCAL_LP_MAX_LOG_ODDS is refused instead of confirmed. The bar is fixed on the dev benign tasks
@@ -1634,6 +1655,30 @@ L6_ANSWER_GUARD = os.getenv("L6_ANSWER_GUARD", "off").strip().lower()
 # (core/addressee.py cues). Measured offline on the live AgentDojo episodes: v1 flagged 11.8 % of benign answers
 # (legitimate links from content the user asked about); every injection text carries a cue, no benign leaf does.
 L6_ADDRESSEE_GATE = os.getenv("L6_ADDRESSEE_GATE", "true").lower() == "true"
+# L6 v3 (results.md §26 / §26.1; layer6_answer/relay_judge.py): each v2.1 finding is confirmed by the local Qwen3-4B --
+# is the copied source region written TO the AI, or ordinary document content? Kept iff P(yes) >= 0.5 (fixed); fails
+# toward flagging when the local model cannot run. OFF until measured on the fresh TEST.
+L6_RELAY_JUDGE = os.getenv("L6_RELAY_JUDGE", "false").lower() == "true"
+# L6 v3 structured span (results.md §26.2; layer6_answer/answer_guard._structured_spans): the addressed span is built
+# from the tool output's own structure (YAML / mapping units; sentence ends, line breaks, serialized escapes) instead
+# of the folded one-line text, first..last cue segment + 1 after, none before. Deterministic. ADOPTED 2026-11-13 (§26.6:
+# TEST2, 13 fresh agents: recall 0.997, FP 0.14 %, precision 0.982); acts only when L6_ANSWER_GUARD is on.
+L6_STRUCTURED_SPAN = os.getenv("L6_STRUCTURED_SPAN", "true").lower() == "true"
+# L6 v3.1 (results.md §26.4): first-seen taint -- an identifier the user did not type whose first appearance in the
+# session's tool outputs lies inside an addressed span stays a finding even when a later trusted record holds it
+# (lineage Leaf.seq). ADOPTED 2026-11-13 with the structured span (§26.6).
+L6_TAINT_FIRST_SEEN = os.getenv("L6_TAINT_FIRST_SEEN", "true").lower() == "true"
+# L6 v3.1 window: segments kept after the last cue in the structured span (v3: 1; -1 = to the end of the unit).
+L6_SPAN_AFTER = int(os.getenv("L6_SPAN_AFTER", "1"))
+# L6 v3.2 (results.md §26.7): an answer identifier counts as inside an addressed span only as a whole token (lineage
+# _bounded_in) -- fixes "informations.com" matching inside "true-informations.com". OFF until the TEST3 read.
+L6_BOUNDED_IDENT = os.getenv("L6_BOUNDED_IDENT", "false").lower() == "true"
+# L6 v3.3 (results.md §26.10): wrapper-tolerant units (spotlighting "<<" ... ">>", code fences, an embedded serialized
+# object) and nothing before the first framing cue of a unit. OFF until the TEST4 read.
+L6_SPAN_V33 = os.getenv("L6_SPAN_V33", "false").lower() == "true"
+# L6 v3.4 (results.md §26.12): an explicit closing markup tag (</information> ...) ends the injected block -- no text
+# after it and no +1 window. OFF until the TEST5 read.
+L6_SPAN_CLOSE_TAG = os.getenv("L6_SPAN_CLOSE_TAG", "false").lower() == "true"
 # v8 RCA (scratch/rca/v7/RCA_V8.md): when field-level provenance (authz lineage) places an argument in a user-typed or
 # system-of-record field, the chunk-level "copied from a flagged output" block is overridden for it (instruction-context
 # blocks are not). OFF until measured (a06).

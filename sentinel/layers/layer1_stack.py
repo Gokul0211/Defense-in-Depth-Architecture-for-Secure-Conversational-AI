@@ -198,7 +198,10 @@ def stack_decision(text: str, arm_a_fired: bool, hard_reason: bool, judge_flagge
                 score = w[0] * z_e3 + w[1] * (z_d if z_d is not None else -1e9) + w[2] * z_ft + b
             else:
                 score = max(z_s1, z_d if z_d is not None else -math.inf, z_ft)
-            held = arm_a_fired and not hard_reason and not judge_flagged and z_s1 < float(art["t_auth"])
+            # AUTH (z_S1 < t_auth) or, from v15 (results.md §23.11), AUTH2: the fine-tuned stage also reads it as benign
+            t2 = art.get("t_auth2")
+            held = (arm_a_fired and not hard_reason and not judge_flagged
+                    and (z_s1 < float(art["t_auth"]) or (t2 is not None and z_ft < float(t2))))
             fires = score > tau
             flag = (arm_a_fired and not held) or fires
             out.update(flag=flag, held=held and not fires, lifted=fires and not arm_a_fired, path="local_read",

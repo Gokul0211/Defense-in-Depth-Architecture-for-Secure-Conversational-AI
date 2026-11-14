@@ -99,3 +99,11 @@ def addressee_cues(text: str) -> tuple[int, int]:
     """(# strong cues, # weak cues) present in `text`."""
     t = match_text(text)
     return sum(bool(p.search(t)) for p in strong_patterns()), sum(bool(p.search(t)) for p in _WEAK)
+
+
+def first_cue_start(text: str) -> int | None:
+    """Character offset of the earliest addressee cue (strong or weak) in `text`, or None. Used by L6 v3.3 (results.md
+    §26.10): text before the first framing cue of an injected block is not part of the message to the AI."""
+    t = match_text(text)
+    starts = [m.start() for p in strong_patterns() + _WEAK for m in [p.search(t)] if m]
+    return min(starts) if starts else None

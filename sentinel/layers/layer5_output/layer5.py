@@ -157,7 +157,9 @@ async def layer5_scan_output(
 
     # 1. PII Scan
     import sentinel.config as _cfg5
-    _policy = bool(getattr(_cfg5, "L5_FIELD_POLICY", False)) and bool(
+    # a declared (L5_FIELD_POLICY) or inferred (L5_INFERRED_POLICY, results.md §24) field policy is in force
+    _policy = bool(getattr(_cfg5, "L5_FIELD_POLICY", False) or getattr(_cfg5, "L5_INFERRED_POLICY", False)
+                   or getattr(_cfg5, "L5_POLICY_LIBRARY", "")) and bool(
         getattr(session, "policy_private_values", None) or getattr(session, "policy_allowed_values", None))
     _exempt = _user_supplied_text(session)
     if _policy:   # values the declared policy allows are not a disclosure (results.md §21.6)
@@ -235,15 +237,29 @@ async def layer5_scan_output(
     # (MHJ: 53/110 attacks with no visible intent in the user turns) becomes observable in the reply.
     # "report" attaches the guard's P(Unsafe) of the reply (in context of the last user turn) without
     # changing any decision; "enforce" raises the score to WARN when it reaches L5_HARM_TAU.
+    # L5_HARM_LOCAL (results.md §28.2): the reply is read by the shared local 4B (harm_local.py) instead of the 0.6B
+    # guard; harm_score is then sigmoid(selected score) and the artifact's own tau decides.
     import sentinel.config as _c5
     harm_score = None
+    harm_hit = False
     mode = getattr(_c5, "L5_HARM_CHECK", "off")
     if mode in ("report", "enforce"):
-        from sentinel.core.safety_guard import safety_score_response
         user_turns = [t for t in _user_supplied_text_list(session)] if session is not None else []
-        harm_score = safety_score_response(user_turns[-1] if user_turns else "", response_text)
-        if harm_score is not None and harm_score >= getattr(_c5, "L5_HARM_TAU", 1.0):
-            reasons.append(f"Response-side harm check: P(unsafe)={harm_score:.2f}")
+        last_turn = user_turns[-1] if user_turns else ""
+        if getattr(_c5, "L5_HARM_LOCAL", False):
+            from .harm_local import local_harm_read
+            hr = local_harm_read(last_turn, response_text)
+            harm_score = None if hr is None else hr["p"]
+            harm_hit = hr is not None and hr["harmful"]
+            harm_reason = (f"Response-side harm check (local 4B): score={hr['score']:.2f} > tau={hr['tau']:.2f}"
+                           if harm_hit else "")
+        else:
+            from sentinel.core.safety_guard import safety_score_response
+            harm_score = safety_score_response(last_turn, response_text)
+            harm_hit = harm_score is not None and harm_score >= getattr(_c5, "L5_HARM_TAU", 1.0)
+            harm_reason = f"Response-side harm check: P(unsafe)={harm_score:.2f}" if harm_hit else ""
+        if harm_hit:
+            reasons.append(harm_reason)
             if mode == "enforce":
                 threat_score = max(threat_score, LEAK_EVIDENCE_SCORE)
 
@@ -262,7 +278,7 @@ async def layer5_scan_output(
     # Leak evidence now outranks policy; exfiltration's position at the top
     # of the ladder is unchanged.
     threat_class = "CLEAN"
-    harmful_out = (mode == "enforce" and harm_score is not None and harm_score >= getattr(_c5, "L5_HARM_TAU", 1.0))
+    harmful_out = (mode == "enforce" and harm_hit)
     if exfil_score >= OUTPUT_EXFILTRATION_THRESHOLD:
         threat_class = "OUTPUT_EXFILTRATION"
     elif pii_findings or provenance_findings:

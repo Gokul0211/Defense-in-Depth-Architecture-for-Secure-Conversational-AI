@@ -98,6 +98,12 @@ def probe_score(probe: dict, captured: dict) -> tuple[float, list[float]] | None
     return (max(zs) if probe["combine"] == "max_z" else ps[0]), ps
 
 
+def slot_cap(cap, k: int) -> int:
+    """A template's read cap for slot k: one int for every slot, or a per-slot tuple (L5's response-side harm template:
+    request 300, reply 600 tokens)."""
+    return int(cap[k]) if isinstance(cap, (tuple, list)) else int(cap)
+
+
 class _StopForward(Exception):
     """Raised by the one-call hook of read_template(stop_after_layer=L): the probes have what they need."""
 
@@ -207,9 +213,10 @@ class LocalJudge:
         return res
 
     # ---- additional templates (L2 document judge, context-aware L1): one model, one prefix cache per template ----
-    def add_template(self, name: str, system: str, user_fmt: str, escape=None, cap: int = _MAX_TEXT_TOKENS):
+    def add_template(self, name: str, system: str, user_fmt: str, escape=None, cap: int | tuple = _MAX_TEXT_TOKENS):
         """Register a template. `user_fmt` holds slots {0}, {1}, ... filled at read time (each escaped by `escape`
-        and capped head + tail at `cap` tokens). The policy prefix up to slot {0} is encoded once and cached."""
+        and capped head + tail at `cap` tokens -- one int for every slot, or a per-slot tuple). The policy prefix up to
+        slot {0} is encoded once and cached."""
         from transformers import DynamicCache
         marks = [f"⁣⁣SLOT{k}⁣⁣" for k in range(user_fmt.count("{"))]
         full = self.tok.apply_chat_template([{"role": "system", "content": system},
@@ -250,10 +257,11 @@ class LocalJudge:
         torch = self.torch
         t = self.templates[name]
         body = []
-        for text, seg in zip(slots, t["segs"]):
+        for k, (text, seg) in enumerate(zip(slots, t["segs"])):
             ids = self._ids(t["escape"](text or ""))
-            if len(ids) > t["cap"]:
-                h = t["cap"] // 2
+            cap = slot_cap(t["cap"], k)
+            if len(ids) > cap:
+                h = cap // 2
                 ids = ids[:h] + self._ids(" ... ") + ids[-h:]
             body += ids + seg
         n0 = len(t["pre"])

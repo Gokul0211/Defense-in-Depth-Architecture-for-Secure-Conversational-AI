@@ -239,6 +239,15 @@ _REGISTRY: dict[str, dict] = {
         "hf_path": None,
         "license": "internal (XSum, NewsQA, WildChat-1M sources)",
     },
+    "benign_pipeline_arm_v2": {
+        # results.md §27.2: a FRESH benign arm for the final whole-system run -- v1's templates over documents no
+        # round has read (XSum TEST split, WildChat-1M shard 00002). sentinel/eval/generate_benign_pipeline_arm_v2.py.
+        "loader": "_load_benign_pipeline_arm_v2",
+        "layer": "cross-layer",
+        "description": "Benign multi-layer pipeline arm v2 (fresh news / code documents + benign tool calls)",
+        "hf_path": None,
+        "license": "internal (XSum test, WildChat-1M sources)",
+    },
     "dida_bench": {
         "loader": "_load_sentinel_bench",
         "layer": "cross-layer",
@@ -1487,6 +1496,22 @@ def _load_benign_pipeline_arm(split: str = "test", limit: int | None = None, cac
                        description="Benign multi-layer pipeline arm", license="internal", split=split)
 
 
+def _load_benign_pipeline_arm_v2(split: str = "test", limit: int | None = None, cache: bool = True) -> EvalDataset:
+    """results.md §27.2: the fresh benign arm. Generate first: python -m sentinel.eval.generate_benign_pipeline_arm_v2"""
+    local_path = _DATA_DIR / "benign_pipeline_arm_v2" / f"{split}.jsonl"
+    samples = []
+    if local_path.exists():
+        with open(local_path, "r", encoding="utf-8") as f:
+            samples = [EvalSample(**json.loads(line)) for line in f if line.strip()]
+    else:
+        logger.warning(f"benign pipeline arm v2 not found at {local_path}; "
+                       "run python -m sentinel.eval.generate_benign_pipeline_arm_v2")
+    if limit:
+        samples = _apply_limit(samples, limit)
+    return EvalDataset(name="benign_pipeline_arm_v2", samples=samples,
+                       description="Benign multi-layer pipeline arm v2 (fresh)", license="internal", split=split)
+
+
 def _load_sentinel_bench(split: str = "test", limit: int | None = None, cache: bool = True) -> EvalDataset:
     """
     Load SENTINEL-Bench multi-vector composite attack chains.
@@ -1764,6 +1789,46 @@ def _load_tensortrust_fresh9(split: str = "test", limit: int | None = None, cach
     return cached
 
 
+def _load_tensortrust_fresh10(split: str = "test", limit: int | None = None, cache: bool = True) -> EvalDataset:
+    """Cache-only: scratch/rca/l1/tt65_v14_data.py (2026-11-08): carved out of the v13 pool (train_tt_v13) by tt15's v5+
+    rule; the v14 pool excludes it and its near-duplicates. Never valid for a configuration containing the v12 or v13
+    fine-tuned stages (both trained on these texts)."""
+    cached = _load_from_cache_capped("tensortrust_fresh10", split, limit)
+    if cached is None:
+        raise FileNotFoundError("tensortrust_fresh10 is built by scratch/rca/l1/tt65_v14_data.py")
+    return cached
+
+
+def _load_agentleak_fresh(split: str = "test", limit: int | None = None, cache: bool = True) -> EvalDataset:
+    """Cache-only: scratch/rca/l5/l5_05_fresh_test.py (2026-11-11, results.md §24): the local Qwen3-4B answers every
+    TEST-split AgentLeak scenario under AgentLeak's own single-agent prompt (with / without its privacy-policy block);
+    labels by AgentLeak's own leak rule (100 % agreement with the official verdicts on 3,945 DEV + VAL traces)."""
+    cached = _load_from_cache_capped("agentleak_fresh", split, limit)
+    if cached is None:
+        raise FileNotFoundError("agentleak_fresh is built by scratch/rca/l5/l5_05_fresh_test.py build")
+    return cached
+
+
+_REGISTRY["agentleak_fresh"] = {
+    "loader": "_load_agentleak_fresh", "layer": "L5", "hf_path": None, "license": "MIT (AgentLeak scenarios)",
+    "description": "Fresh AgentLeak C1 outputs from a local model on the TEST-split scenarios (L5 inferred-policy TEST)"}
+
+
+def _load_tensortrust_fresh11(split: str = "test", limit: int | None = None, cache: bool = True) -> EvalDataset:
+    """Cache-only: scratch/rca/l1/tt70_fresh11.py (2026-11-08): carved out of train_tt_v14 by the fresh9 / fresh10 rule;
+    never valid for a configuration containing the v12-v15 fine-tuned stages."""
+    cached = _load_from_cache_capped("tensortrust_fresh11", split, limit)
+    if cached is None:
+        raise FileNotFoundError("tensortrust_fresh11 is built by scratch/rca/l1/tt70_fresh11.py")
+    return cached
+
+
+_REGISTRY["tensortrust_fresh11"] = {
+    "loader": "_load_tensortrust_fresh11", "layer": "L1", "hf_path": "qxcv/tensor-trust", "license": "MIT",
+    "description": "Eleventh fresh TensorTrust set, carved out of the v14 pool (>= 5 words, near-dup filtered vs all earlier)"}
+_REGISTRY["tensortrust_fresh10"] = {
+    "loader": "_load_tensortrust_fresh10", "layer": "L1", "hf_path": "qxcv/tensor-trust", "license": "MIT",
+    "description": "Tenth fresh TensorTrust set, carved out of the v13 pool (>= 5 words, near-dup filtered vs all earlier)"}
 _REGISTRY["tensortrust_fresh9"] = {
     "loader": "_load_tensortrust_fresh9", "layer": "L1", "hf_path": "qxcv/tensor-trust", "license": "MIT",
     "description": "Ninth fresh TensorTrust set, carved out of the v12 pool (>= 5 words, near-dup filtered vs all earlier)"}

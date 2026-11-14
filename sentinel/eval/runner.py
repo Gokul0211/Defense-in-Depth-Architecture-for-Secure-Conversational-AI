@@ -568,10 +568,32 @@ def _evaluate_l5_with_provenance(text: str, vault_text: str, session_id: str, me
         # deployed behaviour, which is the whole point of this function.
         import sentinel.config as _c
         md = metadata or {}
+        inferred = None
         if getattr(_c, "L5_FIELD_POLICY", False) and md.get("vault_fields"):
             # the declared field policy (results.md §21.6): the record's fields, the task's allowed set, the request
             from sentinel.core.sensitive_value_extractor import track_field_policy
             track_field_policy(session, md["vault_fields"], md.get("allowed_fields") or [], md.get("request") or "")
+        elif getattr(_c, "L5_POLICY_LIBRARY", "") and md.get("vault_fields"):
+            # the operator's task-policy library (results.md §24.2); the sample's declared allowed set is NOT read
+            from sentinel.core.policy_library import library_allowed
+            from sentinel.core.sensitive_value_extractor import track_field_policy
+            inferred = library_allowed(md.get("request") or "", list(md["vault_fields"]), _c.L5_POLICY_LIBRARY,
+                                       int(getattr(_c, "L5_POLICY_LIBRARY_K", 3)),
+                                       float(getattr(_c, "L5_POLICY_LIBRARY_SMIN", 0.7)),
+                                       float(getattr(_c, "L5_INFERRED_POLICY_T", 0.5))
+                                       if getattr(_c, "L5_INFERRED_POLICY", False) else None)
+            if inferred is None:
+                track_sensitive_values(session, vault_text)
+            else:
+                track_field_policy(session, md["vault_fields"], inferred, md.get("request") or "")
+        elif getattr(_c, "L5_INFERRED_POLICY", False) and md.get("vault_fields"):
+            # no declared policy: the data minimizer infers the allowed set (results.md §24); the declared allowed
+            # fields in the metadata are NOT read on this path
+            from sentinel.core.data_minimizer import infer_field_policy
+            inferred = infer_field_policy(session, md["vault_fields"], md.get("request") or "",
+                                          float(getattr(_c, "L5_INFERRED_POLICY_T", 0.5)))
+            if inferred is None:                           # model unavailable: the shipped behaviour
+                track_sensitive_values(session, vault_text)
         else:
             track_sensitive_values(session, vault_text)
         return await layer5_scan_output(text, system_prompt=None, session_id=session_id)

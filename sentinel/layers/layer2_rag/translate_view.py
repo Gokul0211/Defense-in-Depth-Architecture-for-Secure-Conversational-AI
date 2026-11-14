@@ -15,6 +15,7 @@ absent -> no view (the other readings still run).
 from __future__ import annotations
 
 import logging
+import os
 import re
 import threading
 import unicodedata
@@ -161,7 +162,10 @@ def _load(model_dir: Path = MODEL_DIR):
         from transformers import MarianMTModel, MarianTokenizer
         if not model_dir.exists():
             raise FileNotFoundError(key)
-        dev = "cuda:0" if torch.cuda.is_available() else "cpu"
+        # L2_TRANSLATE_DEVICE (results.md §27.2 latency step): auto = the GPU when present (the measured default, fp16) | cpu
+        # (fp32; outputs may differ from the GPU fp16 path -- parity-check before use) | cuda
+        want = os.getenv("L2_TRANSLATE_DEVICE", "auto").strip().lower()
+        dev = "cuda:0" if torch.cuda.is_available() and want != "cpu" else "cpu"
         tok = MarianTokenizer.from_pretrained(key)
         m = MarianMTModel.from_pretrained(key)
         m = (m.half() if dev != "cpu" else m).to(dev).eval()
