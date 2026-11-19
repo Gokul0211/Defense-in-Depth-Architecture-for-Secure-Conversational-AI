@@ -573,15 +573,14 @@ def _evaluate_l5_with_provenance(text: str, vault_text: str, session_id: str, me
             # the declared field policy (results.md §21.6): the record's fields, the task's allowed set, the request
             from sentinel.core.sensitive_value_extractor import track_field_policy
             track_field_policy(session, md["vault_fields"], md.get("allowed_fields") or [], md.get("request") or "")
-        elif getattr(_c, "L5_POLICY_LIBRARY", "") and md.get("vault_fields"):
-            # the operator's task-policy library (results.md §24.2); the sample's declared allowed set is NOT read
-            from sentinel.core.policy_library import library_allowed
+        elif (getattr(_c, "L5_POLICY_LIBRARY", "") or getattr(_c, "L5_NOPOLICY_V3", False)) and md.get("vault_fields"):
+            # a task-policy library: the operator's (results.md §24.2) or the shipped starter library with the general
+            # minimizer (L5_NOPOLICY_V3, §33); the sample's declared allowed set is NOT read on this path
+            from sentinel.core.policy_library import library_allowed, policy_source
             from sentinel.core.sensitive_value_extractor import track_field_policy
-            inferred = library_allowed(md.get("request") or "", list(md["vault_fields"]), _c.L5_POLICY_LIBRARY,
-                                       int(getattr(_c, "L5_POLICY_LIBRARY_K", 3)),
-                                       float(getattr(_c, "L5_POLICY_LIBRARY_SMIN", 0.7)),
-                                       float(getattr(_c, "L5_INFERRED_POLICY_T", 0.5))
-                                       if getattr(_c, "L5_INFERRED_POLICY", False) else None)
+            src = policy_source(_c)
+            inferred = library_allowed(md.get("request") or "", list(md["vault_fields"]), src[0],
+                                       int(getattr(_c, "L5_POLICY_LIBRARY_K", 3)), src[2], src[1])
             if inferred is None:
                 track_sensitive_values(session, vault_text)
             else:

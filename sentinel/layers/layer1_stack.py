@@ -1,5 +1,6 @@
 """
-L1 v12 stack (config.L1_STACK_V12, default off; scratch/rca/l1/TT_REDESIGN.md §14-§18, results.md §23).
+L1 v12 stack (config.L1_STACK_V12, default ON since 2026-11-19 with the v15 artifact, results.md §23.14;
+scratch/rca/l1/TT_REDESIGN.md §14-§18, results.md §23).
 
 Applied by layer1_check to USER text, after the shipped tiers (arm A) have produced their final score:
   z_FT   a fine-tuned DeBERTa-v3 stage (weights outside git, config.L1_FT_V12_DIR): logit margin, head + tail at 512

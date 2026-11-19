@@ -782,6 +782,13 @@ async def _harm_head(text: str) -> tuple[float | None, str | None]:
     import sentinel.config as cfg
     from sentinel.core.safety_guard import safety_score_prompt
 
+    if getattr(cfg, "L1_HARM_LOCAL", False):
+        # L1H v4 (results.md §32.3): the request-harm read on the shared local 4B; when it is absent (no GPU / no
+        # artifact) the shipped guard below still answers
+        from sentinel.core.request_harm_local import local_request_harm_read
+        r = local_request_harm_read(text)
+        if r is not None:
+            return float(r["p"]), "local4b"
     g = safety_score_prompt(text)
     if g is None:
         return None, None

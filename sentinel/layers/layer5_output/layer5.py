@@ -263,6 +263,20 @@ async def layer5_scan_output(
             if mode == "enforce":
                 threat_score = max(threat_score, LEAK_EVIDENCE_SCORE)
 
+    # L3 v4 (config.L3_MT_V4, layers/layer3_mt.py; results.md §34.2): L3's own reply signal on every reply -- the v6
+    # pair-read probe with L3's threshold (calibrated on the protected model's replies to benign multi-turn chats). It
+    # catches the multi-turn attacks whose intent never shows in the user turns (MHJ: 53 / 110). Fires -> WARN-level
+    # evidence and HARMFUL_OUTPUT, independent of L5_HARM_CHECK.
+    l3_reply_hit = False
+    if getattr(_c5, "L3_MT_V4", False):
+        from sentinel.layers.layer3_mt import mt_reply
+        _turns = [t for t in _user_supplied_text_list(session)] if session is not None else []
+        mr = mt_reply(_turns[-1] if _turns else "", response_text)
+        if mr is not None and mr["fired"]:
+            l3_reply_hit = True
+            reasons.append(f"L3 multi-turn reply signal (local 4B): score={mr['score']:.2f} > tau={mr['tau']:.2f}")
+            threat_score = max(threat_score, LEAK_EVIDENCE_SCORE)
+
     # Threat-class attribution, most severe first.
     #
     # BUG FIX (2026-09-18, Phase 5 Stage 0a / 3B.5): `policy_violations`
@@ -278,7 +292,7 @@ async def layer5_scan_output(
     # Leak evidence now outranks policy; exfiltration's position at the top
     # of the ladder is unchanged.
     threat_class = "CLEAN"
-    harmful_out = (mode == "enforce" and harm_hit)
+    harmful_out = (mode == "enforce" and harm_hit) or l3_reply_hit
     if exfil_score >= OUTPUT_EXFILTRATION_THRESHOLD:
         threat_class = "OUTPUT_EXFILTRATION"
     elif pii_findings or provenance_findings:

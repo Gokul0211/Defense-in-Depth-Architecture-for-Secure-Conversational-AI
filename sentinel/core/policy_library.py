@@ -90,19 +90,59 @@ def library_decision(request: str, fields: list[str], path: str, k: int = 3, s_m
     return out, {"match": True, "neighbours": len(nb), "best_sim": round(nb[0][0], 4)}
 
 
+def nearest_tasks(request: str, path: str, k: int = 3) -> list[dict]:
+    """The k library tasks most similar to the request (masked-request similarity, no threshold): the worked examples
+    of the "disclose_rag" minimizer (results.md §33). Requests are returned masked."""
+    lib = load_library(path)
+    if lib is None or k <= 0:
+        return []
+    q = _encoder().encode([mask_request(request)], normalize_embeddings=True)[0]
+    order = (lib["emb"] @ q).argsort()[::-1][:k]
+    return [{"request": mask_request(lib["tasks"][int(i)]["request"]), "fields": list(lib["tasks"][int(i)]["fields"]),
+             "allowed": list(lib["tasks"][int(i)].get("allowed") or [])} for i in order]
+
+
+STARTER_LIBRARY = Path(__file__).resolve().parents[1] / "layers" / "layer5_output" / "l5_starter_library.json"
+
+
+def policy_source(cfg) -> tuple[str, float | None, float] | None:
+    """(library path, fallback cut or None, s_min) for a session WITHOUT a declared policy: the operator's library
+    (config.L5_POLICY_LIBRARY; the minimizer fallback only with L5_INFERRED_POLICY), else -- with L5_NOPOLICY_V3 on --
+    the shipped starter library with the general minimizer as its fallback (results.md §33); None = no library."""
+    lib = str(getattr(cfg, "L5_POLICY_LIBRARY", "") or "")
+    if lib:
+        fb = float(getattr(cfg, "L5_INFERRED_POLICY_T", 0.5)) if getattr(cfg, "L5_INFERRED_POLICY", False) else None
+        return lib, fb, float(getattr(cfg, "L5_POLICY_LIBRARY_SMIN", 0.7))
+    if getattr(cfg, "L5_NOPOLICY_V3", False):
+        path = str(getattr(cfg, "L5_STARTER_LIBRARY", "") or "") or str(STARTER_LIBRARY)
+        return path, float(getattr(cfg, "L5_NOPOLICY_V3_T", 0.5)), float(getattr(cfg, "L5_STARTER_LIBRARY_SMIN", 0.8))
+    return None
+
+
 def library_allowed(request: str, fields: list[str], path: str, k: int, s_min: float,
-                    fallback_t: float | None) -> list[str] | None:
-    """The allowed fields for a record: the library's decision per field; uncovered fields fall back to the zero-shot
-    minimizer (P(needed) >= fallback_t) when fallback_t is set and the model runs, else they count as private.
-    None only if neither the library nor the minimizer can decide anything (the caller keeps the heuristic)."""
+                    fallback_t: float | None, mode: str | None = None) -> list[str] | None:
+    """The allowed fields for a record: the library's decision per field; uncovered fields fall back to the general
+    minimizer (P >= fallback_t; mode = config.L5_MINIMIZER_MODE unless given: "needed" / "disclose" / "disclose_rag",
+    or "transfer" = the k nearest tasks' vote without s_min, no model) when fallback_t is set, else they count as
+    private. None only if neither the library nor the fallback can decide anything (the caller keeps the heuristic)."""
+    import sentinel.config as cfg
+    mode = mode or str(getattr(cfg, "L5_MINIMIZER_MODE", "needed") or "needed")
     dec, info = library_decision(request, fields, path, k=k, s_min=s_min)
     if not info.get("match") and fallback_t is None:
         return None
     open_fields = [f for f, d in dec.items() if d is None]
     p = {}
     if open_fields and fallback_t is not None:
-        from sentinel.core.data_minimizer import minimize_fields
-        p = minimize_fields(request, open_fields) or {}
+        if mode == "transfer":
+            d2, _ = library_decision(request, fields, path, k=k, s_min=-1.0)
+            p = {f: (1.0 if d2.get(f) else 0.0) for f in open_fields if d2.get(f) is not None}
+        else:
+            from sentinel.core.data_minimizer import format_examples, minimize_fields
+            if mode == "needed":                          # the §24 call, unchanged
+                p = minimize_fields(request, open_fields) or {}
+            else:
+                ex = format_examples(nearest_tasks(request, path, 3)) if mode == "disclose_rag" else ""
+                p = minimize_fields(request, open_fields, mode=mode, examples=ex) or {}
         if not info.get("match") and not p:
             return None
     cut = fallback_t if fallback_t is not None else 2.0          # no fallback: an uncovered field is private

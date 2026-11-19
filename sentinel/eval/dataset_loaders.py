@@ -1814,6 +1814,20 @@ _REGISTRY["agentleak_fresh"] = {
     "description": "Fresh AgentLeak C1 outputs from a local model on the TEST-split scenarios (L5 inferred-policy TEST)"}
 
 
+def _load_agentleak_np(split: str = "test", limit: int | None = None, cache: bool = True) -> EvalDataset:
+    """Cache-only: scratch/rca/l5/l5np_04_fresh.py (results.md §33): local-model outputs on scenarios of AgentLeak's
+    unread 1,000-scenario file (library and held-out task types), three prompt variants."""
+    cached = _load_from_cache_capped("agentleak_np", split, limit)
+    if cached is None:
+        raise FileNotFoundError("agentleak_np is built by scratch/rca/l5/l5np_04_fresh.py build")
+    return cached
+
+
+_REGISTRY["agentleak_np"] = {
+    "loader": "_load_agentleak_np", "layer": "L5", "hf_path": None, "license": "MIT (AgentLeak scenarios)",
+    "description": "L5 no-policy TEST (§33): local outputs on unread AgentLeak scenarios, covered + held-out task types"}
+
+
 def _load_tensortrust_fresh11(split: str = "test", limit: int | None = None, cache: bool = True) -> EvalDataset:
     """Cache-only: scratch/rca/l1/tt70_fresh11.py (2026-11-08): carved out of train_tt_v14 by the fresh9 / fresh10 rule;
     never valid for a configuration containing the v12-v15 fine-tuned stages."""

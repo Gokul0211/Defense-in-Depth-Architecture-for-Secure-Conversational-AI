@@ -30,31 +30,66 @@ MINIMIZER_SYSTEM = (
     "for them. Answer 'yes' only if the field's value is needed; otherwise answer 'no'.")
 MINIMIZER_USER = ("Task: {request}\nRecord fields: {fields}\nField:{field}\n"
                   "Does the assistant need the value of this field to complete the task? Answer yes or no.")
+# Round 3 (results.md §33, 2026-11-15): the DISCLOSURE question. The label of a leak is whether the REPLY states a field,
+# not whether the task needs it (a diagnosis can be needed to book the right department and still must not be stated).
+DISCLOSE_SYSTEM = (
+    "You are a strict privacy checker for an AI assistant's replies. A record retrieved for a user's task holds many "
+    "fields. Under the minimum-necessary principle the reply may state a field's value only if the reply cannot do its "
+    "job without it: the information the task asks for, and what names the person, case or item the reply is about. "
+    "Every other field must not appear in the reply, even when it was useful for doing the task: identifiers, contact "
+    "details, dates of birth, medical, financial, legal or employment details the task does not ask for, ratings, "
+    "history and internal notes. Answer 'yes' only if the reply may state the field's value; otherwise answer 'no'.")
+DISCLOSE_USER = ("{examples}Task: {request}\nRecord fields: {fields}\nField:{field}\n"
+                 "May the reply to this task state the value of this field? Answer yes or no.")
+EXAMPLES_HEAD = "Replies to similar tasks may state only these fields:\n"
+EXAMPLE_ROW = "- Task: {request}\n  Record fields: {fields}\n  The reply may state: {allowed}\n"
+MODES = ("needed", "disclose", "disclose_rag")                # "transfer" (no model) lives in core/policy_library.py
 _MARK = "⁣⁣FIELD⁣⁣"
 _MAX_REQUEST_CHARS = 2000
 _BATCH = 16
+# prefix-cache copies per batch are bounded by tokens (n0 x batch): 16 rows up to a 250-token prefix (every M0 / M1
+# record, unchanged), fewer for the longer worked-example prompts of disclose_rag (a 470-token prefix x 16 ran the
+# 4 GB card out of memory, results.md §33.4)
+_BATCH_TOKENS = 4000
+# disclose_rag (worked examples, ~450-token prefixes): at 8 rows the card was oversubscribed by ~0.4 GB and paged
+# to shared system memory (66 min for what M1 does in 7); 1,000 tokens gives 2 rows (§33.5). Every other mode keeps
+# _BATCH_TOKENS, so its stored design scores stay exact.
+_BATCH_TOKENS_RAG = 1000
 
 
-def _chat(j, request: str, fields: list[str], field: str) -> str:
-    msgs = [{"role": "system", "content": MINIMIZER_SYSTEM},
-            {"role": "user", "content": MINIMIZER_USER.format(request=(request or "")[:_MAX_REQUEST_CHARS],
-                                                              fields=", ".join(fields), field=field)}]
+def format_examples(tasks: list[dict]) -> str:
+    """Worked examples for mode "disclose_rag": library tasks {request, fields, allowed} (requests already masked)."""
+    rows = [EXAMPLE_ROW.format(request=t.get("request", ""), fields=", ".join(t.get("fields") or []),
+                               allowed=", ".join(t.get("allowed") or []) or "none") for t in tasks]
+    return (EXAMPLES_HEAD + "".join(rows)) if rows else ""
+
+
+def _chat(j, request: str, fields: list[str], field: str, mode: str = "needed", examples: str = "") -> str:
+    req = (request or "")[:_MAX_REQUEST_CHARS]
+    if mode in ("disclose", "disclose_rag"):
+        ex = (examples + "\n") if (examples and mode == "disclose_rag") else ""
+        msgs = [{"role": "system", "content": DISCLOSE_SYSTEM},
+                {"role": "user", "content": DISCLOSE_USER.format(examples=ex, request=req, fields=", ".join(fields),
+                                                                 field=field)}]
+    else:
+        msgs = [{"role": "system", "content": MINIMIZER_SYSTEM},
+                {"role": "user", "content": MINIMIZER_USER.format(request=req, fields=", ".join(fields), field=field)}]
     return j.tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
 
 
-def _prompt_ids(j, request: str, fields: list[str], field: str) -> list[int]:
+def _prompt_ids(j, request: str, fields: list[str], field: str, mode: str = "needed", examples: str = "") -> list[int]:
     """The full prompt of one field (the parity reference for the prefix-cached path)."""
-    return j.tok(_chat(j, request, fields, " " + field), add_special_tokens=False)["input_ids"]
+    return j.tok(_chat(j, request, fields, " " + field, mode, examples), add_special_tokens=False)["input_ids"]
 
 
-def _score_record(j, request: str, fields: list[str]) -> list[float]:
+def _score_record(j, request: str, fields: list[str], mode: str = "needed", examples: str = "") -> list[float]:
     """P(yes) for every field of one record. The shared prefix (system + task + field list + 'Field:') runs once; the
     per-field suffixes (' <field>' + question + assistant header) are left-padded into one batch over the repeated prefix
     cache with explicit positions, so the last real token of every row sits at the last index."""
     import copy
     from transformers import DynamicCache
     torch = j.torch
-    full = _chat(j, request, fields, _MARK)
+    full = _chat(j, request, fields, _MARK, mode, examples)
     i = full.index(_MARK)
     pre = j.tok(full[:i], add_special_tokens=False)["input_ids"]
     tail = full[i + len(_MARK):]
@@ -65,8 +100,10 @@ def _score_record(j, request: str, fields: list[str]) -> list[float]:
         j.model(input_ids=torch.tensor([pre], device="cuda:0"), past_key_values=cache, use_cache=True)
     pad = j.tok.pad_token_id if j.tok.pad_token_id is not None else j.tok.eos_token_id
     out: list[float] = []
-    for k in range(0, len(sufs), _BATCH):
-        rows = sufs[k:k + _BATCH]; b = len(rows); ls = max(len(r) for r in rows)
+    budget = _BATCH_TOKENS_RAG if mode == "disclose_rag" else _BATCH_TOKENS
+    bsz = max(1, min(_BATCH, budget // max(1, n0)))
+    for k in range(0, len(sufs), bsz):
+        rows = sufs[k:k + bsz]; b = len(rows); ls = max(len(r) for r in rows)
         ids = torch.full((b, ls), pad, dtype=torch.long, device="cuda:0")
         mask = torch.zeros((b, n0 + ls), dtype=torch.long, device="cuda:0"); mask[:, :n0] = 1
         pos = torch.full((b, ls), n0, dtype=torch.long, device="cuda:0")
@@ -105,14 +142,14 @@ def _score_batch(j, rows: list[list[int]]) -> list[float]:
 
 
 @lru_cache(maxsize=4096)
-def _minimize_cached(request: str, fields: tuple) -> tuple | None:
+def _minimize_cached(request: str, fields: tuple, mode: str = "needed", examples: str = "") -> tuple | None:
     from sentinel.core.local_judge import _lock, get_local_judge
     j = get_local_judge()
     if j is None:
         return None
     try:
         with _lock:
-            ps = _score_record(j, request, list(fields))
+            ps = _score_record(j, request, list(fields), mode, examples)
         return tuple(ps)
     except Exception as e:                                   # noqa: BLE001 -- fail soft: no inferred policy
         logger.warning(f"data minimizer failed on one record: {e}")
@@ -123,12 +160,19 @@ def _minimize_cached(request: str, fields: tuple) -> tuple | None:
         return None
 
 
-def minimize_fields(request: str, fields: list[str]) -> dict[str, float] | None:
-    """{field: P(the task needs this field's value)} for a record's field names, or None if the local model cannot run."""
+def minimize_fields(request: str, fields: list[str], mode: str | None = None,
+                    examples: str = "") -> dict[str, float] | None:
+    """{field: P(yes)} for a record's field names, or None if the local model cannot run. mode "needed" (default, §24):
+    P(the task needs the value); "disclose" / "disclose_rag" (§33): P(the reply may state it), the latter with worked
+    examples (format_examples). Default mode: config.L5_MINIMIZER_MODE (unknown values -> "needed")."""
+    import sentinel.config as cfg
+    mode = mode or str(getattr(cfg, "L5_MINIMIZER_MODE", "needed") or "needed")
+    if mode not in MODES:
+        mode = "needed"
     names = tuple(dict.fromkeys(str(f) for f in fields if str(f).strip()))
     if not names:
         return {}
-    ps = _minimize_cached(request or "", names)
+    ps = _minimize_cached(request or "", names, mode, examples if mode == "disclose_rag" else "")
     if ps is None:
         return None
     return {f: p for f, p in zip(names, ps) if not math.isnan(p)}
@@ -171,16 +215,16 @@ def track_tool_output(session, response_text: str, user_text: str) -> str:
     tracking runs (sensitive_value_extractor.track_sensitive_values). Returns "inferred" or "heuristic"."""
     import sentinel.config as cfg
     from sentinel.core.sensitive_value_extractor import track_field_policy, track_sensitive_values
-    lib = str(getattr(cfg, "L5_POLICY_LIBRARY", "") or "")
+    from sentinel.core.policy_library import library_allowed, policy_source
+    src = policy_source(cfg)                          # operator library, else the §33 starter library, else None
     inf = bool(getattr(cfg, "L5_INFERRED_POLICY", False))
+    lib = src[0] if src else ""
     if (lib or inf) and not getattr(cfg, "L5_FIELD_POLICY", False):
         fields = record_fields(response_text)
         if fields:
-            if lib:                                   # the operator's task-policy library (results.md §24.2)
-                from sentinel.core.policy_library import library_allowed
+            if lib:                                   # task-policy library (results.md §24.2 / §33)
                 allowed = library_allowed(user_text, list(fields), lib, int(getattr(cfg, "L5_POLICY_LIBRARY_K", 3)),
-                                          float(getattr(cfg, "L5_POLICY_LIBRARY_SMIN", 0.7)),
-                                          float(getattr(cfg, "L5_INFERRED_POLICY_T", 0.5)) if inf else None)
+                                          src[2], src[1])
                 if allowed is not None:
                     track_field_policy(session, fields, allowed, user_text)
                     return "library"

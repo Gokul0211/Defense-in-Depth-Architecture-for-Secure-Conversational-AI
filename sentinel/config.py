@@ -928,6 +928,17 @@ L5_INFERRED_POLICY_T = float(os.getenv("L5_INFERRED_POLICY_T", "0.5"))      # se
 L5_POLICY_LIBRARY = os.getenv("L5_POLICY_LIBRARY", "")
 L5_POLICY_LIBRARY_K = int(os.getenv("L5_POLICY_LIBRARY_K", "3"))
 L5_POLICY_LIBRARY_SMIN = float(os.getenv("L5_POLICY_LIBRARY_SMIN", "0.7"))
+# L5 NO-POLICY v3 (results.md §33; OFF until its fresh TEST): with no declared policy and no operator library, the shipped
+# STARTER library (layers/layer5_output/l5_starter_library.json: AgentLeak task types, masked requests) decides records
+# it covers (s_min L5_STARTER_LIBRARY_SMIN) and the general minimizer (L5_MINIMIZER_MODE, cut L5_NOPOLICY_V3_T) the rest.
+L5_NOPOLICY_V3 = os.getenv("L5_NOPOLICY_V3", "false").lower() == "true"
+L5_NOPOLICY_V3_T = float(os.getenv("L5_NOPOLICY_V3_T", "0.5"))
+L5_STARTER_LIBRARY = os.getenv("L5_STARTER_LIBRARY", "")                  # empty = the shipped file
+L5_STARTER_LIBRARY_SMIN = float(os.getenv("L5_STARTER_LIBRARY_SMIN", "0.8"))
+# The general minimizer's question (results.md §33): "needed" = §24 (does the task need the value; default), "disclose"
+# = may the reply state it, "disclose_rag" = disclose + the 3 nearest library tasks as examples, "transfer" = the
+# nearest library tasks' vote without s_min (no model).
+L5_MINIMIZER_MODE = os.getenv("L5_MINIMIZER_MODE", "needed")
 
 # Layer 4 — Decision Threshold (InjecAgent-calibrated, additive ceiling)
 # Youden's J-optimal on audit_tool_call()'s final_score once tool-response
@@ -1526,6 +1537,14 @@ L5_HARM_TAU = float(os.getenv("L5_HARM_TAU", os.getenv("L1_HARM_TAU", "0.6737"))
 # "l5harm", artifact core/artifacts/l5_harm_local.npz, its own tau) instead of the CPU 0.6B guard. Off until a round
 # meets its gate; the artifact is exported only from an adopted round (scratch/rca/l1h/v4_06_export.py).
 L5_HARM_LOCAL = os.getenv("L5_HARM_LOCAL", "false").lower() == "true"
+# L1H v4 (results.md §32.3): the L1 harm head reads the REQUEST-HARM template on the shared local 4B (core/
+# request_harm_local.py, artifact core/artifacts/l1_harm_local.npz) instead of the CPU 0.6B guard; the guard still
+# answers when the local read is absent. Off until a round meets its gate.
+L1_HARM_LOCAL = os.getenv("L1_HARM_LOCAL", "false").lower() == "true"
+# L3 v4 (results.md §34 / §34.2): the multi-turn probe on the shared 4B per user turn (L3) and the L3 reply signal on every
+# reply (L5 output stage); sentinel/layers/layer3_mt.py, artifacts core/artifacts/l3_mt_probe.npz / l3_mt_reply.npz.
+# Off until the L3 v4 round meets its gate.
+L3_MT_V4 = os.getenv("L3_MT_V4", "false").lower() == "true"
 # F-H1: report the guard's harm CATEGORY when the harm head fires (one extra forward, flagged prompts only).
 L1_HARM_REPORT_CATEGORY = os.getenv("L1_HARM_REPORT_CATEGORY", "true").lower() == "true"
 # RCA 2 fix validation: the ignore/override addressee cue's left edge treats "_" as a separator, so
@@ -1641,13 +1660,18 @@ L1_LOCAL_LLM_DIR = os.getenv("L1_LOCAL_LLM_DIR", "~/.cache/sentinel/qwen3-4b-ins
 # L1 v12 stack (sentinel/layers/layer1_stack.py; scratch/rca/l1/TT_REDESIGN.md §18, results.md §23): for USER text, after
 # the shipped tiers, a fine-tuned DeBERTa-v3 stage + the local 4B read (ENS3 + a layer-24 domain probe) + ProtectAI v2:
 # AUTH hold (arm A fired, no hard Tier-1 reason, z_S1 < 2.5 -> below WARN) and a lift to WARN when max(z) > tau (CAL
-# conformal, alpha 0.01). Artifact core/artifacts/l1_stack_v12.json; weights outside git (L1_FT_V12_DIR). OFF until measured.
-L1_STACK_V12 = os.getenv("L1_STACK_V12", "false").lower() == "true"
+# conformal, alpha 0.01). Artifact core/artifacts/l1_stack_v12.json; weights outside git (L1_FT_V12_DIR).
+# DEFAULT ON since 2026-11-19 (results.md §23.14): the v15 artifact meets every L1 injection metric on the untouched
+# fresh10 TEST (§23.11 / §23.13) and the production path reproduces the offline v15 decisions on fresh8. Without the
+# fine-tuned weights or the artifact the stack is off by itself (fail-soft) and arm A stands.
+L1_STACK_V12 = os.getenv("L1_STACK_V12", "true").lower() == "true"
 L1_FT_V12_DIR = os.getenv("L1_FT_V12_DIR", "~/.cache/sentinel/l1-ft-v12")
 # step E: the 4B read only when it can change the decision (b_skip chosen on VAL: identical VAL / CAL decisions)
 L1_STACK_CASCADE = os.getenv("L1_STACK_CASCADE", "true").lower() == "true"
-# step E: the 4B read stops after the deepest probe layer (24 of 36); adopted only after live parity (0 mismatches)
-L1_STACK_EARLY_EXIT = os.getenv("L1_STACK_EARLY_EXIT", "false").lower() == "true"
+# step E: the 4B read stops after the deepest probe layer (24 of 36). Live parity: 0 mismatches and 0.0 max |z|
+# difference on 300 VAL texts (tt56, results.md §23.2 / §23.6); the v15 production path was measured with it (§23.11).
+# DEFAULT ON since 2026-11-19 (§23.14).
+L1_STACK_EARLY_EXIT = os.getenv("L1_STACK_EARLY_EXIT", "true").lower() == "true"
 # v8 L6 Answer-Provenance Guard (sentinel/layers/layer6_answer): off | report | enforce. Traces links / addresses /
 # reader-directed instructions in the assistant's reply to their source (scratch/rca/v7/LAYERS_V8.md). OFF.
 L6_ANSWER_GUARD = os.getenv("L6_ANSWER_GUARD", "off").strip().lower()
@@ -1671,14 +1695,15 @@ L6_TAINT_FIRST_SEEN = os.getenv("L6_TAINT_FIRST_SEEN", "true").lower() == "true"
 # L6 v3.1 window: segments kept after the last cue in the structured span (v3: 1; -1 = to the end of the unit).
 L6_SPAN_AFTER = int(os.getenv("L6_SPAN_AFTER", "1"))
 # L6 v3.2 (results.md §26.7): an answer identifier counts as inside an addressed span only as a whole token (lineage
-# _bounded_in) -- fixes "informations.com" matching inside "true-informations.com". OFF until the TEST3 read.
-L6_BOUNDED_IDENT = os.getenv("L6_BOUNDED_IDENT", "false").lower() == "true"
+# _bounded_in) -- fixes "informations.com" matching inside "true-informations.com". ADOPTED 2026-11-14 with v3.4 (§26.14).
+L6_BOUNDED_IDENT = os.getenv("L6_BOUNDED_IDENT", "true").lower() == "true"
 # L6 v3.3 (results.md §26.10): wrapper-tolerant units (spotlighting "<<" ... ">>", code fences, an embedded serialized
-# object) and nothing before the first framing cue of a unit. OFF until the TEST4 read.
-L6_SPAN_V33 = os.getenv("L6_SPAN_V33", "false").lower() == "true"
+# object) and nothing before the first framing cue of a unit. ADOPTED 2026-11-14 with v3.4 (§26.14).
+L6_SPAN_V33 = os.getenv("L6_SPAN_V33", "true").lower() == "true"
 # L6 v3.4 (results.md §26.12): an explicit closing markup tag (</information> ...) ends the injected block -- no text
-# after it and no +1 window. OFF until the TEST5 read.
-L6_SPAN_CLOSE_TAG = os.getenv("L6_SPAN_CLOSE_TAG", "false").lower() == "true"
+# after it and no +1 window. ADOPTED 2026-11-14 (§26.14: fresh local-agent TEST5, 179 relays: recall 0.972, FP 0 / 227,
+# precision 1.000, AUROC 0.986); acts only when L6_ANSWER_GUARD is on.
+L6_SPAN_CLOSE_TAG = os.getenv("L6_SPAN_CLOSE_TAG", "true").lower() == "true"
 # v8 RCA (scratch/rca/v7/RCA_V8.md): when field-level provenance (authz lineage) places an argument in a user-typed or
 # system-of-record field, the chunk-level "copied from a flagged output" block is overridden for it (instruction-context
 # blocks are not). OFF until measured (a06).

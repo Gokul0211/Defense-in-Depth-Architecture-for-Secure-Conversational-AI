@@ -545,8 +545,19 @@ async def layer3_check(session_id: str, user_input: str) -> L3Result:
             and (is_header or extract_mapping_pair(user_input) is not None)):
         score = 0.0
 
+    # L3 v4 (config.L3_MT_V4, layer3_mt.py; results.md §34): the multi-turn probe on the shared 4B. A session the probe
+    # has flagged (any prefix over its tau) stays flagged; its turns score at least BLOCK on L3's axis.
+    mt = None
+    if getattr(_cfg, "L3_MT_V4", False):
+        from sentinel.layers.layer3_mt import mt_turn
+        mt = mt_turn(session_id, user_input)
+        if mt is not None and mt["latched"]:
+            score = max(score, _cfg.l3_block_threshold())
+
     # Build reason string
     reasons = []
+    if mt is not None and mt["latched"]:
+        reasons.append(f"Multi-turn probe (local 4B): the conversation reads as an attack (this turn's margin {mt['margin']:.2f})")
     if harm_alignment > L3_HARM_ALIGNMENT_THRESHOLD:
         reasons.append(f"Content resembles known harmful topic (harm_alignment={harm_alignment:.2f})")
     if velocity > L3_VELOCITY_THRESHOLD:
@@ -576,6 +587,8 @@ async def layer3_check(session_id: str, user_input: str) -> L3Result:
 def reset_layer3_state():
     """Clear all session embeddings — called on demo reset."""
     global _harm_anchor_embeddings, _escalation_anchor_embeddings
+    from sentinel.layers.layer3_mt import reset_mt_state          # L3 v4 sessions (L3_MT_V4)
+    reset_mt_state()
     session_embeddings.clear()
     session_turn_counts.clear()
     session_user_turns.clear()

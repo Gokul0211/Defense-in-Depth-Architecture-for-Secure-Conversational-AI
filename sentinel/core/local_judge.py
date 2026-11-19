@@ -158,6 +158,9 @@ class LocalJudge:
     def _hook(self, layer, output):
         h = output[0] if isinstance(output, tuple) else output
         self._captured[layer] = h[0, -1].detach().float().cpu().numpy()
+        span = getattr(self, "_pool_span", None)
+        if span is not None:                               # read_pair: the mean over the reply tokens (harm v6)
+            self._pooled[layer] = h[0, span[0]:span[1]].detach().float().mean(0).cpu().numpy()
 
     def _body(self, text: str) -> list[int]:
         from sentinel.layers.layer1_llm_judge import neutralise_delimiters
@@ -239,15 +242,107 @@ class LocalJudge:
         self.templates[name]["probe"] = probe
         if probe is None:
             return
+        self.ensure_hooks(probe["layers"])
+
+    def ensure_hooks(self, layer_ids):
+        """Capture hooks on these inner layers (each layer is hooked once, whoever asked first)."""
         hooked = getattr(self, "_hooked", set(self.probe["layers"]) if self.probe else set())
         layers = self.model.model.layers
-        for L in probe["layers"]:
+        for L in layer_ids:
             if L not in hooked:
                 if not 1 <= L <= len(layers) - 1:
                     raise ValueError("probe layers must be inner layers")
                 layers[L - 1].register_forward_hook(lambda m, i, o, L=L: self._hook(L, o))
                 hooked.add(L)
         self._hooked = hooked
+
+    # ---- reply-first PAIR read (L5 harm v6, results.md §31.2): one prefill of the reply, two read-outs ----
+    def add_pair_template(self, name: str, system: str, head_fmt: str, branch_fmts: tuple, caps: tuple,
+                          escape=None):
+        """Register a two-branch template. The user message of branch k is head_fmt + branch_fmts[k]; head_fmt holds
+        slot {0} (the reply, capped caps[0] tokens head + tail); branch 0 has no slot; branch 1 holds slot {0} (the
+        request, capped caps[1]). The policy prefix up to the reply slot is encoded once and cached; read_pair() fills
+        the reply ONCE and reads both branches from that state (branch 0 = the reply alone, branch 1 = given the
+        request)."""
+        from transformers import DynamicCache
+        mr, mq = "⁣⁣SLOTR⁣⁣", "⁣⁣SLOTQ⁣⁣"
+        head = head_fmt.format(mr)
+        chat = lambda u: self.tok.apply_chat_template([{"role": "system", "content": system},   # noqa: E731
+                                                       {"role": "user", "content": u}],
+                                                      tokenize=False, add_generation_prompt=True)
+        f0, f1 = chat(head + branch_fmts[0]), chat(head + branch_fmts[1].format(mq))
+        i0, i1 = f0.index(mr), f1.index(mr)
+        if f0[:i0] != f1[:i1]:
+            raise ValueError("pair template: the two branches must share the prefix")
+        tail = head[head.index(mr) + len(mr):]              # the head text after the reply slot (shared)
+        a0, a1 = i0 + len(mr) + len(tail), i1 + len(mr) + len(tail)
+        if f0[i0 + len(mr):a0] != tail or f1[i1 + len(mr):a1] != tail:
+            raise ValueError("pair template: the head tail must follow the reply slot in both branches")
+        q = f1.index(mq)
+        pre = self._ids(f0[:i0])
+        cache = DynamicCache()
+        with self.torch.no_grad():
+            self.model(input_ids=self.torch.tensor([pre], device=self.model.device), past_key_values=cache, use_cache=True)
+        if not hasattr(self, "pair_templates"):
+            self.pair_templates = {}
+        self.pair_templates[name] = {"pre": pre, "mid": self._ids(tail), "b0": self._ids(f0[a0:]),
+                                     "b1_pre": self._ids(f1[a1:q]), "b1_post": self._ids(f1[q + len(mq):]),
+                                     "cache": cache, "escape": escape or (lambda t: t), "caps": tuple(caps)}
+
+    def read_pair(self, name: str, reply: str, request: str, pool: bool = True) -> dict:
+        """Three forwards on one cache: (1) the reply + head tail after the cached prefix (the mean of the reply
+        tokens' states is captured when pool), (2) branch 0, (3) branch 1 with the request, after cropping back to the
+        end of (1). Returns {"log_odds": [lo0, lo1], "p_yes": [p0, p1], "hidden": [{layer: vec}, {layer: vec}],
+        "pooled": {layer: vec}, "tokens": n}; the cache is cropped back to the prefix in every case."""
+        torch = self.torch
+        t = self.pair_templates[name]
+
+        def capped(text, cap):
+            ids = self._ids(t["escape"](text or ""))
+            if len(ids) > cap:
+                h = cap // 2
+                ids = ids[:h] + self._ids(" ... ") + ids[-h:]
+            return ids
+
+        r_ids, q_ids = capped(reply, t["caps"][0]), capped(request, t["caps"][1])
+        n0 = len(t["pre"])
+        shared = r_ids + t["mid"]
+        cache = t["cache"]
+
+        def fwd(ids, start):
+            x = torch.tensor([ids], device=self.model.device)
+            pos = torch.arange(start, start + len(ids), device=self.model.device)[None]
+            return self.model(input_ids=x, past_key_values=cache, use_cache=True, position_ids=pos,
+                              cache_position=pos[0], logits_to_keep=1)
+
+        def answer(out):
+            lp = torch.log_softmax(out.logits[0, -1].float(), -1)
+            ly, ln = torch.logsumexp(lp[self.yes], 0), torch.logsumexp(lp[self.no], 0)
+            return float(ly - ln), float(torch.sigmoid(ly - ln))
+
+        res = {"log_odds": [], "p_yes": [], "hidden": [], "pooled": {}}
+        try:
+            with torch.no_grad():
+                self._captured, self._pooled = {}, {}
+                self._pool_span = (0, max(1, len(r_ids))) if pool else None
+                try:
+                    fwd(shared, n0)
+                finally:
+                    self._pool_span = None
+                res["pooled"] = dict(self._pooled)
+                n1 = n0 + len(shared)
+                for k, ids in enumerate((t["b0"], t["b1_pre"] + q_ids + t["b1_post"])):
+                    if k:
+                        cache.crop(n1)
+                    self._captured = {}
+                    lo, p = answer(fwd(ids, n1))
+                    res["log_odds"].append(lo); res["p_yes"].append(p)
+                    res["hidden"].append(dict(self._captured))
+                res["tokens"] = n1 + len(t["b1_pre"]) + len(q_ids) + len(t["b1_post"])
+        finally:
+            cache.crop(n0)
+        self.calls += 1
+        return res
 
     def read_template(self, name: str, *slots: str, stop_after_layer: int | None = None) -> dict:
         """One reading under template `name`. stop_after_layer=L (L2 D2, config.L2_LOCAL_EARLY_EXIT): the forward pass
