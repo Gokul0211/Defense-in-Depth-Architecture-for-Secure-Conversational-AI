@@ -7827,3 +7827,362 @@ probe, replay, VAL or TEST number exists.
 - **Whole-system follow-up:** if v4 is adopted, its effect on the whole system is a disclosed re-read of the §27.3
   arms, not a new verdict.
 
+### 34.4 L3 audit result and amendment (2026-11-21 00:52, before any probe, replay, VAL or TEST number)
+**The pre-registered audit ran** (l3v4_audit.json, 2026-11-21 00:50). Granite Guardian "harm" P >= 0.5 on any user turn
+excluded **270 / 400** WildChat-00003 conversations from the benign TEST arm:
+- random 129 / 200, sensitive 141 / 200;
+- of the planned 50 + 50 replayed, 27 + 32 are excluded, leaving 23 + 18.
+
+**Its residual error on September's audited arms** (agreement with the September labels):
+
+| arm | recall | FP | precision | AUROC |
+|---|---|---|---|---|
+| wildchat_sens_ref | 0.929 | 87.9 % | 0.374 | 0.582 |
+| wildchat_sens_test | 0.940 | 81.2 % | 0.529 | 0.641 |
+| wildchat_ref | 0.805 | 57.1 % | 0.282 | 0.721 |
+| wildchat_test | 0.864 | 54.6 % | 0.108 | 0.783 |
+
+- **Reading:** the judge finds September's harmful conversations, but it also excludes most of the clean ones.
+- **Consequence:** the audited-clean arm is a "looks clean to Granite" subset, and an FP measured on it is optimistic.
+
+**Amendment:**
+- The gate stays as pre-registered: the audited-clean arm.
+- The TEST read also reports, ungated, the WildChat-00003 rows without the exclusion: the probe on all 400, end to end on
+  all 100 replayed. That is the conservative bracket: an unaudited real chat that is in fact harmful counts as a false
+  alarm there.
+- Both are shown side by side (l3v4_07_test.py: `reported_unaudited_wildchat3`).
+- The audited-clean replayed arms hold only 23 / 18 conversations, so their FP intervals are wide. This is disclosed.
+- Nothing else changes; the QuAC rows (50 + 50 replayed, 300 + 300 probe) are unaffected.
+
+### 34.5 Night 2 (2026-11-20 23:50 to 2026-11-21 11:34): probe fitted, design replays stopped at 24 / 300 -- no end-to-end, VAL-stop or TEST number
+**Done (outputs kept; every step resumable):**
+- The audit (§34.4), the probe design features (01:31) and the probe fit (01:32; l3v4_selected.json).
+- **Probe selection on VAL (design data only):** C = 0.2 is selected. Over the 554 VAL attack conversations it has
+  recall 0.9206 and AUROC 0.9996. VAL FP is 0 % on every benign group (oasst, quac_random, quac_sensitive, wildchat,
+  wildchat_sens).
+  - tau = 5.9164, the max of the per-group CAL taus. It is set by wildchat_sens, which has only 32 CAL conversations.
+  - The other candidates, C = 0.01 and C = 0.05, reach recall 0.8989 and 0.9025 with the same AUROC and FP.
+  - The §34.1 probe gate (VAL FP <= 4 % per benign group) is met. The two end-to-end parts of the §34.2 VAL stop are not
+    measured yet.
+- **Design replays:** 24 / 300 conversations (all CAL benign quac_random), from 01:32 to 03:29, then none.
+
+**Why the night was lost (both measured):**
+1. **Standby.** Per the Windows event log (Kernel-Power), the power source changed at 03:34:01. Modern Standby started
+   at 03:34:03 and ended at 11:30:01. Further power-source changes at 04:15, 06:46, 06:49, 09:27 and 09:37 woke the
+   machine for a few seconds each. The step's `timeout 21600` had not fired by 11:34; the standby hours did not count
+   toward it.
+2. **Replay throughput far below plan.** 24 conversations took 117 min, about 4.9 min each. At that rate the 300 take
+   about 24 h; about 1 h was planned (a planning estimate). From the stored `ms` (batch time / live conversations,
+   batches of 6):
+
+   | turns | time per conversation per turn |
+   |---|---|
+   | 1 | 3.9 - 4.1 s |
+   | 5 - 11 | 20 - 80 s |
+   | worst (turns 11 - 13) | 141.6 / 173.8 / 266.4 / 301.9 s |
+
+   - At 11:30, with the replay running, the GPU showed 3,917 / 4,096 MiB in use at 100 % utilisation (nvidia-smi).
+   - The KV cache costs 147,456 bytes per token in fp16: 36 layers x 8 KV heads x head dim 128, about 141 MiB per 1,000
+     tokens (the model config).
+   - A 12-turn QuAC history holds about 12 replies of up to 200 tokens, about 340 MiB (estimate). Six of them is about
+     2 GiB, beside the nf4 weights on a 4 GB card.
+   - **Diagnosis (to confirm first on resume):** the Windows driver falls back to shared system memory instead of
+     raising out-of-memory, so the replay's batch-halving path never triggers. This is the same failure as the §27.3
+     latency incident.
+
+**Fix (planned, NOT implemented; the user stopped the run at 11:34):**
+- Batch by a token budget: group conversations by their current history length, so that batch size x (longest history
+  + 200) stays under a measured KV budget. Short histories still batch wide.
+- Cap the process with torch.cuda.set_per_process_memory_fraction, so that an overflow raises out-of-memory and halves
+  the batch instead of spilling.
+- Apply the same change to l3v4_05_replay.py, so the design and TEST replays run one code path.
+- Replay settings are unchanged: the model, system prompt, greedy decoding and <= 200 new tokens. The 24 kept rows stay;
+  they used the same settings at batch 6.
+- Before the full chain, time a few batches with shared GPU memory watched.
+
+**Resume:**
+1. Apply the fix.
+2. Run `bash scratch/rca/l3/chain_l3_night2.sh`. It skips the audit and the fit, re-checks the design features, and
+   resumes the replays at 24.
+3. Run `WAIT_L3_AFTER_LINE=<l3/STATUS line count before the relaunch> bash scratch/rca/queue/runner.sh`. The §36 jobs
+   are all still pending.
+
+### 34.6 Implementation amendment (2026-11-22 00:23, before any end-to-end, VAL or TEST number): one replay engine, a split chain
+**Why:** §34.5. The batch-of-6 replay loop spilled past the 4 GB card: 4.9 min per conversation, up to 302 s per reply.
+
+**What changes (speed only):** scratch/rca/l3/l3v4_replay_engine.py now runs both replays, design and TEST.
+- **Turn-level pool with a token budget:** batch x (longest prompt + 200) stays under a budget measured from the free
+  memory after the model load and the model's KV size per token, and batch x longest prompt <= 2,048.
+- **Hard cap on the PyTorch allocator:** an overflow raises out-of-memory instead of spilling. The budget then shrinks
+  15 % and the step is re-planned.
+- **Batch 1 where it is cheaper per reply:** bitsandbytes' single-sequence 4-bit path, decided from running means of
+  measured step times.
+- **A prompt alone over the budget:** it runs alone, with chunked prefill (512 tokens) and the cap at the device total.
+  This applies to a few long WildChat / MHJ histories: last-turn prompts reach 6,814 tokens in design and 7,677 in TEST.
+
+**Unchanged:** the model, the system prompt, greedy decoding, <= 200 new tokens, the conversation selections, and every
+label, threshold, gate and metric of §34 - §34.4.
+- The 24 design rows of 11-21 stay; they used the same settings at batch 6.
+- Batch composition can change a greedy reply only through fp16 rounding.
+
+**Chain:** scratch/rca/l3/chain_l3_night3.sh splits night 2 into a `val` job and a `test` job.
+- The `test` job runs only on a VAL-stop pass.
+- Both are queued in scratch/rca/queue/ as 21a / 21b, so the paper runs share the GPU in one queue.
+
+**Check:** scratch/rca/l3/_replay_engine_smoke.py (CPU, fake model) passes:
+- the prompts equal the §34 message construction;
+- every reply saw exactly its conversation's earlier replies;
+- simulated out-of-memory re-plans;
+- the lone path is used;
+- each conversation is written once.
+
+**Addendum (2026-11-22 15:34, before any TEST replay or TEST number exists; speed only):** the memory budget of the engine.
+- **What the design run measured:**
+  - The first design run (the VAL job, started 15:18) found 774 MiB free after the model load. Its flat token budget
+    held back 256 + 320 MiB, which left 1,405 tokens, so batches ran at 4 - 6 on turn-1 prompts.
+  - The peaks it logged sit 190 - 290 MiB above the weights, against 518 MiB allowed under the cap: non-KV use was
+    30 - 90 MiB.
+- **The change:** from the TEST replays on, a step runs if its own need fits the free memory minus 160 + 100 MiB. The
+  need is its KV cache, plus its prefill activations at 72 KiB per prompt token, plus a worst-case
+  masked-attention term.
+- **Batch sizes on this card, old vs new:**
+
+  | longest prompt (tokens) | 30 | 100 | 260 | 500 | 800 | 2,000 |
+  |---|---|---|---|---|---|---|
+  | old | 6 | 4 | 3 | 2 | 1 | lone |
+  | new | 12 | 10 | 5 | 3 | 2 | 1 |
+
+- The cap, the out-of-memory re-plan (now shrinking the byte budget 15 %), the settings and the selections are
+  unchanged.
+- The running design job keeps the old budget (its process has the old module loaded).
+- The smoke test passes on the new model.
+
+**In-flight checkpoint (2026-11-22 16:10; resumability only):** the engine saves the replies of the conversations still in flight
+every 120 s (l3v4_replay_design.partial.json / l3v4_replay.partial.json, atomic) and restores them on the next start.
+- A resumed conversation continues from its own saved replies, so its next prompt is the one it would have had.
+- The file is removed when the replay completes.
+- The smoke test now also stops a run and resumes it: every conversation is written once, and the saved replies are
+  kept as they were.
+- **State:** the user paused the PC at 16:09. 100 of the 300 design conversations are saved. The roughly 420
+  in-flight replies of that run were lost; it predates the checkpoint.
+
+## 35. User decisions (2026-11-20 23:43): two rows closed as not pursued; L3 on MHJ is the one open layer round
+- **Closed, not pursued** (user: "im not gonna be working on these 2"). Both rows stay on the board at their measured
+  values, and their root causes stay recorded.
+  - **L5 without any operator policy** (§33.6). AgentLeak's leak label is a per-task policy; the same field is allowed
+    by one task's policy and forbidden by another's. L5 meets the mark with a declared policy or the task-policy library
+    (§24). It is also the source of 5 of the 7 fresh-arm benign alarms in the final system run (§27.3).
+  - **Harm in replies** (§31.4 - §31.6). The datasets' harm policies need different thresholds. `L5_HARM_LOCAL` stays
+    off.
+- **Accepted:** L1H v4.1 (§32.6, user: "this is ok"), opt-in.
+- **Open:** L3 on MHJ (§34 - §34.3). Resume with `bash scratch/rca/l3/chain_l3_night2.sh`.
+- **Paper:** the October paper, renamed on 2026-11-20 to paper/old paper/, predates every round after §17. It is not edited (user:
+  the paper is old). The work since then is summarised in README "Since the paper" and contributions I–M.
+
+### 35.1 User decisions (2026-11-21 00:01): the final-year project and the paper are separate
+- **One codebase, two profiles.**
+  - The final-year project runs the code default with Groq: the L1 judge gpt-oss-safeguard-20b and a hosted L4
+    contract.
+  - The paper claims only the local profile the FINAL run measured (scratch/rca/sys/final_profile.env, §27.3).
+  - Numbers for the Groq profile are measured separately or labelled unmeasured.
+- **Not in the paper:** live AgentDojo runs (L4 is reported by effect-level replay) and the red team.
+- **Mechanisms A–D stay in the paper.**
+  - They are re-measured on today's configuration: one pass over the 575 DIDA-Bench sessions for A–C.
+  - Where A and C stop on certified sessions comes from a SPLIT-Bench regeneration against today's layers.
+  - D comes from the cross-corpus check on L1 v15.
+  - The runs list with planning estimates is in task.md "NEW PAPER". None of them has started except L3 (§34.3).
+
+## 36. Paper runs on today's configuration (pre-registered 2026-11-21 00:25, before any number of these runs)
+**Purpose:** the new paper (§35.1) carries no result from a superseded configuration. Every run below measures the
+FINAL profile (scratch/rca/sys/final_profile.env, the configuration §27.3 measured) or third-party guards on today's test
+items. These are MEASUREMENTS for the paper, not adoption gates: nothing is tuned on them and no threshold changes.
+**Queue:** scratch/rca/queue/runner.sh starts after the L3 chain ends (§34.3), one GPU job at a time; jobs and logs are in
+scratch/rca/queue/.
+**State (2026-11-21 11:34):** not started. The runner was stopped by hand while it still waited for the L3 chain;
+all 8 jobs are still in scratch/rca/queue/pending/ (§34.5).
+**State (2026-11-22 00:31):** the queue ran from 00:13 until the user needed the PC.
+- Run 5 is done (result below).
+- Run 4 stopped at 1,352 / 1,602 texts scored. It is resumable and its job stays pending.
+- Runs 3 and 2 have not started.
+- The L3 jobs (§34.6) are queued after run 4 as 21a / 21b / 21c (21c: export + the whole-system re-read, only after a
+  passed L3 TEST).
+- Resume: `bash scratch/rca/queue/runner.sh`.
+
+### Run 5 -- Mechanisms A-C on DIDA-Bench (scratch/rca/paper/p05_mech_abc.py -> p05_mech_abc.json)
+- **Pass:** one simulate_pipeline pass (the FINAL run's function) over all 575 DIDA-Bench sessions.
+- **A:** TAINT_PATH_DETECTED vs the RAG_PLUS_AGENT_ATTACK rule (firings, overlap, unique captures, benign firings) and
+  the C4 partition (A: layer alone; B: rule with a layer; C: rule without any layer; D: nothing).
+- **B:** SPRT, alpha = beta = 0.05, KDE likelihoods on train 463, evaluated on test 112.
+- **C:** pattern mining with eval/pattern_mining_eval.py's parameters, mining_set 425 -> held_out 150.
+- **Reported:** every count with Wilson 95 % intervals. The 112 test sessions were read by the FINAL run; this re-read
+  evaluates mechanisms, not the system.
+
+**Result, run 5 (2026-11-22 00:23; scratch/rca/paper/p05_mech_abc.json, p05_scores.jsonl):**
+- One pass over all 575 DIDA-Bench sessions (375 attacks, 200 benign) under the FINAL profile: 10 min in all, 878 ms per
+  session.
+- **A, taint graph vs the RAG_PLUS_AGENT rule:**
+  - On attacks, the rule fires on 150 / 375 (0.400 [0.352, 0.450]) and TAINT_PATH on 75 / 375 (0.200 [0.163, 0.243]).
+    Every taint firing is also a rule firing: taint-only 0, rule-only 75.
+  - Neither fires on benign: 0 / 200 [0, 0.019].
+  - C4 partition of the attacks:
+    - a layer at WARN or above, alone or with a rule: 362 / 375 (0.965 [0.942, 0.980]);
+    - rule and layer together: 160;
+    - **rule without any layer: 0 / 375, so the incremental recall of the rules is 0 [0, 0.010]**;
+    - nothing: 13 (0.035).
+  - On benign, a layer reaches WARN in 20 / 200 (0.100 [0.066, 0.149]); no rule fires.
+- **B, SPRT (alpha = beta = 0.05; KDE likelihoods fit on train 463, read on test 112):**
+
+  | TP | FP | FN | TN | recall | FPR | precision | accuracy | balanced acc. | F1 | MCC |
+  |---|---|---|---|---|---|---|---|---|---|---|
+  | 58 | 0 | 1 | 53 | 0.983 [0.910, 0.997] | 0 [0, 0.068] | 1.000 | 0.991 [0.951, 0.998] | 0.992 | 0.992 | 0.982 |
+
+  - Agreement with the full cascade is 1.000.
+  - Mean layers consulted: 2.80 overall, 1.54 on attacks, 4.21 on benign. 10.7 % of sessions exhaust the layers
+    without a decision.
+- **C, pattern mining** (eval/pattern_mining_eval.py parameters; three known chain types mined, poisoned_rag_exfil and
+  full_chain held out):
+  - 46 patterns, 4 of them single-layer.
+  - Recall on known types (held-in test) 66 / 69 (0.957 [0.880, 0.985]); on the held-out types 150 / 150 (1.000
+    [0.975, 1.0]).
+  - **Benign FP 5 / 60 (0.083 [0.036, 0.181]), above the 4 % tolerance.**
+  - **Reading:** the top patterns are single-layer evidence. "L1:HIGH" alone has support 0.545 at discriminativeness
+    1.0, and its multi-layer extensions add no support. "L3:MEDIUM" (benign support 0.071) carries the benign
+    false alarms. The miner finds today's L1, not a cross-layer structure.
+  - This is a measurement for the paper, not a gate (§36), so nothing is tuned on it.
+
+### Run 4 -- Mechanism D on L1 v15 (scratch/rca/paper/p04_conformal_l1.py -> p04_conformal_l1.json)
+- **Scoring:** layer1_check over Alpaca 0-999, NotInject 339, DIDA-Bench test benign 53 and WildJailbreak benign 210.
+- **Mechanism view:** split-conformal tau at config.L1_CONFORMAL_ALPHA on Alpaca 0-499. FPR with Clopper-Pearson 95 % on
+  Alpaca 500-999 (same source) and on the three shifted corpora. "Held" if the interval lies below alpha,
+  "significantly violated" if it lies above, otherwise "not resolved".
+- **Deployed view:** FPR of L1's own production decision on the same corpora.
+
+**Result, run 4 (2026-11-22 15:18; scratch/rca/paper/p04_conformal_l1.json, p04_scores.jsonl):** L1 v15 under the FINAL
+profile.
+
+**Mechanism view:** alpha = 0.01; the split-conformal tau on Alpaca 0-499 is 0.5494. FPR with Clopper-Pearson 95 %:
+
+| corpus | n | FPR | 95 % CI | verdict |
+|---|---|---|---|---|
+| Alpaca 500-999 (same source) | 500 | 0.0000 | [0, 0.0074] | **held** |
+| NotInject | 339 | 0.0206 | [0.0083, 0.0421] | not resolved |
+| DIDA-Bench test benign | 53 | 0.0000 | [0, 0.0672] | not resolved |
+| WildJailbreak benign | 210 | 0.0190 | [0.0052, 0.0480] | not resolved |
+
+**Deployed view** (L1's own decision != ALLOW; Wilson 95 %):
+
+| corpus | FP rate | 95 % CI | latency mean |
+|---|---|---|---|
+| Alpaca 0-499 | 0.002 | [0.0004, 0.0112] | 343 ms |
+| Alpaca 500-999 | 0.000 | [0, 0.0076] | 301 ms |
+| NotInject | 0.021 | [0.010, 0.042] | 300 ms |
+| DIDA-Bench benign | 0.000 | [0, 0.068] | 881 ms |
+| WildJailbreak benign | 0.019 | [0.007, 0.048] | **2,600 ms** |
+
+**Reading:**
+- The guarantee holds on the same source.
+- No shifted corpus significantly violates it: every lower bound is under alpha.
+  - In September, split-conformal FAILED on WildJailbreak benign at alpha 0.05 (FPR 0.2619; shift_conformal_eval.py).
+    Today's L1 reads 0.019 there at alpha 0.01.
+  - NotInject and WildJailbreak sit at about 2 x alpha, unresolved at these sizes. Both are inside the 4 % FP
+    tolerance.
+- **Latency on long prompts is over the 1 s mark.**
+  - Mean / median latency: 300 / 279 ms on Alpaca (median 65 characters); 881 / 467 ms on DIDA-Bench benign (median
+    399 characters); 2,600 / 2,491 ms on WildJailbreak benign (median 835 characters).
+  - Read time grows with the input length (RCA queued; the 772 ms per request of §27.3 was measured on the DIDA arms).
+
+### Run 3 -- third-party guard baselines (scratch/rca/paper/p03_guards.py -> p03_guards_<backend>.json)
+- **Backends:** ProtectAI deberta-v3 v2 and PIGuard (windowed max), Llama Guard 3 1B (P(unsafe), last 12,000 chars).
+- **Items:** the exact items behind today's rows.
+  - L1: TensorTrust fresh10 + NotInject + Alpaca eval + DIDA benign.
+  - L1H: the v4.1 TEST rows.
+  - L2: the t11 draw, 3,810 documents.
+  - L3: the v4 TEST conversations, minus audit exclusions.
+  - SYS: DIDA-Bench + arms v1 / v2.
+- **Metrics:** each guard at its own verdict (0.5), every metric of the board.
+- **Disclosure:** baselines read L3 v4's TEST items; that is not a read of DIDA's L3 and tunes nothing.
+
+### Run 2 -- SPLIT-Bench v3 against today's DIDA (sentinel/eval/split_bench_v3.py; build -> data/split_bench_v3, analyze)
+- **Why v1 / v2 retire:** they are hand-written fragment pools measured on the September layers (none ships today), and
+  their benign controls are synthetic shells.
+- **Construction:** v3 is SPLIT-S2's construction (second_stack.build_pools: the same natural-text pools for the same
+  seed; the same shell, certificate and budget), scored by DIDA's pipeline.
+  - **Evidence vector:** L1 and L3 from the decision axis; L2 = max(decision axis, continuous document channel), which
+    repairs interface site 7 for fusion; L4 and L5 from the decision axis.
+  - **Certificate:** the pipeline ALLOWS the session, every layer's evidence is <= 0.45, and >= k eligible carriers are
+    >= 0.15.
+  - **Eligibility:** L1, L2 and L3 are eligible only if continuous on the pools (>= 20 distinct in-band values).
+  - **Budget:** 4,080 candidates per bucket, target 170 per attack bucket and 340 benign. eps and theta_lo are never
+    loosened.
+- **Analysis (CPU, from stored scores):**
+  - C0: certificates re-verified.
+  - C2: decision axis vs evidence AUROC per layer.
+  - C3: constant layers and content-free separability.
+  - C4: correlation firings on certified sessions.
+  - Decomposition at zero benign FP (single layers, every OR, the cross-layer increment).
+  - Session e-value fusion (mean, product, Bonferroni union) with Jaccard vs the best single layer.
+  - The per-turn e-process with its Jaccard vs the L1 / L3 oracles.
+  - The learned alarm: logistic on the evidence vector, fit on the DIDA-Bench mining split (run 5's scores), tau
+    split-conformal at 2 % on half of benign arm v1, added alarms on the other half and on v2, ranking AUROC and
+    detections on v3.
+  - Capacity on the shared axis with the water-filling sweep.
+- **Also:** SPLIT-S2 (second_stack analyze) is re-run from its stored corpus with today's code. Its components are
+  unchanged, so it stays a current result.
+- **Unit tests:** tests/test_split_bench_v3.py (5 pass: evidence, certificate, decomposition, Proposition 1 on the mean
+  merge, capacity sweep).
+- **Implementation note (2026-11-22 00:29, before any v3 number; speed only):** inside both builds, L1 results are reused per turn text.
+  This is simulate_pipeline's opt-in l1_cache, byte-identical with the judge off. The drift / follow turns repeat
+  across candidates. Per-row latency_ms then excludes cached L1 reads; latency is not a v3 metric. The 5 tests
+  still pass.
+
+## 37. Repository check and a no-data hand-off pack (2026-11-22 15:09; user: "see the repo fully fix bugs ... he has a MacBook M5 ... just run tests")
+**Tests:**
+- **Local** (every resource, CPU): 2,164 passed, 4 skipped, 0 failed, in 7 min 44 s.
+- **Fresh-clone simulation** (committed files plus the tests, offline, empty model caches, no .env): 1,936 passed and
+  202 failed at first, all from setup rather than code.
+  - 180 needed setup alone: the small public MiniLM model, and pytest.ini (asyncio mode), which is gitignored.
+  - 22 needed what a clone cannot have:
+    - 7: the InjecAgent data (not redistributed);
+    - 6: Meta's gated Prompt-Guard-86M;
+    - 4: the full L1 model set (Prompt-Guard, PIGuard, the private fine-tuned weights);
+    - 3: gitignored result files;
+    - **2: a test bug.** The chat-backend tests stubbed the API key on app.py's own copy, but /sentinel/chat reads the
+      key pool from sentinel.config, so they passed only with a real .env. Fixed: the stub now patches the config.
+- New tests/_resources.py: a test that needs a gated model, private weights, non-redistributed data or a gitignored file
+  is now SKIPPED with its reason. Locally nothing is skipped, so coverage is unchanged.
+- **After the fixes,** the fresh-clone run (pytest.ini + MiniLM): 2,114 passed, 0 failed, 54 skipped.
+
+**Static scan (ruff: pyflakes and bugbear rules):**
+- **One real bug:** dataset_loaders._load_notinject used an undefined `_CACHE_DIR`. Whenever the NotInject cache was
+  missing, that raised a NameError and hid the intended FileNotFoundError and its build hint. Fixed: both cache paths
+  now use `_cache_path(...)`.
+- The other hits are false positives:
+  - string-only annotations in safety_guard.py;
+  - closures called within the same loop iteration (pdf_hidden.py, agentdojo_l4.py);
+  - FastAPI `File()` defaults;
+  - four unused locals that no logic reads.
+
+**Reproducibility:**
+- The phase-4 benchmark regenerates byte for byte.
+- The L5 corpus generator is deterministic on one machine, but 389 of its 550 texts differ from the shipped file. The
+  likely cause is Faker output changing between versions: requirements-eval.txt pins only `faker>=22.0.0`. The shipped
+  file stays the reference.
+
+**Hand-off pack (Parth: a MacBook, no AI, no coding):**
+- parth_instruction.md: plain setup steps.
+- parth_run.py: 8 resumable jobs, results in parth_results/ and parth_results.zip.
+  - preflight;
+  - the test suite;
+  - four cross-layer analyses from the SPLIT-Bench v1 / v2 stored scores (E, F, the e-process);
+  - two rebuild-and-compare checks.
+- parth_constraints.txt: this machine's library versions.
+- parth_pack.zip: the tests, pytest.ini and the files above. It is not committed.
+- A full pass in the fresh-clone simulation took 5.5 min. Every job was ok except the known L5 rebuild difference.
+
+**Not handed off (decision):** every remaining GPU run stays on this machine: L3 v4.1, paper runs 2-4 and the adoption
+re-read.
+- They read data the repository does not redistribute (WildChat / MHJ conversations, the real-user benign arm) and the
+  private fine-tuned L1 weights.
+- They run the nf4 4B on CUDA, the configuration the paper reports. 4-bit models reached Apple GPUs only in
+  bitsandbytes 0.50 (its release notes), and nothing of that path was tested here. The L3 TEST is read once.
+

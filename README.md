@@ -20,7 +20,7 @@
 [What it does](#what-it-does) ·
 [Results](#results) ·
 [The research](#research) ·
-[Contributions A–H](#contributions) ·
+[Contributions A–M](#contributions) ·
 [Architecture](#architecture) ·
 [Quick start](#quick-start) ·
 [Reproduce](#reproduce)
@@ -34,6 +34,7 @@
 - 🧱 **A runtime proxy** that screens every prompt, retrieved document, conversation, tool call and model output, with calibrated thresholds and a shared per-session evidence bus.
 - 🤖 **On a live Gemini agent** (AgentDojo), DIDA's tool-call check alone cuts attack success from **58.8% to 10.3%** with **zero loss** of benign task success. The full defense gets it to **4.4%**.
 - 🔬 **A research result:** layered guardrails don't compose the way people assume. No detector that reads threshold crossings can catch an attacker who keeps every layer just under its threshold. And no statistically valid fusion beats the best single layer unless it assumes the layers are independent. We prove both, then show they hold on DIDA **and** on a second stack built from third-party parts (LLM Guard + Llama Guard 3).
+- 🖥️ **Since the paper, fully local:** the final whole-system run (one read, 2026-11-19) blocks **96.6%** of DIDA-Bench attacks, blocks **0%** of 582 re-used and **0.19%** of 529 fresh benign requests, at **0.77 s** per request on a 4 GB laptop GPU with no hosted model call ([details](#since-the-paper)).
 - 📒 **Nothing hand-waved:** every number below comes from [`results.md`](results.md), the full lab log of every run, bug, fix and superseded figure.
 
 ---
@@ -44,7 +45,7 @@
 
 The results tables further down are the paper's measurements (September 2026). The work since then ran in rounds
 with pre-registered DEV / VAL / one-time TEST protocols on fresh, untouched test draws; everything is logged in
-[`results.md`](results.md) §18–§28 (every metric of every row: §21.5 and each round's own section; metrics policy and 95 % intervals: §21.1).
+[`results.md`](results.md) §18–§34 (every metric of every row: §21.5 and each round's own section; metrics policy and 95 % intervals: §21.1; the final whole-system run: §27.3).
 
 | Layer | What changed | Shipped by default? | Measured (fresh test draws) |
 |---|---|---|---|
@@ -124,7 +125,8 @@ with its logged root cause in [`results.md`](results.md):
   - **Input side, closed:** L1H v4.1, a request-harm read on the shared 4B (§32.6), reaches pooled recall 0.913, FP
     3.04 %, precision 0.964 and AUROC 0.989 at 221 ms. StrongREJECT and SST recall are 0.837 / 0.840. The user accepted
     it as near the marks; it is opt-in (`L1_HARM_LOCAL`) and not part of the measured system.
-  - **Reply side, closed at the measured frontier** (v6 / v6.1 / v6.2, §31.4 - §31.6): within one dataset the read
+  - **Reply side, closed at the measured frontier and not pursued further** (user decision 2026-11-20, §35; v6 /
+    v6.1 / v6.2, §31.4 - §31.6): within one dataset the read
     separates harm (VAL recall at 4 % FP 0.85 - 0.97). The datasets' harm policies, though, need different thresholds,
     and no single threshold, cluster calibration or nonlinear head serves them all.
 - **L3 on MHJ**: the remaining layer round.
@@ -134,7 +136,8 @@ with its logged root cause in [`results.md`](results.md):
     judged by Granite Guardian. It is built and unit-tested (`L3_MT_V4`, off).
   - **Run state:** the run was stopped by hand on 2026-11-20 before any probe or end-to-end number. Resume with
     `bash scratch/rca/l3/chain_l3_night2.sh`: VAL stop first, TEST only on a pass.
-- **L5 without any policy**: closed at the design limit (§33.6).
+- **L5 without any policy**: closed at the design limit (§33.6) and not pursued further (user decision 2026-11-20,
+  §35).
   - AgentLeak's leak label is a per-task policy, and the same field is allowed by one task's policy and forbidden by
     another's.
   - The best design point is recall 0.929 at FP 7.1 %. With a declared policy or the task-policy library, L5 meets
@@ -246,9 +249,9 @@ The math is classical: decision fusion, and Vovk and Wang's e-merging. The contr
 
 <a id="contributions"></a>
 
-## 🧬 What sets DIDA apart: contributions A–H
+## 🧬 What sets DIDA apart: contributions A–M
 
-Most guardrail projects ship detectors. DIDA also ships the machinery to **prove what a stack of detectors can and cannot catch**, and to measure it. These eight pieces are what you won't find in an off-the-shelf guardrail toolkit. The letters match the code and the released artifacts.
+Most guardrail projects ship detectors. DIDA also ships the machinery to **prove what a stack of detectors can and cannot catch**, and to measure it. A–H are the paper's contributions; their letters match the code and the released artifacts. I–M came after the paper (October–November 2026) and are not in it yet; the code names them by layer and flag.
 
 ### Cross-layer mechanisms
 
@@ -270,6 +273,19 @@ Most guardrail projects ship detectors. DIDA also ships the machinery to **prove
 
 > **Why this matters:** A–D are the cross-layer tricks people usually reach for. E–H explain where each one stops: three of the four reduce to a single layer on certified attacks, exactly as E predicts. That gives you a way to test *your own* guardrail stack before trusting it.
 
+### Since the paper: per-layer contributions I–M
+
+| | Contribution | What it does | Measured (fresh test draws, each read once) |
+|:---:|---|---|---|
+| **I** | **Action authorization at the tool boundary** | Each tool call is checked against an intent contract (which actions the user asked for, with which values), the lineage of every argument (the user, a system of record, or document text) and a trust matrix per argument class. A fully local profile writes the contract with the local Qwen3-4B. Includes a named-source rule and an operator capability registry. | AgentDojo held out, effect-level replay: **0 / 398** attacks with an effect when the user declines unexpected confirmations; benign tasks prompted **4.1%**. InjecAgent 100% stopped, 0 / 34 benign held; Agent Security Bench 99.5% stopped *(results.md §16–§17, §25)* |
+| **J** | **Policy-conditioned residual probe for documents** | A 4-bit local Qwen3-4B reads each document under a written document policy. A linear probe on its residual stream decides, with split-conformal thresholds per content type, a translated view for non-English text and windowed reads for long documents. | Eleventh untouched draw: recall **0.959**, FP **1.10%**, precision **0.992**, AUROC **0.996**, 0.92 s per document; BIPIA **0.969** *(results.md §20–§22)* |
+| **K** | **Answer-provenance guard (L6)** | The final answer may not repeat an identifier or a 6-word run that first entered the session through third-party data, using first-seen taint over structured spans of YAML / JSON records. It catches injected content relayed to the user, which no tool-call check sees. | The local 4B as the AgentDojo agent: recall **0.972**, FP **0 / 227**, precision **1.000**, 3.2 ms. 13 published agents: recall **0.997**, FP **0.14%**, precision **0.982** *(results.md §26)* |
+| **L** | **Task-policy library for output disclosure (L5)** | L5 does not guess which record fields are private. It enforces a per-task allowed-field policy, declared by the operator or matched by similarity from a library of task types, and matches the other fields' values exactly. | Fresh AgentLeak test (a local model's outputs on unseen scenarios): recall **0.997**, FP **3.85%**, precision **0.995** *(results.md §24)* |
+| **M** | **Label-agreement audit before a harm gate** | Before blaming a detector, measure the labels and score the reference judges stored with the benchmark on the same items. A gate stricter than human agreement cannot be read. | WildGuardTest labels (Fleiss kappa 0.50) put a single human annotator at recall 0.850 / FP 7.4% against the majority. On human-consensus items no stored judge (GPT-4, Llama-3-70B, HarmBench's 13B classifier) meets a 0.92 / 4% gate *(results.md §28)* |
+
+The layer upgrades behind the final system run, the fully local L1 v15 stack and the L1H v4.1 request-harm read, are listed in [Since the paper](#since-the-paper).
+
+
 <details>
 <summary><b>Where each contribution lives in the code</b></summary>
 
@@ -283,6 +299,11 @@ Most guardrail projects ship detectors. DIDA also ships the machinery to **prove
 | F | `sentinel/core/evidence_fusion.py`, `sentinel/eval/eprocess_eval.py` |
 | G | `sentinel/eval/split_bench.py`, `sentinel/eval/second_stack.py` |
 | H | `sentinel/eval/split_attack.py` |
+| I | `sentinel/layers/layer4_agentic/authz/`, `sentinel/layers/layer4_agentic/action_policy.py` |
+| J | `sentinel/layers/layer2_rag/local_detector.py`, `sentinel/layers/layer2_rag/translate_view.py`, `sentinel/core/local_judge.py` |
+| K | `sentinel/layers/layer6_answer/answer_guard.py` |
+| L | `sentinel/core/policy_library.py`, `sentinel/layers/layer5_output/layer5.py` |
+| M | `results.md` §28 (the analysis and its numbers) |
 
 </details>
 

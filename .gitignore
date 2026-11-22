@@ -102,3 +102,9 @@ skills-lock.json
 
 # ADR training corpus: derived from WildChat / WildGuardMix / Alpaca / XSum text, not redistributed
 sentinel/eval/data/addressee/
+
+# Parth's hand-off (2026-11-22): the instructions and the pinned versions ship; his results do not
+!parth_instruction.md
+!parth_constraints.txt
+parth_results/
+parth_results.zip

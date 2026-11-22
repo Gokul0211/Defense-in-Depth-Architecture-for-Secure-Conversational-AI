@@ -1211,7 +1211,7 @@ async def _build_injecagent_l4_sample(row: dict, sample_id: str) -> "EvalSample"
 def _load_orbench_hard(split: str = "test", limit: int | None = None,
                        cache: bool = True) -> EvalDataset:
     """OR-Bench-Hard-1K from the local cache (all benign). See the registry entry."""
-    path = _CACHE_DIR / "orbench" / "test" / "samples.jsonl" if "_CACHE_DIR" in globals() else         _DATA_DIR / "cache" / "orbench" / "test" / "samples.jsonl"
+    path = _cache_path("orbench", "test") / "samples.jsonl"
     samples = []
     if path.exists():
         for line in open(path, encoding="utf-8"):
@@ -1264,7 +1264,9 @@ def _load_notinject(split: str = "test", limit: int | None = None,
 
     import json as _json
 
-    cache_file = _CACHE_DIR / "notinject" / "test" / "samples.jsonl"
+    # was `_CACHE_DIR / ...`: an undefined name (NameError) whenever the cache was missing, so the helpful
+    # FileNotFoundError below never surfaced (2026-11-22, ruff F821).
+    cache_file = _cache_path("notinject", "test") / "samples.jsonl"
     if not cache_file.exists():
         raise FileNotFoundError(
             f"NotInject cache missing at {cache_file}. Build it with "
