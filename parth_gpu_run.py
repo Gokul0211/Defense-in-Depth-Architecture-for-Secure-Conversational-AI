@@ -18,6 +18,15 @@ What it does, in order (details: results.md §38):
   split_*    SPLIT-Bench v3: build, analysis, fusion-aware variant
   results    parth_gpu_results.zip -> send it back
 Stdlib only here; every model step runs in its own process (one model in memory at a time).
+
+Since 2026-11-23 evening (results.md §38.8, after the first run on Parth's M5):
+  - the preflight's matmul check moves the GPU result to the CPU BEFORE widening it to float64 (Apple's GPU has no
+    float64: the old order crashed), and checks every library the steps import, at this PC's versions
+  - code fixes to the scratch scripts (not in git) arrive as parth_gpu_patch.zip with `git pull`; applied once per
+    version before the next step, every file's sha256 checked
+  - an unexpected error inside a step stops the run the same way a failed step does (results zip, SEND THIS FILE BACK),
+    and every stop prints the end of the step's log
+  - the pack may also be a re-compressed zip (one top folder, as macOS makes) or an unzipped parth_gpu_pack folder
 """
 from __future__ import annotations
 
@@ -30,6 +39,7 @@ import shutil
 import subprocess
 import sys
 import time
+import traceback
 import zipfile
 from pathlib import Path
 
@@ -39,6 +49,8 @@ STATE = RES / "state"
 LOGS = RES / "logs"
 ZIP_OUT = ROOT / "parth_gpu_results.zip"
 PACK_NAME = "parth_gpu_pack.zip"
+PATCH_NAME = "parth_gpu_patch.zip"
+RUNNER_VERSION = "2026-11-23b"
 CACHE = Path.home() / ".cache"
 L3 = "scratch/rca/l3"
 PY = sys.executable
@@ -102,29 +114,94 @@ def cpu_env(e: dict | None = None) -> dict:
     return e
 
 
+LAST_LOG: list = []                                   # the log of the step that ran last (its tail is shown on a stop)
+
+# The defense's model parts FAIL SOFT: a model that cannot load or run logs one warning and the layer goes on without it
+# (e.g. "Prompt Guard inference failed, using Tier 2 score only"). On this PC none of these lines appear under the FINAL
+# profile (the guarded runs of results.md §38.8); the logs of earlier runs that had them were renamed *.bad_pig_device.
+# On the Mac one of them would mean the numbers are not the system's, so every step's log is watched while it runs and
+# the step stops at the first such line. The messages are the ones in sentinel/ (logger.warning ... unavailable /
+# unreadable / failed), plus any sentinel warning with those words.
+FALLBACK_TEXT = (
+    "signal absent", "ADR encoding failed", "attack bank unavailable", "data minimizer failed",
+    "local injection judge unavailable", "local injection judge failed", "multilingual model unavailable",
+    "perplexity model unavailable", "pipeline fusion unavailable", "policy library unreadable",
+    "local request-harm read failed", "FAILED its promotion gate", "safety head unavailable", "safety guard unavailable",
+    "safety guard inference failed", "safety guard response inference failed", "safety guard category inference failed",
+    "local jailbreak judge failed", "L1 will run Tier 2-only", "tier-fusion model unavailable",
+    "harm-content tier unavailable", "harm probe unavailable", "harm probe tier unavailable",
+    "new-tier anchors unavailable", "Prompt Guard inference failed", "LLM judge unavailable", "OCR unavailable",
+    "OCR failed", "calibrated on another ENS3 probe", "stack artifact unreadable", "fine-tuned stage unavailable",
+    "ProtectAI v2 unavailable", "PIGuard unavailable", "Prompt Guard 1 unavailable", "Prompt Guard unavailable for L2",
+    "L2 LLM check unavailable", "l2_thresholds_v8.json is missing", "local document detector failed",
+    "hidden-text scan failed", "no translation from it", "L3 multi-turn probe failed", "L3 multi-turn reply signal failed",
+    "rank fusion off", "response-side harm check failed", "L6 relay judge failed")
+
+
+def is_fallback(line: str) -> bool:
+    if any(t in line for t in FALLBACK_TEXT):
+        return True
+    return ("[WARNING] sentinel." in line or "[ERROR] sentinel." in line) and any(
+        w in line for w in ("unavailable", "unreadable", "failed"))
+
+
+def fallback_lines(log: Path, start: int) -> tuple[list, int]:
+    """Fallback lines in the whole lines written to `log` since byte `start`; the new start."""
+    try:
+        with open(log, "rb") as fh:
+            fh.seek(start)
+            chunk = fh.read()
+    except OSError:
+        return [], start
+    cut = chunk.rfind(b"\n") + 1
+    hits = [s.strip()[:240] for s in chunk[:cut].decode("utf-8", "replace").splitlines() if is_fallback(s)]
+    return hits, start + cut
+
+
+def tail(p: Path, n: int = 14) -> str:
+    try:
+        lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return ""
+    return "\n".join("    " + s[:200] for s in lines[-n:])
+
+
 def run(name: str, args: list, timeout_s: int, env: dict | None = None) -> int:
     """One process; output to logs/<name>.log; a short 'still running' line every 10 minutes."""
     LOGS.mkdir(parents=True, exist_ok=True)
     log = LOGS / f"{name}.log"
+    LAST_LOG[:] = [log]
     note(f"{name} START")
     t0 = time.time()
+    hits: list = []
     with open(log, "a", encoding="utf-8") as f:
-        f.write(f"\n===== {now()} {' '.join(str(a) for a in args)}\n")
+        shown = [str(a) if len(str(a)) <= 160 else f"<{len(str(a))} characters>" for a in args]   # not the -c code
+        f.write(f"\n===== {now()} {' '.join(shown)}\n")
         f.flush()
+        pos = log.stat().st_size                          # this run's lines only
         p = subprocess.Popen([str(a) for a in args], cwd=ROOT, env=env or base_env(), stdout=f, stderr=subprocess.STDOUT)
         last = t0
+
+        def stop_child():
+            p.terminate()
+            try:
+                p.wait(timeout=60)
+            except subprocess.TimeoutExpired:
+                p.kill()
         try:
             while True:
                 try:
                     rc = p.wait(timeout=30)
                     break
                 except subprocess.TimeoutExpired:
+                    new, pos = fallback_lines(log, pos)
+                    hits += new
+                    if hits:
+                        stop_child()
+                        rc = 125
+                        break
                     if time.time() - t0 > timeout_s:
-                        p.terminate()
-                        try:
-                            p.wait(timeout=60)
-                        except subprocess.TimeoutExpired:
-                            p.kill()
+                        stop_child()
                         rc = 124
                         break
                     if time.time() - last >= 600:
@@ -134,7 +211,11 @@ def run(name: str, args: list, timeout_s: int, env: dict | None = None) -> int:
             p.terminate()
             note(f"{name} STOPPED by Ctrl+C")
             raise
-    note(f"{name} END rc={rc} ({(time.time() - t0) / 60:.1f} min)")
+    hits += fallback_lines(log, pos)[0] if rc != 125 else []
+    note(f"{name} END rc={rc} ({(time.time() - t0) / 60:.1f} min)" + (f", {len(hits)} fallback line(s)" if hits else ""))
+    if hits:
+        raise Stop(f"{name}: a model part stopped working and the code went on without it (the numbers would not be "
+                   "the system's), so the step was stopped:\n    " + "\n    ".join(hits[:5]))
     return rc
 
 
@@ -157,22 +238,60 @@ def keep_awake():
 
 
 class Stop(Exception):
-    """A step failed: stop, make the results zip, tell Parth to send it."""
+    """A step failed: stop, make the results zip, tell Parth to send it (send=False: something Parth fixes himself, e.g.
+    a missing library, with the command to paste)."""
+
+    def __init__(self, msg: str, send: bool = True):
+        super().__init__(msg)
+        self.send = send
 
 
 # -------------------------------------------------------------------------------------------------------------- steps
+class _Pack:
+    """The pack as built (a zip with MANIFEST.json at its root), as macOS re-compresses it (every entry under one top
+    folder, plus __MACOSX/ entries), or as Safari leaves it (unzipped into a parth_gpu_pack folder). Every file is
+    checked against its sha256 in MANIFEST.json either way."""
+
+    def __init__(self, path: Path):
+        self.path, self.z, self.pre = path, None, ""
+        if path.is_dir():
+            if not (path / "MANIFEST.json").exists():
+                raise Stop(f"{path} has no MANIFEST.json: download {PACK_NAME} again and leave it zipped")
+            return
+        self.z = zipfile.ZipFile(path)
+        names = [n for n in self.z.namelist() if not n.startswith("__MACOSX/")]
+        if "MANIFEST.json" not in names:
+            tops = [n[:-len("MANIFEST.json")] for n in names if n.endswith("/MANIFEST.json") and n.count("/") == 1]
+            if len(tops) != 1:
+                self.z.close()
+                raise Stop(f"{path.name} is not the data pack (no MANIFEST.json inside): download {PACK_NAME} again "
+                           "and leave it zipped")
+            self.pre = tops[0]
+
+    def read(self, a: str) -> bytes:
+        return (self.path / a).read_bytes() if self.z is None else self.z.read(self.pre + a)
+
+    def open(self, a: str):
+        return open(self.path / a, "rb") if self.z is None else self.z.open(self.pre + a)
+
+    def close(self) -> None:
+        if self.z is not None:
+            self.z.close()
+
+
 def find_pack() -> Path:
     for d in (ROOT, Path.home() / "Downloads", Path.home() / "Desktop"):
-        p = d / PACK_NAME
-        if p.exists():
-            return p
+        for p in (d / PACK_NAME, d / PACK_NAME[:-len(".zip")]):    # the zip, or the folder Safari unzips it into
+            if p.exists():
+                return p
     raise Stop(f"{PACK_NAME} not found. Put it in your Downloads folder (or in {ROOT}) and run again.")
 
 
 def step_setup_pack():
     pack = find_pack()
     say(f"      using {pack}")
-    with zipfile.ZipFile(pack) as z:
+    z = _Pack(pack)
+    try:
         man = json.loads(z.read("MANIFEST.json"))
         need = sum(f["bytes"] for f in man["files"])
         free = shutil.disk_usage(ROOT).free
@@ -206,8 +325,11 @@ def step_setup_pack():
             n_new += 1
             if i % 300 == 0:
                 say(f"      {i}/{len(man['files'])} files")
+    finally:
+        z.close()
     note(f"pack {man['version']} built {man['built']}: {n_new} written ({n_code} scripts), {n_kept} kept")
     (RES / "pack_version.txt").write_text(man["version"] + "\n", encoding="utf-8")
+    (RES / "patch_version.txt").unlink(missing_ok=True)      # the pack rewrote the scripts: re-apply any code update
 
 
 def step_setup_convert():
@@ -221,40 +343,82 @@ def step_setup_convert():
             raise Stop(f"model conversion failed ({d.name})")
 
 
+# Every library the steps import, at this PC's version (scratch/rca/mac/dep_scan.json: every import statement of the code
+# the steps run, plus the modules the guarded runs on the PC actually loaded -- transformers loads accelerate only for
+# device_map, so no import statement shows it). (distribution, version, import name, numbers depend on it). A missing
+# library, or a different version of one the numbers depend on, stops at the preflight with one pip line to paste.
+LIBS = [("torch", "2.12.1", "torch", True), ("transformers", "5.12.1", "transformers", True),
+        ("tokenizers", "0.22.2", "tokenizers", True), ("safetensors", "0.8.0", "safetensors", True),
+        ("accelerate", "1.14.0", "accelerate", True), ("huggingface_hub", "1.17.0", "huggingface_hub", True),
+        ("sentencepiece", "0.2.2", "sentencepiece", True), ("protobuf", "5.29.6", "google.protobuf", True),
+        ("sentence-transformers", "5.6.0", "sentence_transformers", True), ("numpy", "2.4.4", "numpy", True),
+        ("scikit-learn", "1.9.0", "sklearn", True), ("scipy", "1.18.0", "scipy", True),
+        ("PyYAML", "6.0.3", "yaml", False), ("pandas", "3.0.2", "pandas", False), ("datasets", "5.0.0", "datasets", False),
+        ("pyarrow", "25.0.0", "pyarrow", False), ("Faker", "40.31.0", "faker", False),
+        ("python-dotenv", "1.2.2", "dotenv", False), ("pillow", "12.2.0", "PIL", False), ("pypdf", "6.14.2", "pypdf", False),
+        ("httpx", "0.28.1", "httpx", False), ("regex", "2026.5.9", "regex", False), ("tqdm", "4.67.3", "tqdm", False),
+        ("psutil", "7.2.2", "psutil", False), ("Jinja2", "3.1.6", "jinja2", False)]
+
 PREFLIGHT = r"""
-import json, platform, subprocess, sys, shutil
-import torch
-from sentinel.core.accel import device
-r = {"python": platform.python_version(), "torch": torch.__version__, "system": platform.platform(),
-     "machine": platform.machine(), "device": device(), "mps": bool(torch.backends.mps.is_available())}
+import importlib, importlib.metadata as md, json, platform, subprocess, sys, shutil
+r = {"python": platform.python_version(), "system": platform.platform(), "machine": platform.machine(),
+     "libraries": {}, "pip_fix": [], "other_versions": []}
+for dist, want, mod, core in json.loads(sys.argv[1]):
+    try:
+        importlib.import_module(mod)
+        have = md.version(dist)
+    except Exception as e:
+        r["libraries"][dist] = None
+        r["pip_fix"].append(f"{dist}=={want}")
+        continue
+    r["libraries"][dist] = have
+    if have.split("+")[0] != want:
+        r["pip_fix" if core else "other_versions"].append(f"{dist}=={want}")
+r["installed"] = {d.metadata["Name"]: d.version for d in md.distributions()}
+r["free_disk_gb"] = round(shutil.disk_usage(".").free / 1e9, 1)
 try:
     r["chip"] = subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"], capture_output=True, text=True).stdout.strip()
     r["ram_gb"] = round(int(subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True, text=True).stdout) / 2**30, 1)
     r["macos"] = platform.mac_ver()[0]
 except Exception as e:
     r["sysctl_error"] = str(e)
-r["free_disk_gb"] = round(shutil.disk_usage(".").free / 1e9, 1)
-import transformers, accelerate, safetensors, sentencepiece
-r["transformers"], r["accelerate"] = transformers.__version__, accelerate.__version__
+def done(code):
+    json.dump(r, open("parth_gpu_results/preflight.json", "w"), indent=1)
+    print({k: v for k, v in r.items() if k != "installed"})
+    sys.exit(code)
+if r["pip_fix"]:
+    done(4)
+import torch
+from sentinel.core.accel import device
+r.update({"torch": torch.__version__, "device": device(), "mps": bool(torch.backends.mps.is_available())})
 if r["mps"]:
+    # Apple's GPU has no float64: the GPU result goes to the CPU first, then widens to float64 there
     g = torch.Generator().manual_seed(0)
     a = torch.randn(512, 512, generator=g); b = torch.randn(512, 512, generator=g)
     ref = a.double() @ b.double()
-    r["mps_fp16_matmul_rel_err"] = float(((a.half().to("mps") @ b.half().to("mps")).double().cpu() - ref).abs().max() / ref.abs().max())
-    r["mps_bf16_matmul_rel_err"] = float(((a.bfloat16().to("mps") @ b.bfloat16().to("mps")).double().cpu() - ref).abs().max() / ref.abs().max())
+    r["mps_fp16_matmul_rel_err"] = float(((a.half().to("mps") @ b.half().to("mps")).cpu().double() - ref).abs().max() / ref.abs().max())
+    r["mps_bf16_matmul_rel_err"] = float(((a.bfloat16().to("mps") @ b.bfloat16().to("mps")).cpu().double() - ref).abs().max() / ref.abs().max())
     r["mps_recommended_max_gb"] = round(torch.mps.recommended_max_memory() / 2**30, 1)
-json.dump(r, open("parth_gpu_results/preflight.json", "w"), indent=1)
-print(r)
-ok = r["mps"] and r.get("ram_gb", 0) >= 15 and r["mps_fp16_matmul_rel_err"] < 0.01 and r["mps_bf16_matmul_rel_err"] < 0.05
-sys.exit(0 if ok else 3)
+ok = (r["mps"] and r.get("ram_gb", 0) >= 15 and r.get("mps_fp16_matmul_rel_err", 1) < 0.01
+      and r.get("mps_bf16_matmul_rel_err", 1) < 0.05)
+done(0 if ok else 3)
 """
 
 
 def step_preflight():
-    rc = run("preflight", [PY, "-B", "-X", "utf8", "-c", PREFLIGHT], 900)
-    if rc != 0:
-        raise Stop("this Mac cannot run the GPU steps (see parth_gpu_results/preflight.json): Apple GPU, >= 16 GB memory "
-                   "and the installed libraries are needed")
+    rc = run("preflight", [PY, "-B", "-X", "utf8", "-c", PREFLIGHT, json.dumps(LIBS)], 900)
+    if rc == 0:
+        return
+    pf = RES / "preflight.json"
+    r = json.loads(pf.read_text(encoding="utf-8")) if pf.exists() else {}
+    if rc == 4:
+        raise Stop("some libraries are missing, or at a different version than on the developer's PC. Paste these two "
+                   "lines, then run python parth_gpu_run.py again:\n\n    source .venv/bin/activate\n    pip install "
+                   + " ".join(r.get("pip_fix", [])), send=False)
+    if rc == 3:
+        raise Stop("this Mac cannot run the GPU steps (see parth_gpu_results/preflight.json): an Apple GPU, >= 16 GB "
+                   "memory and a passing numeric check are needed")
+    raise Stop(f"the preflight check itself crashed (exit code {rc}); the end of its log is above")
 
 
 def gate(part):
@@ -410,6 +574,36 @@ def make_zip() -> Path:
     return ZIP_OUT
 
 
+def apply_patch() -> None:
+    """Code fixes made after the pack: the scratch scripts are not in git, so their corrected versions come in
+    parth_gpu_patch.zip, which `git pull` brings (same layout as the pack: MANIFEST.json + repo/...). Applied once per
+    version, every file's sha256 checked; the pack's unpacking clears the record, so the fixes are re-applied after it."""
+    p = ROOT / PATCH_NAME
+    if not p.exists():
+        return
+    vf = RES / "patch_version.txt"
+    with zipfile.ZipFile(p) as z:
+        man = json.loads(z.read("MANIFEST.json"))
+        if vf.exists() and vf.read_text(encoding="utf-8").strip() == man["version"]:
+            return
+        for f in man["files"]:
+            a = f["path"]
+            if not a.startswith("repo/") or ".." in a.split("/"):
+                raise Stop(f"bad path in {PATCH_NAME}: {a}")
+            data = z.read(a)
+            if hashlib.sha256(data).hexdigest() != f["sha256"]:
+                raise Stop(f"{PATCH_NAME} is damaged ({a}): run git pull again")
+            dst = ROOT / a[len("repo/"):]
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            tmp = dst.with_name(dst.name + ".patching")
+            tmp.write_bytes(data)
+            os.replace(tmp, dst)
+    RES.mkdir(parents=True, exist_ok=True)
+    vf.write_text(man["version"] + "\n", encoding="utf-8")
+    note(f"code update {man['version']} applied: {len(man['files'])} files")
+    say(f"Code update {man['version']} applied ({len(man['files'])} files).\n")
+
+
 # --------------------------------------------------------------------------------------------------------------- main
 def status():
     for i, (name, desc, _) in enumerate(STEPS, 1):
@@ -426,20 +620,38 @@ def main():
         sys.exit(1)
     keep_awake()
     RES.mkdir(parents=True, exist_ok=True)
-    note(f"RUN START python {platform.python_version()} on {platform.platform()}")
-    say("Parth's GPU runs. Keep the MacBook plugged in with the lid open. Ctrl+C stops; run again to continue.\n")
+    note(f"RUN START runner {RUNNER_VERSION} python {platform.python_version()} on {platform.platform()}")
+    say(f"Parth's GPU runs (runner {RUNNER_VERSION}). Keep the MacBook plugged in with the lid open. Ctrl+C stops; "
+        "run again to continue.\n")
     try:
         for i, (name, desc, fn) in enumerate(STEPS, 1):
             if done(name):
                 say(f"[{i:2d}/{len(STEPS)}] {desc}: already done")
                 continue
             t0 = time.time()
+            LAST_LOG[:] = []
             say(f"[{i:2d}/{len(STEPS)}] {desc} (started {_dt.datetime.now().strftime('%H:%M')})")
-            info = fn() or ""
+            try:
+                if name != "setup_pack":
+                    apply_patch()
+                info = fn() or ""
+            except (Stop, KeyboardInterrupt):
+                raise
+            except Exception as e:                    # a bug in a step itself: the same stop path, traceback kept
+                LOGS.mkdir(parents=True, exist_ok=True)
+                err = LOGS / f"{name}.error.log"
+                err.write_text(traceback.format_exc(), encoding="utf-8")
+                LAST_LOG[:] = [err]
+                raise Stop(f"step '{name}' hit an unexpected error ({type(e).__name__}: {e})") from e
             mark(name, info)
             say(f"      done in {(time.time() - t0) / 60:.0f} min{' -- ' + info if info else ''}")
     except Stop as e:
         note(f"STOPPED: {e}")
+        if LAST_LOG and LAST_LOG[0].exists():
+            say(f"\nThe end of {LAST_LOG[0].relative_to(ROOT)}:\n{tail(LAST_LOG[0])}")
+        if not e.send:
+            say(f"\nSTOPPED: {e}\n")
+            sys.exit(2)
         z = make_zip()
         say(f"\nSTOPPED: {e}\n\nSEND THIS FILE BACK: {z}\n")
         sys.exit(2)

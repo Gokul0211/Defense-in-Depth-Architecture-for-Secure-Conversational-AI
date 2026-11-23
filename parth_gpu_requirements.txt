@@ -1,0 +1,29 @@
+# Every library parth_gpu_run.py's steps import, at the developer PC's versions (2026-11-23, results.md 38.8).
+# The same list the runner's preflight checks (LIBS in parth_gpu_run.py). Once, in the activated .venv:
+#   pip install -r parth_gpu_requirements.txt
+# torch is the plain macOS build of the version the PC runs as its CUDA build.
+torch==2.12.1
+transformers==5.12.1
+tokenizers==0.22.2
+safetensors==0.8.0
+accelerate==1.14.0
+huggingface_hub==1.17.0
+sentencepiece==0.2.2
+protobuf==5.29.6
+sentence-transformers==5.6.0
+numpy==2.4.4
+scikit-learn==1.9.0
+scipy==1.18.0
+PyYAML==6.0.3
+pandas==3.0.2
+datasets==5.0.0
+pyarrow==25.0.0
+Faker==40.31.0
+python-dotenv==1.2.2
+pillow==12.2.0
+pypdf==6.14.2
+httpx==0.28.1
+regex==2026.5.9
+tqdm==4.67.3
+psutil==7.2.2
+Jinja2==3.1.6

@@ -122,10 +122,8 @@ def _score_uncached(windows: list[str]) -> list[float | None] | None:
         return out
     except Exception as e:                                   # noqa: BLE001 -- fail toward flagging
         logger.warning(f"L6 relay judge failed: {e}")
-        try:
-            j.torch.cuda.empty_cache()
-        except Exception:                                    # noqa: BLE001
-            pass
+        from sentinel.core.accel import empty_cache          # NVIDIA or Apple GPU (2026-11-23, results.md 38.8)
+        empty_cache()
         return None
 
 

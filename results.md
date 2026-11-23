@@ -8635,3 +8635,132 @@ Run 4 (the L1 latency RCA, job 40) stays on this PC (§38.7).
     - the GPT-2 perplexity tier and multilingual-e5 are off by default;
     - the evaluation baselines are not loaded by the layers.
   - **Lesson:** a trace sees only the paths its inputs reach. Also list every model id in the code.
+
+### 38.8 First run on Parth's M5: two stops, the fixes, and a check of every GPU step (2026-11-23 18:18 - 19:58)
+- **What happened on the Mac** (his Terminal screenshot, then his assistant's diagnosis, both sent by the user; the
+  machine is an M5 MacBook Air, 16 GB, macOS 27.0.1, torch 2.12.1):
+  - 18:18 and 18:20: "parth_gpu_pack.zip not found" (the zip was not in Downloads yet).
+  - 18:29: the runner found a `parth_gpu_pack.zip` with no `MANIFEST.json` at its root, and stopped on an uncaught
+    KeyError: a traceback, no results zip.
+    - The pack built here has `MANIFEST.json` at its root (checked: 268 entries; top level `cache/`, `repo/`,
+      `MANIFEST.json`). So the file on the Mac was not the file built here.
+    - Most likely a re-compressed copy: Safari unzips a download by itself and removes the zip, which fits the two
+      "not found" runs before it, and macOS "Compress" puts every entry under one top folder. **Not confirmed.**
+    - Parth got past this step himself. His results zip will show how: STATUS.txt records the pack version and the
+      counts of files written and kept, and every file is sha256-checked on the way in.
+  - Then "Check this Mac" (the preflight) stopped twice:
+    1. `accelerate` was missing. His assistant installed 1.14.0, the version in `parth_constraints.txt`.
+       - **Root cause:** his environment is built from requirements.txt + requirements-eval.txt, and neither lists
+         accelerate. transformers imports it lazily, only for `device_map`.
+       - The clean room (§38.6) used this PC's Python environment. It tested the files Parth has, not his libraries.
+    2. `TypeError: Cannot convert a MPS Tensor to float64 dtype as the MPS framework doesn't support float64`, in the
+       fp16 and bf16 matmul checks.
+       - **Root cause:** `(a @ b).double().cpu()` widened the product to float64 while it was still on the Apple GPU,
+         and MPS has no float64. The right order is `.cpu().double()`. With it, the same check gives fp16 0.00044 and
+         bf16 0.0033 here (limits 0.01 and 0.05).
+       - The MPS branch cannot run on this PC, and the clean room stopped at the preflight's "no Apple GPU" exit, so
+         these lines never ran before the Mac.
+- **Fixes in `parth_gpu_run.py` (runner 2026-11-23b, printed on its first line):**
+  - The preflight moves the GPU result to the CPU before widening it.
+  - The preflight checks the 25 libraries the steps import, at this PC's versions (the list comes from the scan below).
+    - A missing library, or a different version of one of the 12 that numbers depend on, stops with one
+      `pip install` line to paste.
+    - That stop doesn't ask Parth to send a file.
+    - `parth_gpu_requirements.txt` (new, tracked) installs them all.
+  - **Every step's log is watched while it runs for the defense's fail-soft warnings**: 45 messages in `sentinel/`,
+    such as "Prompt Guard inference failed, using Tier 2 score only" or "local injection judge unavailable".
+    - **Why:** each model part, when it cannot load or run, logs one warning and the layer goes on without it.
+      `get_local_judge()` does the same, so a whole-system run without the 4B would finish with wrong numbers and no
+      stop.
+    - **The first such line stops the step:** the process is ended, the line is shown, and the step is not marked
+      done.
+    - **This has happened here before:** the runs renamed `scratch/rca/v2/*.bad_pig_device.log` had 350-529 such lines
+      each ("Expected all tensors to be on the same device").
+    - **On today's profile** the scanner finds 0 such lines in all 19 logs: the guarded runs below, the 80-sample
+      trace runs per arm (§38.5) and the clean room.
+  - An unexpected error inside any step now takes the normal stop path: the traceback goes to
+    `logs/<step>.error.log`, the results zip is made and SEND THIS FILE BACK is printed. Every stop also prints the end
+    of the step's log. The log's header line abbreviates the long `-c` code.
+  - The pack may also be a re-compressed zip (one top folder, `__MACOSX/` entries) or an unzipped `parth_gpu_pack`
+    folder. Every file is still checked against its sha256.
+  - Fixes to the scratch scripts can now ship through `git pull`. scratch/ is not tracked, so they arrive as
+    `parth_gpu_patch.zip`, in the same format as the pack, and are applied once per version before the next step.
+    Unpacking the pack clears that record, so a later unpack can't undo a fix. **None was needed this time.**
+  - **`sentinel/layers/layer6_answer/relay_judge.py`:** its fail-soft path freed GPU memory with
+    `torch.cuda.empty_cache()`, which does nothing on a Mac, so after an out-of-memory error the Apple GPU's cache
+    stayed full. It now uses `accel.empty_cache()` (NVIDIA or Apple), as the minimizer already did.
+- **Is the same mistake anywhere else?**
+  - **Static:** every Python file the Mac's steps run: the whole `sentinel` package, the 13 scratch entry scripts and
+    their local imports, `parth_gpu_run.py`.
+    - The preflight lines were the only float64 on a GPU tensor. Elsewhere float64 appears only in numpy on the CPU.
+    - No numpy array is moved to the GPU. The only `torch.tensor(..., device=...)` calls carry integer token ids.
+    - The `torch.cuda` calls on the Mac's path sit behind `torch.cuda.is_available()`, which is false on a Mac, so
+      those parts run on the CPU there, as planned.
+    - There is no `.cuda()`, `map_location="cuda"` or bitsandbytes import on it.
+  - **Dynamic: `scratch/rca/mac/f64guard.py`.**
+    - **Method:** it runs a step on this PC's GPU under a PyTorch dispatch mode, entered in every thread. The mode
+      raises on any float64 or complex128 tensor on a non-CPU device, whether an op's input or its output.
+    - **Self-test:** it catches a numpy float64 array moved to the GPU, and one created inside a worker thread whose
+      code catches the error. It passes the correct `.cpu().double()` order.
+    - **Time boxes:** `F64GUARD_LIMIT_S` stops a long step and keeps the report.
+    - **All runs** (`scratch/rca/mac/f64_runs/`):
+
+      | run | where | GPU ops seen | float64 on the GPU | note |
+      |---|---|---|---|---|
+      | A1 parity probe / reply | this repo, read-only (`parity_f64_*`) | 465,702 | none | output identical to the PC self-check |
+      | A2 parity judge (747 items) | same | 3,336,655 | none | identical |
+      | A3 parity replay (6 replies) | same | 674,265 | none | identical |
+      | B1 L3 TEST replay engine, 7 min | throwaway copy | 7,012,326 | none | resumed the pack's save point; hit and handled one OOM |
+      | B2 FINAL pipeline, 12 x 3 arms | copy | 105,867 / 64,984 / 54,323 | none | no fail-soft line |
+      | B3 SPLIT-Bench v3 build, 8 min | copy | 865,733 | none | into pool scoring (200 / 902) |
+      | C1 L5 minimizer (3 modes) + L6 relay judge, called directly | this repo | 38,871 | none | neither fell back |
+
+    - **About the copy:** it held the git files plus the pack's repo/ part (545 files) and was deleted afterwards.
+      This machine's save point (`l3v4_replay*.json*`, still timestamped 11:37), ledger and results were never
+      touched.
+    - **Coverage:** the judge-label step calls the same `Judge.p_yes` as A2, and the reply-signal step the same
+      `LocalJudge` read and pair features as A1.
+  - **What the guard cannot see:** code that runs only on Apple's GPU.
+    - **The fp16 loader on `mps`:** the same function as on CUDA (§38.6 loader check).
+    - **The Metal memory calls in `sentinel/core/accel.py`:** checked by hand against PyTorch's MPS allocator source.
+      - `set_per_process_memory_fraction` accepts 0-2 and is not checked against the low watermark, so the engine's
+        cap below 1.0 is valid.
+      - An allocation over the cap raises "MPS backend out of memory", which `accel.is_oom` matches.
+    - **The tokenizer files:** every non-weight file of both nf4 folders is in the converter's copy list.
+    - **On the Mac:** the parity gate runs these paths first, before the TEST.
+  - **The TEST features step:** it returns "all done" before loading a model, because all six TEST feature files are
+    in the pack. The Mac therefore uses this PC's TEST features, as planned.
+- **Libraries** (`scratch/rca/mac/dep_scan.py` -> `dep_scan.json`):
+  - Every import statement of the code the steps run (181 files), plus the 77 distributions the guarded runs loaded.
+  - Beyond requirements.txt + requirements-eval.txt, the steps need `accelerate`, `sentencepiece` and `protobuf`. All
+    three are now on the Mac.
+  - **The 25 loaded distributions not in his install are harmless:**
+    - aiohttp and its helpers come with `datasets` through an extra;
+    - `google-*` matches only the protobuf namespace;
+    - bitsandbytes is the CUDA path;
+    - the rest are optional imports that libraries take when present (brotli, trio, zstandard, pytz). None changes a
+      number.
+- **Runner checks** (`scratch/rca/mac/runner_check.py`; stdlib, temporary folder, fake home):
+  - **The nine checks:**
+    - T1: a re-compressed zip;
+    - T2: an unzipped folder;
+    - T3: a zip that is not the pack;
+    - T4: the patch zip;
+    - T5: an unexpected error in a step;
+    - T6: a stop Parth fixes himself;
+    - T7: the preflight library check;
+    - T8: a fail-soft line while a step runs. It was stopped after 30 s of a 120 s child.
+    - T9: a fail-soft line just before a clean exit. It was caught, and INFO lines and the sacremoses warning pass.
+  - **Result:** all nine pass. T4 failed first: the patch's record folder did not exist when the patch ran before
+    anything else. Fixed.
+  - **End to end** (`runner_room_check.sh`): in the copy, in Parth's state (unpack and convert done), the new runner:
+    - printed its version;
+    - skipped steps 1-2;
+    - passed the library check (25 found, nothing to fix);
+    - stopped at the Apple-GPU check, which is right on a PC, with the log's end shown, the results zip made and exit
+      code 2.
+- **Lessons:**
+  - A clean room that shares the developer's Python environment tests the files, not the environment. Check the
+    libraries too.
+  - Code that only runs on the other platform needs a guard for that platform's known limits (MPS: no float64).
+  - A fail-soft design needs a fail-loud watch on a platform nobody has measured it on.
