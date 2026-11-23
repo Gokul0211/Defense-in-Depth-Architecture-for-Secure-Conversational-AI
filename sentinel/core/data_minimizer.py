@@ -97,24 +97,24 @@ def _score_record(j, request: str, fields: list[str], mode: str = "needed", exam
     n0 = len(pre)
     cache = DynamicCache()
     with torch.no_grad():
-        j.model(input_ids=torch.tensor([pre], device="cuda:0"), past_key_values=cache, use_cache=True)
+        j.model(input_ids=torch.tensor([pre], device=j.dev), past_key_values=cache, use_cache=True)
     pad = j.tok.pad_token_id if j.tok.pad_token_id is not None else j.tok.eos_token_id
     out: list[float] = []
     budget = _BATCH_TOKENS_RAG if mode == "disclose_rag" else _BATCH_TOKENS
     bsz = max(1, min(_BATCH, budget // max(1, n0)))
     for k in range(0, len(sufs), bsz):
         rows = sufs[k:k + bsz]; b = len(rows); ls = max(len(r) for r in rows)
-        ids = torch.full((b, ls), pad, dtype=torch.long, device="cuda:0")
-        mask = torch.zeros((b, n0 + ls), dtype=torch.long, device="cuda:0"); mask[:, :n0] = 1
-        pos = torch.full((b, ls), n0, dtype=torch.long, device="cuda:0")
+        ids = torch.full((b, ls), pad, dtype=torch.long, device=j.dev)
+        mask = torch.zeros((b, n0 + ls), dtype=torch.long, device=j.dev); mask[:, :n0] = 1
+        pos = torch.full((b, ls), n0, dtype=torch.long, device=j.dev)
         for r, row in enumerate(rows):
-            ids[r, ls - len(row):] = torch.tensor(row, device="cuda:0")
+            ids[r, ls - len(row):] = torch.tensor(row, device=j.dev)
             mask[r, n0 + ls - len(row):] = 1
-            pos[r, ls - len(row):] = torch.arange(n0, n0 + len(row), device="cuda:0")
+            pos[r, ls - len(row):] = torch.arange(n0, n0 + len(row), device=j.dev)
         c = copy.deepcopy(cache); c.batch_repeat_interleave(b)
         with torch.no_grad():
             o = j.model(input_ids=ids, attention_mask=mask, position_ids=pos, past_key_values=c, use_cache=True,
-                        cache_position=torch.arange(n0, n0 + ls, device="cuda:0"), logits_to_keep=1)
+                        cache_position=torch.arange(n0, n0 + ls, device=j.dev), logits_to_keep=1)
         lp = torch.log_softmax(o.logits[:, -1].float(), -1)
         ly = torch.logsumexp(lp[:, j.yes], -1); ln = torch.logsumexp(lp[:, j.no], -1)
         out += [float(x) for x in torch.sigmoid(ly - ln).cpu()]
@@ -127,13 +127,13 @@ def _score_batch(j, rows: list[list[int]]) -> list[float]:
     torch = j.torch
     n = max(len(r) for r in rows)
     pad = j.tok.pad_token_id if j.tok.pad_token_id is not None else j.tok.eos_token_id
-    ids = torch.full((len(rows), n), pad, dtype=torch.long, device="cuda:0")
-    mask = torch.zeros((len(rows), n), dtype=torch.long, device="cuda:0")
-    pos = torch.zeros((len(rows), n), dtype=torch.long, device="cuda:0")
+    ids = torch.full((len(rows), n), pad, dtype=torch.long, device=j.dev)
+    mask = torch.zeros((len(rows), n), dtype=torch.long, device=j.dev)
+    pos = torch.zeros((len(rows), n), dtype=torch.long, device=j.dev)
     for i, r in enumerate(rows):
-        ids[i, n - len(r):] = torch.tensor(r, device="cuda:0")
+        ids[i, n - len(r):] = torch.tensor(r, device=j.dev)
         mask[i, n - len(r):] = 1
-        pos[i, n - len(r):] = torch.arange(len(r), device="cuda:0")
+        pos[i, n - len(r):] = torch.arange(len(r), device=j.dev)
     with torch.no_grad():
         out = j.model(input_ids=ids, attention_mask=mask, position_ids=pos, use_cache=False, logits_to_keep=1)
     lp = torch.log_softmax(out.logits[:, -1].float(), -1)
@@ -153,10 +153,8 @@ def _minimize_cached(request: str, fields: tuple, mode: str = "needed", examples
         return tuple(ps)
     except Exception as e:                                   # noqa: BLE001 -- fail soft: no inferred policy
         logger.warning(f"data minimizer failed on one record: {e}")
-        try:
-            j.torch.cuda.empty_cache()
-        except Exception:                                    # noqa: BLE001
-            pass
+        from sentinel.core.accel import empty_cache
+        empty_cache()
         return None
 
 

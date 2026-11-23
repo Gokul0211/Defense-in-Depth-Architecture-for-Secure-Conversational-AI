@@ -108,3 +108,7 @@ sentinel/eval/data/addressee/
 !parth_constraints.txt
 parth_results/
 parth_results.zip
+
+# Parth's GPU hand-off (2026-11-23, results.md 38): the instructions ship; the pack and his results do not
+!parth_gpu_instruction.md
+parth_gpu_results/

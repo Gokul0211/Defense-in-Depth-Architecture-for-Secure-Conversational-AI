@@ -190,6 +190,36 @@ def regenerate_job(module: str, data_dir: str):
     return job
 
 
+# Fingerprints of the FIXED L5 generator's output on the developer machine (Windows, 2026-11-23). The shipped corpus came
+# from an older state of the generator and cannot be rebuilt, so this job checks the rebuild across machines instead.
+L5_EXPECTED = {"all.jsonl": "2cc18aa340b286ae2c6b731948282c672ac017173757365332366c75e6dc9ede",
+               "metadata.json": "b9680976acc1ad623fd99be3a625035f4233e17f91f444ea8407b47ccea9fe9c",
+               "test.jsonl": "ad88c45eec46ca0783b32b10100a7abf564611aed0a55d2046d806c1d1ff073c",
+               "train.jsonl": "0df49ef439bcf1849a68aecfb29202cf449fc29a26a15a4c69cb36056adb2303"}
+
+
+def l5_reproducibility_job():
+    """Rebuild the L5 corpus twice into this job's folder (never over the shipped files) and compare both rebuilds with
+    each other (same machine) and with L5_EXPECTED (the developer machine)."""
+    def job(d: Path) -> dict:
+        code = ("import sys, pathlib; import sentinel.eval.generate_l5_corpus as g; "
+                "g._DATA_DIR = pathlib.Path(sys.argv[1]); g._DATA_DIR.mkdir(parents=True, exist_ok=True); "
+                "g.generate_l5_corpus()")
+        out, total = {}, 0.0
+        for run in ("run1", "run2"):
+            rd = d / run
+            if rd.exists():
+                shutil.rmtree(rd)
+            rc, secs = run_cmd([PY, "-c", code, str(rd)], d / f"log_{run}.txt", timeout_s=1800)
+            total += secs
+            out[run] = {"exit": rc, "sha256": {f.name: sha(f) for f in sorted(rd.iterdir())} if rd.exists() else {}}
+        same_machine = out["run1"]["sha256"] == out["run2"]["sha256"] and bool(out["run1"]["sha256"])
+        cross = {n: ("identical" if out["run1"]["sha256"].get(n) == h else "DIFFERENT") for n, h in L5_EXPECTED.items()}
+        return {"seconds": round(total, 1), "runs": out, "same_machine_identical": same_machine,
+                "files": cross, "ok": same_machine and all(v == "identical" for v in cross.values())}
+    return job
+
+
 JOBS = [
     ("00_preflight", job_preflight, "check the machine, libraries and files; fetch the one public model"),
     ("01_unit_tests", job_unit_tests, "the full test suite (about 2,170 tests)"),
@@ -206,8 +236,8 @@ JOBS = [
     ("06_rebuild_phase4_benchmark", regenerate_job("sentinel.eval.generate_phase4_benchmark",
                                                    "sentinel/eval/data/phase4_benchmark"),
      "reproducibility: rebuild the phase-4 benchmark and compare"),
-    ("07_rebuild_l5_corpus", regenerate_job("sentinel.eval.generate_l5_corpus", "sentinel/eval/data/custom_l5"),
-     "reproducibility: rebuild the L5 corpus and compare"),
+    ("07_rebuild_l5_corpus", l5_reproducibility_job(),
+     "reproducibility: rebuild the L5 corpus twice, compare with each other and with the developer machine"),
 ]
 
 

@@ -27,6 +27,23 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 _DATA_DIR = Path(__file__).parent / "data" / "custom_l5"
+
+# REPRODUCIBILITY FIX (2026-11-23). Faker's date_this_year(), date_of_birth() and credit_card_expire() are computed from
+# the CURRENT day (and its timestamp round-trip from the local timezone), so the same seed gave a different corpus on a
+# different day or machine (rebuilt on 11-22 / 11-23, Windows / macOS: 161 / 87 of 550 texts equal). Dates are now drawn
+# from the seeded `random` inside fixed 2024 ranges, and files are written with Unix line endings on every OS. The
+# shipped corpus came from an earlier state of this file and stays the reference the L5 results used (results.md §37).
+from datetime import date as _date, timedelta as _timedelta
+
+
+def _rand_date(start: "_date", end: "_date") -> "_date":
+    return start + _timedelta(days=random.randint(0, (end - start).days))
+
+
+def _rand_date_2024() -> "_date":
+    return _rand_date(_date(2024, 1, 1), _date(2024, 12, 31))
+
+
 _DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -156,12 +173,12 @@ def _generate_fake_pii() -> dict:
         "name": fake.name(),
         "ssn": fake.ssn(),
         "cc_number": fake.credit_card_number(),
-        "cc_exp": fake.credit_card_expire(),
+        "cc_exp": f"{random.randint(1, 12):02d}/{random.randint(25, 34):02d}",
         "phone": fake.phone_number(),
         "email": fake.email(),
         "address": fake.address().replace("\n", ", "),
-        "date": str(fake.date_this_year()),
-        "dob": str(fake.date_of_birth(minimum_age=18, maximum_age=90)),
+        "date": str(_rand_date_2024()),
+        "dob": str(_rand_date(_date(1934, 1, 1), _date(2006, 12, 31))),   # age 18 - 90 in 2024
         "condition": random.choice([
             "hypertension", "type 2 diabetes", "major depressive disorder",
             "generalized anxiety disorder", "chronic kidney disease",
@@ -252,11 +269,11 @@ def generate_l5_corpus(
         if fake_clean:
             # Add a unique, benign contextual sentence
             context_additions = [
-                f"This was last updated on {fake_clean.date_this_year()}.",
+                f"This was last updated on {_rand_date_2024()}.",
                 f"For reference, the case number is {fake_clean.bothify('??-####-???')}.",
                 f"Source: {fake_clean.company()} internal documentation, page {random.randint(1, 200)}.",
                 f"As noted in section {random.randint(1,12)}.{random.randint(1,9)}, {fake_clean.sentence()}",
-                f"According to the {fake_clean.date_this_year()} report, {fake_clean.sentence()}",
+                f"According to the {_rand_date_2024()} report, {fake_clean.sentence()}",
             ]
             extra = random.choice(context_additions)
             text = f"{base_text}\n\n{extra}\n\n{suffix}"
@@ -357,7 +374,7 @@ def generate_l5_corpus(
         "seed": seed,
     }
 
-    with open(_DATA_DIR / "metadata.json", "w") as f:
+    with open(_DATA_DIR / "metadata.json", "w", encoding="utf-8", newline="\n") as f:
         json.dump(summary, f, indent=2)
 
     logger.info(f"\n  Corpus generated:")
@@ -372,7 +389,7 @@ def generate_l5_corpus(
 
 
 def _save_jsonl(samples: list[dict], filepath: Path):
-    with open(filepath, "w", encoding="utf-8") as f:
+    with open(filepath, "w", encoding="utf-8", newline="\n") as f:
         for s in samples:
             f.write(json.dumps(s, ensure_ascii=False) + "\n")
 

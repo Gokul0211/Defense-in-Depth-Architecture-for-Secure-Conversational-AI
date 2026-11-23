@@ -109,14 +109,36 @@ class _StopForward(Exception):
 
 
 class LocalJudge:
+    @property
+    def dev(self):
+        """The device the model runs on (cuda:0 / mps). A judge built without __init__ (tests) falls back to the
+        model's own device."""
+        return getattr(self, "_dev", None) or self.model.device
+
+    @dev.setter
+    def dev(self, value):
+        self._dev = value
+
     def __init__(self, model_id: str, probe: dict | None = None):
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, DynamicCache
-        if not torch.cuda.is_available():
-            raise RuntimeError("local judge needs a CUDA GPU (4-bit weights)")
+        from sentinel.core.accel import device, fp16_dir
         self.torch = torch
+        self.dev = device()
         pre_q = Path(os.path.expanduser(local_quantized_dir()))
-        if (pre_q / "config.json").exists():
+        if self.dev == "mps":
+            # Apple silicon (2026-11-23): the exact fp16 dequantisation of the same pre-quantized weights
+            # (sentinel/core/nf4_to_fp16.py), loaded straight to the GPU (no CPU copy of the 8 GB).
+            fp = Path(fp16_dir(str(pre_q)))
+            if not (fp / "config.json").exists():
+                raise RuntimeError(f"local judge on Apple silicon needs the fp16 copy {fp} "
+                                   "(python -m sentinel.core.nf4_to_fp16 SRC DST)")
+            from sentinel.core.nf4_to_fp16 import load_model
+            self.tok = AutoTokenizer.from_pretrained(str(fp))
+            self.model = load_model(fp, "mps", torch.float16)       # fp16 throughout, as dtype=float16 below
+        elif not self.dev.startswith("cuda"):
+            raise RuntimeError("local judge needs a CUDA GPU (4-bit weights) or Apple silicon (fp16 copy)")
+        elif (pre_q / "config.json").exists():
             # A pre-quantized copy (scratch/rca/l1/tt22_prequantize.py): reads ~2.5 GB of 4-bit weights instead of the
             # 8 GB fp16 checkpoint through system RAM (the on-the-fly path left ~11 GB committed on an 8 GB machine).
             self.tok = AutoTokenizer.from_pretrained(str(pre_q))
@@ -140,7 +162,7 @@ class LocalJudge:
         self.suf = self._ids(full[i + len(_MARK):])
         self.cache = DynamicCache()
         with torch.no_grad():
-            self.model(input_ids=torch.tensor([self.pre], device="cuda:0"), past_key_values=self.cache, use_cache=True)
+            self.model(input_ids=torch.tensor([self.pre], device=self.dev), past_key_values=self.cache, use_cache=True)
         self.probe = probe
         self._captured = {}
         if probe is not None:
@@ -178,8 +200,8 @@ class LocalJudge:
         torch = self.torch
         body = self._body(text)
         n0 = len(self.pre)
-        x = torch.tensor([body], device="cuda:0")
-        pos = torch.arange(n0, n0 + len(body), device="cuda:0")[None]
+        x = torch.tensor([body], device=self.dev)
+        pos = torch.arange(n0, n0 + len(body), device=self.dev)[None]
         self._captured = {}
         stop_handle, out = None, None
         if stop_after_layer is not None:
@@ -231,7 +253,7 @@ class LocalJudge:
                 for k in range(len(marks))]
         cache = DynamicCache()
         with self.torch.no_grad():
-            self.model(input_ids=self.torch.tensor([pre], device="cuda:0"), past_key_values=cache, use_cache=True)
+            self.model(input_ids=self.torch.tensor([pre], device=self.dev), past_key_values=cache, use_cache=True)
         if not hasattr(self, "templates"):
             self.templates = {}
         self.templates[name] = {"pre": pre, "segs": segs, "cache": cache, "escape": escape or (lambda t: t),
@@ -360,8 +382,8 @@ class LocalJudge:
                 ids = ids[:h] + self._ids(" ... ") + ids[-h:]
             body += ids + seg
         n0 = len(t["pre"])
-        x = torch.tensor([body], device="cuda:0")
-        pos = torch.arange(n0, n0 + len(body), device="cuda:0")[None]
+        x = torch.tensor([body], device=self.dev)
+        pos = torch.arange(n0, n0 + len(body), device=self.dev)[None]
         self._captured = {}
         stop_handle, out = None, None
         if stop_after_layer is not None:
@@ -399,7 +421,7 @@ class LocalJudge:
         torch = self.torch
         text = self.tok.apply_chat_template([{"role": "system", "content": system}, {"role": "user", "content": user}],
                                             tokenize=False, add_generation_prompt=True)
-        enc = self.tok(text, return_tensors="pt", add_special_tokens=False).to("cuda:0")
+        enc = self.tok(text, return_tensors="pt", add_special_tokens=False).to(self.dev)
         self._captured = {}
         with torch.no_grad():
             out = self.model.generate(**enc, max_new_tokens=max_new_tokens, do_sample=False, temperature=None,
@@ -433,10 +455,8 @@ def local_judge_read(text: str, **kw) -> dict | None:
             return j.read(text, **kw)
     except Exception as e:                                  # noqa: BLE001
         logger.warning(f"local injection judge failed on one input: {e}")
-        try:
-            j.torch.cuda.empty_cache()
-        except Exception:                                   # noqa: BLE001
-            pass
+        from sentinel.core.accel import empty_cache
+        empty_cache()
         return None
 
 

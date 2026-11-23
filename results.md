@@ -8395,6 +8395,28 @@ guards at their own verdict (score >= 0.5), pooled per section. Columns: recall 
 - parth_constraints.txt: this machine's library versions.
 - parth_pack.zip: the tests, pytest.ini and the files above. It is not committed.
 - A full pass in the fresh-clone simulation took 5.5 min. Every job was ok except the known L5 rebuild difference.
+- **Parth's run (2026-11-23 15:14; MacBook, macOS arm64, Python 3.13.18, the pinned versions):** all 8 jobs in 2.7 min.
+  - Tests: 2,093 passed, 0 failed, 63 skipped, every skip with its reason. The extra skips need packages outside
+    requirements.txt (reportlab, agentdojo, google-genai, psutil) or uncached models (gpt2, multilingual-e5).
+  - The four cross-layer analyses reproduce this machine's numbers exactly:
+    - SPLIT-Bench v2 / v1 AUROCs;
+    - e-value fusion 0.1676 / 0.6059, guarantee held;
+    - e-process 0.4912 / 0.4441.
+  - The phase-4 rebuild is byte-identical.
+  - The L5 rebuild differs again, by platform: 87 / 550 texts equal on macOS against 161 / 550 on Windows, and its
+    metadata.json differs too. The current generator is not reproducible across machines; the shipped corpus stays the
+    reference.
+- **L5 generator fixed (2026-11-23):**
+  - **Root cause, measured:**
+    - Faker's date_this_year(), date_of_birth() and credit_card_expire() read the current day and convert through the
+      local timezone, so the same seed gave a different corpus on each day and machine.
+    - Files were written in text mode, so Windows wrote `\r\n`.
+  - **Fix:** dates come from the seeded `random` inside fixed 2024 ranges, and files are written with `\n`.
+  - **Check:** tests/test_l5_corpus_determinism.py (2 pass). Under a 400-day clock shift the fixed generator is
+    byte-identical with Unix line endings; the old one differs and writes `\r\n`.
+  - Job 07 of parth_run.py now rebuilds twice and compares against this machine's fingerprints (L5_EXPECTED), not
+    against the shipped file.
+  - The shipped corpus is unchanged; it stays the reference the L5 results used.
 
 **Not handed off (decision):** every remaining GPU run stays on this machine: L3 v4.1, paper runs 2-4 and the adoption
 re-read.
@@ -8403,3 +8425,213 @@ re-read.
 - They run the nf4 4B on CUDA, the configuration the paper reports. 4-bit models reached Apple GPUs only in
   bitsandbytes 0.50 (its release notes), and nothing of that path was tested here. The L3 TEST is read once.
 
+
+## 38. GPU runs 1-3 handed off to an Apple-silicon Mac (2026-11-23 16:10; user: "i wanna do these runs on parth's pc expect for 4,5,6 ... make sure he reumes from my save point")
+
+**Decision (user, 2026-11-23).** Runs 1-3 of the "work left" table move to Parth's MacBook (M5). This reverses §37's
+"not handed off".
+1. The L3 v4.2 TEST: the replays resume from this PC's save point, then the judge labels, the reply signal, the one TEST
+   read, and the judge sensitivity at 0.5 / 0.7.
+2. Only if the L3 TEST passes: the whole-system re-read with L3 v4 on.
+3. SPLIT-Bench v3: build, analysis, fusion-aware variant.
+
+Run 4 (the L1 latency RCA, job 40) stays on this PC (§38.7).
+
+### 38.1 The platform
+- **Base M5 (Apple):** a 10-core GPU with Neural Accelerators, 16 / 24 / 32 GB of unified memory, 153 GB/s. Sources:
+  support.apple.com/en-us/125405 and Apple's M5 announcement (2025-10).
+- **Backend:** PyTorch's Metal backend (MPS). bitsandbytes' 4-bit kernels are not used on the Mac: they reached Apple
+  GPUs only in 0.50 and are untested here.
+- **Known MPS risks:**
+  - silent wrong results on very large matrix products (arXiv 2609.22991), so prefill stays chunked;
+  - bf16 problems reported in the wild, so the preflight checks fp16 and bf16 matrix products against fp64.
+
+### 38.2 The same weights on the Mac: an exact nf4 -> fp16 conversion
+- **Converter:** `sentinel/core/nf4_to_fp16.py`. It reproduces bitsandbytes' arithmetic: the stored weight is
+  compute_dtype(state_dtype(fp32 product)). Output is ~1 GB shards plus `nf4_converted.json`. It is pure PyTorch, so it
+  runs on the Mac.
+- **Local 4B:** 252 / 252 quantized weights are equal to bitsandbytes' `dequantize_4bit` (`scratch/rca/l3/
+  nf4_check.json`). The 4B is loaded fp16 throughout, as LocalJudge loads it.
+- **L3 judge (Granite Guardian 3.1-2B):**
+  - **How the PC holds it:** quantized at load time, with no file of the 4-bit weights.
+  - **Saved as held in GPU memory:** `scratch/rca/mac/save_granite_nf4.py` -> `scratch/rca/mac/granite_nf4_check.json`.
+    280 / 280 weights convert exactly, and the reloaded copy gives identical P(yes) on 24 judge-curve items.
+  - **Its measured arithmetic is mixed:** bf16 embeddings, norms and head (transformers 5 loads with dtype "auto"), and
+    4-bit linears computing in fp16.
+  - **The Mac rebuilds that mix:** `load_model` keeps the linears in fp16, casting the input in and the output back as
+    `Linear4bit` does, and the rest in bf16.
+- **Not bit-identical in compute (recorded against a pre-set expectation):**
+  - bitsandbytes 0.50 multiplies with its own fused `gemm_4bit` kernel. One Granite `Linear4bit` against the converted
+    weight in a plain matmul differs by at most 1 bf16 ulp (0.0078) on the same GPU.
+  - The script's "exact" expectation for that one module check is therefore not met (its `pass` is false for this
+    reason alone).
+  - The weights are exact. The difference is the kernel's accumulation order: the platform noise the parity gate
+    measures.
+
+### 38.3 Code ported (behaviour on the NVIDIA PC unchanged)
+- **`sentinel/core/accel.py`:** the device (cuda:0 / mps / cpu, or forced by SENTINEL_DEVICE) and memory helpers with one
+  meaning on both GPUs. An empty CUDA_VISIBLE_DEVICES, which the queue uses to mark a step CPU-only, hides the Apple GPU
+  too.
+- **`local_judge.py`, `data_minimizer.py`, the replay engine and the L3 Granite judge:** every hard-coded "cuda:0"
+  replaced.
+  - **The engine on MPS:** a hard cap at the recommended working set, and out-of-memory caught as MPS's RuntimeError.
+  - **The lone path:** may use 1.5x the working set.
+- **Smaller classifiers:** they already fall back to CPU without CUDA (L1 fine-tune in fp32 there, fp16 on the PC). The
+  Mac's own L3-off baseline measures that difference (§38.5).
+
+### 38.4 Parity gate (rules written before any Mac number; `scratch/rca/mac/parity_gate.py`)
+- **What it compares:** the Mac's models against values this PC stored. It reads no TEST label and no TEST outcome.
+- **Rules (a check passes only if every rule holds):**
+  - **probe:** the L3 probe, re-read on 60 stored TEST-prefix FEATURES (inputs made before any TEST read), flips at
+    probe_tau on at most 2 % (<= 1).
+  - **reply:** the reply signal on every turn of 15 stored fresh-VAL conversations: flips at tau_L3 on at most 2 % of
+    turns.
+  - **judge:** Granite P(yes) on all 747 judge-curve items: flips at t = 0.9 on at most 2 %.
+  - **replay:** 6 first replies regenerated: mean common-prefix share >= 0.5, or >= 3 / 6 identical (a broken-model floor).
+  - **All four:** no NaN / inf.
+- **On a FAIL nothing else runs**, and the TEST stays unread.
+- **PC self-check (`scratch/rca/mac/parity_pc_*.json`):** every part identical to the stored values.
+  - probe: 60 / 60, max |diff| 0.0
+  - reply: 30 / 30 turns
+  - judge: 747 / 747; balanced accuracy at 0.9 is 0.8641 on both runs; 313 s
+  - replay: 6 / 6 identical
+  - The gate's code and data paths work, and the same-platform floor is zero.
+
+### 38.5 The hand-off
+- **Pack v1** (superseded by pack v2, §38.7) (`parth_gpu_pack.zip`, not committed, 229 files, 7.64 GB, sha256 manifest; built by
+  `scratch/rca/mac/build_pack.py`):
+  - **Models** (found by tracing the files the FINAL pipeline opens, `scratch/rca/mac/_trace_opens.py`):
+    - the local 4B (nf4) and the Granite judge (nf4, §38.2);
+    - the L1 fine-tune;
+    - opus-mt-mul-en;
+    - PIGuard;
+    - Prompt-Guard-86M (Llama 3.1 Community License; a notice is in the manifest);
+    - all-MiniLM-L6-v2.
+  - **Data and scripts git does not carry:**
+    - `scratch/rca/l3` (features, calibration, save point);
+    - the v6 reply-probe export;
+    - the FINAL profile and the metrics script;
+    - the benign arm v1;
+    - the SPLIT-S2 corpus and pools;
+    - the MHJ TEST audit file;
+    - the FINAL result files;
+    - the guard results.
+  - No `.env`, token or key: the builder refuses secret-like names.
+- **Save point:** TEST 430 conversations / 2,511 replies.
+  - 1,204 replies (48 %) were generated on this PC: 71 finished conversations (193 replies) and 1,011 in-flight replies
+    of 342 conversations.
+  - 1,307 replies (52 %) are left for the Mac. The engine restores the in-flight replies from
+    `l3v4_replay.partial.json`.
+  - Jobs 25b, 25c and 30-32 were moved out of this PC's queue (`scratch/rca/queue/moved_to_parth/`), so the two
+    machines cannot diverge.
+- **Runner:** `parth_gpu_run.py`, one command, 21 steps, each with a DONE marker.
+  - **Setup:** unpack with a sha256 check, keeping run progress and updating scripts; convert both models; preflight.
+  - **Parity gate.**
+  - **The L3 v4.2 TEST chain:** exactly `chain_l3_v42.sh test`, with the TEST read on CPU, then the sensitivity read.
+  - **The FINAL arms on the Mac with L3 off:** the platform's own reference. `scratch/rca/mac/platform_compare.py`
+    compares them sample by sample with this PC's FINAL files.
+  - **The L3 re-read:** only on a TEST pass.
+  - **SPLIT v3:** build, analysis and fusion-aware variant.
+  - **Results:** `parth_gpu_results.zip`.
+  - **Behaviour:** no sleep (`caffeinate`), Python timeouts, and a stop on any failure with the results zip made.
+- **Instructions:** `parth_gpu_instruction.md`. Steps: `git pull`, the pack into Downloads, two libraries, one command,
+  send the zip back.
+- **Disclosures for the report (planned now):**
+  - The TEST replies come from two machines with the same weights (shares above).
+  - The TEST labels and reply scores are computed on the Mac against thresholds set on this PC. The parity gate bounds
+    the flips.
+  - Every whole-system effect is read against the Mac's own L3-off arms, not against this PC's FINAL.
+  - SPLIT-Bench v3's analysis reads this PC's FINAL arms (p05 scores, benign arms) beside a Mac-built corpus;
+    `platform_compare` quantifies the platform part.
+
+### 38.6 Clean-room test of the hand-off (2026-11-23 16:08 - 16:16; `scratch/rca/mac/cleanroom.sh`, logs in `scratch/rca/mac/cleanroom_logs/`)
+- **Setup:**
+  - a fresh copy of the repository's tracked and non-ignored files: what Parth has after `git pull`, 371 files;
+  - an EMPTY home with only the pack in Downloads.
+- **The runner:**
+  - unpacked 229 files and checked every sha256 (24 s);
+  - converted the 4B in 1.3 min (8 shards, 8.04 GB; 252 converted + 146 copied tensors) and Granite in 0.9 min;
+  - stopped at the preflight, as it must on a PC with no Apple GPU. The stop path wrote the results zip.
+- **From the clean room's own files only, on this PC's GPU:**
+  - The FINAL pipeline ran on 12 samples of each arm (DIDA-Bench, benign v1, benign v2) without an error.
+  - The SPLIT pools came out identical to this machine's (902 / 1,817 / 820 / 84 / 372).
+  - The parity gate's 4B parts reproduced the stored values exactly: probe 60 / 60 and reply 30 / 30 (max |diff| 0.0),
+    replay 6 / 6 identical.
+- **Loader check** (`scratch/rca/mac/loader_check.json`):
+  - **Method:** both models are cut to their first 4 decoder layers. The converted copy runs through `load_model`, the
+    4-bit original through bitsandbytes, on the same GPU with one prompt.
+  - **Tokens:** the same top-1 and top-5 tokens for both models.
+  - **Logits max |diff|:**
+    - 4B: 0.016, at scale 15.5;
+    - Granite: 0.094, at scale 5.9. Its bf16 residual stream rounds the fp16 linear outputs.
+  - **Hidden-state max |diff|:** 0.06 (4B) at scale 77, and 1.5 (Granite) at scale 227.
+  - **Reading:** rounding-level differences, as expected from the kernel difference (§38.2). The Metal kernels
+    themselves cannot be tested here; the parity gate measures them on the Mac before the TEST.
+- **Recording bug (no effect on any result):** the clean-room script logged every exit code as 0, because
+  `echo "$(date) rc=$?"` reports date's status. Every step was therefore checked in its own log. The Mac runner reads
+  exit codes directly.
+- **Unit tests:** `tests/test_mac_port.py`, 8 tests on CPU. They cover:
+  - device choice;
+  - the nf4 bit order and rounding chain, including nested absmax;
+  - the 4-bit linear's dtype handling;
+  - out-of-memory detection;
+  - the LocalJudge device fallback.
+  - **Run:** these and the 18 test files that touch the changed modules: 233 passed (CPU, 23 s). The full local suite
+    was not re-run: over an hour on CPU, stopped at 3 % with no failure.
+
+### 38.7 Run 4 on this PC: why L1 takes ~2.6 s on long benign texts (job 40, 2026-11-23 16:22; diagnostic, no change)
+- **The question:** in run 4 (§36), L1 v15 took 2,600 ms per WildJailbreak-benign text (median 835 characters) but 300 ms
+  per Alpaca text (median 65).
+- **The runs:**
+  - `scratch/rca/paper/p06_l1_latency_rca.py` (job 40): cProfile of `layer1_check` under the FINAL profile, 40 texts per
+    corpus, 3-text warm-up -> `p06_l1_latency.json` / `.txt`. Before it ran, the `.txt` listing was fixed to go to the
+    file instead of stdout.
+  - `scratch/rca/paper/p06b_l1_latency_callgraph.py`: the same 40 WildJailbreak texts again, with the raw profile saved
+    and the time attributed to each model's top-level call -> `p06b_l1_callgraph.json` / `.prof`.
+- **Reproduced:**
+  - p06: 295 ms per Alpaca text, 2,647 ms per WildJailbreak-benign text.
+  - p06b: 1,881 ms on the same 40 texts, minutes later.
+  - Reading: the CPU-bound path varies about 30 % from run to run on this laptop (i5-12500H, 4 P-cores + 8 E-cores,
+    8 torch threads). A latency on this machine carries that spread.
+- **Where the time goes (p06b, ms per long text; together ~99 % of the 1,881 ms):**
+
+  | component | device | ms / text | share | notes |
+  |---|---|---|---|---|
+  | Prompt-Guard-86M | CPU fp32 | 734 | 39 % | median 214 tokens, max 743 (two 512-token windows) |
+  | PIGuard (tier 3) | CPU fp32 | 525 | 28 % | median 161 tokens |
+  | L1 fine-tune (v12 stack) | GPU fp16 | 191 | 10 % | |
+  | all-MiniLM-L6-v2 | CPU | 178 | 9 % | |
+  | ProtectAI v2 (v12 stack, on uncertain texts only) | CPU fp32 | 173 mean | 9 % | about 1.4 s on each of 5 / 40 texts |
+  | local 4B read (early exit, layer 24) | GPU nf4 | 58 mean | 3 % | read on 5 / 40 texts |
+
+- **Root cause:**
+  - Three DeBERTa-class encoders run in fp32 on the laptop CPU: Prompt Guard (mDeBERTa-v3-base, a 250K-token
+    vocabulary), and PIGuard and ProtectAI (DeBERTa-v3-base). This is by design: on the 4 GB card, the 4B plus these
+    classifiers spilled 1.42 GB into shared memory (measured 2026-11-03; `sentinel/core/guard_device.py` sends them to
+    the CPU).
+  - DeBERTa's disentangled attention adds a relative-position term per layer that grows with length. In p06,
+    `disentangled_attention_bias` alone is 14.5 s of the 105.8 s. A ~200-token text therefore costs about ten times a
+    ~15-token one.
+  - The 4B, which owns the GPU, is the cheap part (58 ms).
+- **Not a defect of the stack:** the same fine-tune costs 191 ms per text on the GPU in fp16, against PIGuard's 525 ms
+  on the CPU in fp32 at the same length.
+- **Levers, NOT applied (each needs a decision-parity check on stored items before adoption):**
+  1. The classifiers on a GPU with room for them (a larger card, or Apple-silicon unified memory). Expected 3-8x on
+     long texts. CPU / GPU score parity was measured when the CPU placement was introduced (`guard_device.py`: scores unchanged).
+  2. ONNX Runtime or dynamic int8 for the CPU encoders: about 2-3x on the CPU, with small score changes, so a parity
+     check is needed.
+  3. Run Prompt Guard / PIGuard only when the fine-tune's margin is uncertain. This changes the v15 decision path and
+     would need its own VAL / TEST.
+- **Side finding, it fixed Parth's pack:**
+  - ProtectAI v2 is loaded only for uncertain texts (5 / 40 here), and the L2 translate view loads opus-mt-zh-en only
+    for Chinese text. The file trace of the three FINAL arms (§38.5) never reached either, so pack v1 lacked both.
+  - On the Mac those texts would have silently taken another path: the stack without its ProtectAI term, or mul-en
+    instead of zh-en.
+  - **Pack v2** (`parth_gpu_pack.zip`, 263 files, 8.70 GB) adds both. `scratch/rca/mac/pack2_check.py` loads them
+    offline from the pack's files alone, with outputs equal to this PC's cache (ProtectAI probabilities, the zh -> en
+    translation).
+  - The other model ids in the defense code were checked by hand:
+    - Qwen3Guard is off (L1_HARM_HEAD=off);
+    - the GPT-2 perplexity tier and multilingual-e5 are off by default;
+    - the evaluation baselines are not loaded by the layers.
+  - **Lesson:** a trace sees only the paths its inputs reach. Also list every model id in the code.
