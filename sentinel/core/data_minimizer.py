@@ -104,28 +104,41 @@ def _score_record(j, request: str, fields: list[str], mode: str = "needed", exam
     bsz = max(1, min(_BATCH, budget // max(1, n0)))
     for k in range(0, len(sufs), bsz):
         rows = sufs[k:k + bsz]; b = len(rows); ls = max(len(r) for r in rows)
-        ids = torch.full((b, ls), pad, dtype=torch.long, device=j.dev)
-        mask = torch.zeros((b, n0 + ls), dtype=torch.long, device=j.dev); mask[:, :n0] = 1
-        pos = torch.full((b, ls), n0, dtype=torch.long, device=j.dev)
+        rows, ls = _bucketed(j, rows, ls)                    # Apple GPU only: a few shapes per run (accel.py)
+        nb = len(rows)
+        ids = torch.full((nb, ls), pad, dtype=torch.long, device=j.dev)
+        mask = torch.zeros((nb, n0 + ls), dtype=torch.long, device=j.dev); mask[:, :n0] = 1
+        pos = torch.full((nb, ls), n0, dtype=torch.long, device=j.dev)
         for r, row in enumerate(rows):
             ids[r, ls - len(row):] = torch.tensor(row, device=j.dev)
             mask[r, n0 + ls - len(row):] = 1
             pos[r, ls - len(row):] = torch.arange(n0, n0 + len(row), device=j.dev)
-        c = copy.deepcopy(cache); c.batch_repeat_interleave(b)
+        c = copy.deepcopy(cache); c.batch_repeat_interleave(nb)
         with torch.no_grad():
             o = j.model(input_ids=ids, attention_mask=mask, position_ids=pos, past_key_values=c, use_cache=True,
                         cache_position=torch.arange(n0, n0 + ls, device=j.dev), logits_to_keep=1)
         lp = torch.log_softmax(o.logits[:, -1].float(), -1)
         ly = torch.logsumexp(lp[:, j.yes], -1); ln = torch.logsumexp(lp[:, j.no], -1)
-        out += [float(x) for x in torch.sigmoid(ly - ln).cpu()]
+        out += [float(x) for x in torch.sigmoid(ly - ln).cpu()][:b]
         del c, o
     return out
+
+
+def _bucketed(j, rows: list[list[int]], n: int) -> tuple[list[list[int]], int]:
+    """Apple GPU (results.md §38.9, sentinel/core/accel.py): the batch is filled to a power of two with copies of its
+    last row (their outputs are dropped) and the left-padded length raised to a bucket (more masked left pads; the last
+    real token of every row stays at the last index). Elsewhere the batch is returned as it is."""
+    from sentinel.core.accel import bucket_batch, bucket_len, shape_buckets
+    if not shape_buckets(j.dev):
+        return rows, n
+    return rows + [rows[-1]] * (bucket_batch(len(rows)) - len(rows)), bucket_len(n)
 
 
 def _score_batch(j, rows: list[list[int]]) -> list[float]:
     """P(yes) per row: left-padded batch, explicit positions, the last real token of every row at the last index."""
     torch = j.torch
-    n = max(len(r) for r in rows)
+    b = len(rows)
+    rows, n = _bucketed(j, rows, max(len(r) for r in rows))   # Apple GPU only (see _bucketed)
     pad = j.tok.pad_token_id if j.tok.pad_token_id is not None else j.tok.eos_token_id
     ids = torch.full((len(rows), n), pad, dtype=torch.long, device=j.dev)
     mask = torch.zeros((len(rows), n), dtype=torch.long, device=j.dev)
@@ -138,7 +151,7 @@ def _score_batch(j, rows: list[list[int]]) -> list[float]:
         out = j.model(input_ids=ids, attention_mask=mask, position_ids=pos, use_cache=False, logits_to_keep=1)
     lp = torch.log_softmax(out.logits[:, -1].float(), -1)
     ly = torch.logsumexp(lp[:, j.yes], -1); ln = torch.logsumexp(lp[:, j.no], -1)
-    return [float(x) for x in torch.sigmoid(ly - ln).cpu()]
+    return [float(x) for x in torch.sigmoid(ly - ln).cpu()][:b]
 
 
 @lru_cache(maxsize=4096)

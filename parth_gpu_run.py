@@ -27,6 +27,10 @@ Since 2026-11-23 evening (results.md §38.8, after the first run on Parth's M5):
   - an unexpected error inside a step stops the run the same way a failed step does (results zip, SEND THIS FILE BACK),
     and every stop prints the end of the step's log
   - the pack may also be a re-compressed zip (one top folder, as macOS makes) or an unzipped parth_gpu_pack folder
+Since 2026-11-23 night (results.md §38.9, after the judge ran out of Apple-GPU memory: MPS keeps driver memory for every
+distinct tensor shape): the model code pads shapes to a few sizes on Apple's GPU, and a long resumable step that passes
+the memory limit saves and exits with 75 -- run() starts it again at once ("fresh process N"). The code update is
+applied at start, so a step it re-arms runs again in order.
 """
 from __future__ import annotations
 
@@ -50,7 +54,9 @@ LOGS = RES / "logs"
 ZIP_OUT = ROOT / "parth_gpu_results.zip"
 PACK_NAME = "parth_gpu_pack.zip"
 PATCH_NAME = "parth_gpu_patch.zip"
-RUNNER_VERSION = "2026-11-23b"
+RUNNER_VERSION = "2026-11-23c"
+RECYCLE_EXIT = 75                  # = sentinel/core/accel.py RECYCLE_EXIT: "progress saved, start me again" (§38.9)
+MAX_RECYCLES = 400
 CACHE = Path.home() / ".cache"
 L3 = "scratch/rca/l3"
 PY = sys.executable
@@ -167,52 +173,72 @@ def tail(p: Path, n: int = 14) -> str:
 
 
 def run(name: str, args: list, timeout_s: int, env: dict | None = None) -> int:
-    """One process; output to logs/<name>.log; a short 'still running' line every 10 minutes."""
+    """One step's command; output to logs/<name>.log; a short 'still running' line every 10 minutes. A command that
+    exits with RECYCLE_EXIT (75: it saved its progress because its Apple-GPU driver memory passed the limit, results.md
+    §38.9) is started again at once in a fresh process, up to MAX_RECYCLES times within the step's time limit. The log
+    is watched for fail-soft lines the whole time (FALLBACK_TEXT)."""
     LOGS.mkdir(parents=True, exist_ok=True)
     log = LOGS / f"{name}.log"
     LAST_LOG[:] = [log]
     note(f"{name} START")
     t0 = time.time()
     hits: list = []
+    recycles = 0
     with open(log, "a", encoding="utf-8") as f:
         shown = [str(a) if len(str(a)) <= 160 else f"<{len(str(a))} characters>" for a in args]   # not the -c code
         f.write(f"\n===== {now()} {' '.join(shown)}\n")
         f.flush()
         pos = log.stat().st_size                          # this run's lines only
-        p = subprocess.Popen([str(a) for a in args], cwd=ROOT, env=env or base_env(), stdout=f, stderr=subprocess.STDOUT)
         last = t0
+        while True:
+            p = subprocess.Popen([str(a) for a in args], cwd=ROOT, env=env or base_env(), stdout=f,
+                                 stderr=subprocess.STDOUT)
 
-        def stop_child():
-            p.terminate()
-            try:
-                p.wait(timeout=60)
-            except subprocess.TimeoutExpired:
-                p.kill()
-        try:
-            while True:
+            def stop_child():
+                p.terminate()
                 try:
-                    rc = p.wait(timeout=30)
-                    break
+                    p.wait(timeout=60)
                 except subprocess.TimeoutExpired:
-                    new, pos = fallback_lines(log, pos)
-                    hits += new
-                    if hits:
-                        stop_child()
-                        rc = 125
+                    p.kill()
+            try:
+                while True:
+                    try:
+                        rc = p.wait(timeout=30)
                         break
-                    if time.time() - t0 > timeout_s:
-                        stop_child()
-                        rc = 124
-                        break
-                    if time.time() - last >= 600:
-                        last = time.time()
-                        say(f"      still running ({(time.time() - t0) / 60:.0f} min) ...")
-        except KeyboardInterrupt:
-            p.terminate()
-            note(f"{name} STOPPED by Ctrl+C")
-            raise
+                    except subprocess.TimeoutExpired:
+                        new, pos = fallback_lines(log, pos)
+                        hits += new
+                        if hits:
+                            stop_child()
+                            rc = 125
+                            break
+                        if time.time() - t0 > timeout_s:
+                            stop_child()
+                            rc = 124
+                            break
+                        if time.time() - last >= 600:
+                            last = time.time()
+                            say(f"      still running ({(time.time() - t0) / 60:.0f} min) ...")
+            except KeyboardInterrupt:
+                p.terminate()
+                note(f"{name} STOPPED by Ctrl+C")
+                raise
+            if rc == RECYCLE_EXIT and recycles < MAX_RECYCLES and time.time() - t0 < timeout_s:
+                new, pos = fallback_lines(log, pos)
+                hits += new
+                if hits:
+                    break
+                recycles += 1
+                note(f"{name} fresh process {recycles} (GPU memory limit)")
+                if recycles == 1 or recycles % 10 == 0:
+                    say(f"      fresh process {recycles} (the Apple GPU's memory is cleared this way) ...")
+                f.write(f"\n===== {now()} fresh process {recycles}: the same command again\n")
+                f.flush()
+                continue
+            break
     hits += fallback_lines(log, pos)[0] if rc != 125 else []
-    note(f"{name} END rc={rc} ({(time.time() - t0) / 60:.1f} min)" + (f", {len(hits)} fallback line(s)" if hits else ""))
+    note(f"{name} END rc={rc} ({(time.time() - t0) / 60:.1f} min)" + (f", {recycles} fresh processes" if recycles else "")
+         + (f", {len(hits)} fallback line(s)" if hits else ""))
     if hits:
         raise Stop(f"{name}: a model part stopped working and the code went on without it (the numbers would not be "
                    "the system's), so the step was stopped:\n    " + "\n    ".join(hits[:5]))
@@ -599,9 +625,17 @@ def apply_patch() -> None:
             tmp.write_bytes(data)
             os.replace(tmp, dst)
     RES.mkdir(parents=True, exist_ok=True)
+    for rel in man.get("keep", []):                    # outputs of a re-run step, kept as they were (for comparison)
+        src = ROOT / rel
+        if src.exists() and ".." not in rel.split("/"):
+            shutil.copy2(src, src.with_name(f"{src.stem}.before_{man['version']}{src.suffix}"))
+    rerun = [st for st in man.get("rerun", []) if done(st)]
+    for st in rerun:                                   # steps whose numbers came from code this update changes
+        (STATE / f"{st}.done").unlink()
     vf.write_text(man["version"] + "\n", encoding="utf-8")
-    note(f"code update {man['version']} applied: {len(man['files'])} files")
-    say(f"Code update {man['version']} applied ({len(man['files'])} files).\n")
+    note(f"code update {man['version']} applied: {len(man['files'])} files" + (f"; re-run: {rerun}" if rerun else ""))
+    say(f"Code update {man['version']} applied ({len(man['files'])} files)"
+        + (f"; these steps run again with it: {', '.join(rerun)}" if rerun else "") + ".\n")
 
 
 # --------------------------------------------------------------------------------------------------------------- main
@@ -624,6 +658,15 @@ def main():
     say(f"Parth's GPU runs (runner {RUNNER_VERSION}). Keep the MacBook plugged in with the lid open. Ctrl+C stops; "
         "run again to continue.\n")
     try:
+        if done("setup_pack"):
+            # BEFORE the loop: an update can re-arm a step that is already done (its "rerun" list), and that step must
+            # run again in order, now -- not after the steps that follow it
+            try:
+                apply_patch()
+            except Stop:
+                raise
+            except Exception as e:                    # noqa: BLE001
+                raise Stop(f"the code update {PATCH_NAME} could not be applied ({type(e).__name__}: {e})") from e
         for i, (name, desc, fn) in enumerate(STEPS, 1):
             if done(name):
                 say(f"[{i:2d}/{len(STEPS)}] {desc}: already done")

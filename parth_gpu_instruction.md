@@ -5,10 +5,11 @@ need about **40 GB of free disk**. Keep the MacBook **plugged in with the lid op
 and other apps** while it runs: the model needs most of the Mac's memory. It takes a day or more and can run overnight.
 If it stops (closed lid, restart, Ctrl+C), paste the step 4 commands again and it carries on from where it stopped.
 
-## Already started? (the "Check this Mac" step crashed on 23 Nov)
+## Already started? (it stopped on 23 Nov: "Check this Mac", then "the L3 judge ... out of memory")
 
-That crash was a bug in my script, not your Mac. It's fixed. If you edited `parth_gpu_run.py` yourself (the `sed`
-command), that's fine: `git stash` below puts your edit aside. Open **Terminal** and paste:
+Both stops were my script, not your Mac, and both are fixed. If you edited `parth_gpu_run.py` yourself (the `sed`
+command), that's fine: `git stash` below puts your edit aside. This block is safe to paste again any time I send a fix.
+Open **Terminal** and paste:
 
 ```
 cd ~/Desktop/sentinel
@@ -20,8 +21,11 @@ pip install -r parth_gpu_requirements.txt
 python parth_gpu_run.py
 ```
 
-The first line it prints should say **runner 2026-11-23b**. It skips the steps that are already done (unpacking and
-converting) and carries on from "Check this Mac". Then go on with step 5 below.
+The first line it prints should say **runner 2026-11-23c**, then "Code update gpu-patch-1 applied". It skips the steps
+that are already done and carries on; one comparison step runs again with the update. Then go on with step 5 below.
+
+From now on it may print **fresh process N (the Apple GPU's memory is cleared this way)** during long steps. That's
+normal: the step saves its progress, restarts itself and carries on.
 
 ## 1. Get the new code
 

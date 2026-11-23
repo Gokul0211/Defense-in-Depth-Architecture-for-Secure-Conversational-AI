@@ -8764,3 +8764,106 @@ Run 4 (the L1 latency RCA, job 40) stays on this PC (§38.7).
     libraries too.
   - Code that only runs on the other platform needs a guard for that platform's known limits (MPS: no float64).
   - A fail-soft design needs a fail-loud watch on a platform nobody has measured it on.
+
+### 38.9 Second Mac stop: the judge ran out of Apple-GPU memory; shape buckets and process recycling (2026-11-23 20:10 - 21:25)
+- **What happened** (runner 2026-11-23b on Parth's M5, his Terminal output sent by the user):
+  - pip aligned two non-core libraries (PyYAML 6.0.4 -> 6.0.3, pyarrow 26.0.1 -> 25.0.0).
+  - "Check this Mac" passed.
+  - The parity probe / reply part finished (1 min).
+  - The judge part (747 Granite reads) stopped: `MPS backend out of memory (MPS allocated: 6.07 GiB, other allocations:
+    14.00 GiB, max allowed: 20.13 GiB). Tried to allocate 64.88 MiB on shared pool`, in the LM head.
+- **Reading the numbers:**
+  - 6.07 GiB is Granite's weights.
+  - 14.00 GiB of "other allocations" is Metal memory outside PyTorch's allocator.
+  - The failed request is the logits of one ~692-token input (49,155 x 692 x 2 bytes = 64.88 MiB), a normal item.
+  - The limit is 1.7 x the recommended working set of 11.84 GiB.
+  - So memory piled up across items. The Mac was already swapping, at 20 GiB on 16 GB, before the error.
+- **Root cause** (online search):
+  - ultralytics/ultralytics#26742 has the same torch 2.12.1, macOS 27.0.1, a 16 GB Mac and the same "max allowed:
+    20.13 GiB".
+    - Driver memory grows with every DISTINCT tensor shape and is never returned.
+    - `empty_cache()` only delays the error.
+    - Fixed shapes stay flat; padding to buckets stays flat. Their merged fix pads to powers of two on MPS.
+  - PyTorch issues #145374 and #145151 show the same "other allocations" growth.
+  - The judge feeds a different length almost every item, so it meets a new shape almost every time.
+  - CUDA has no such per-shape cost: no run on this PC could show it.
+- **Exposure:** every Mac GPU loop over inputs of varying length:
+  - the parity judge (747);
+  - the TEST labels (2,511 replies);
+  - the reply signal;
+  - the replay engine (1,307 replies, generation);
+  - the whole-system arms (L1 / L5 / L6 reads, L4 contract generation);
+  - both SPLIT builds.
+- **Fix, two layers, only on Apple's GPU** (`sentinel/core/accel.py`; the NVIDIA path runs exactly as before):
+  1. **Shape buckets.** Sequence lengths are padded to 64, 96, 128, 192, 256, ... (powers of two and 1.5 x them),
+     batch sizes to powers of two.
+     - **Single reads** (`LocalJudge.read` / `read_template` / `read_pair`, `Judge.p_yes`) get RIGHT pads. Attention is
+       causal, so no real token sees a pad. The read-out and the capture hooks take the last real token
+       (`logits_to_keep=[n-1]`, `_last`), and the pads' cache entries are cropped.
+     - **Batches that are already left-padded** get more masked left pads: the L5 minimizer and L6 relay judge
+       (`data_minimizer`), the replay engine's batched prefill, and `LocalJudge.generate`'s prompt. A batch is filled
+       with copies of its last row, whose outputs are dropped.
+  2. **Process recycling** (exit code 75). A resumable loop saves and exits when the driver memory passes 0.85 x the
+     recommended working set (~10.1 GiB on the M5). Runner 2026-11-23c starts it again at once, up to 400 times within
+     the step's time limit.
+     - **Parity judge and TEST labels:** made resumable (partial files, same order, same final file).
+     - **Reply signal:** already resumable per conversation.
+     - **Replay engine:** recycles after any step, with its in-flight checkpoint saved first. An Apple-GPU
+       out-of-memory error after at least one finished step now recycles instead of shrinking the batch.
+     - **SPLIT build:** recycles at its existing saves.
+     - **Fusion-aware build:** made resumable. It saved nothing until the end, so the runner's "continues if stopped"
+       was not true.
+  - **The whole-system arms are not resumable**, so they rely on the buckets alone. A fallback there stops the step
+    (§38.8's log watch), so it cannot pass silently.
+  - **The driver memory is now logged:** every 100 local-judge reads, every 50 judge items and every engine step. Parth's
+    logs will show the growth.
+- **Checks on this PC.** The buckets were forced on CUDA (`SENTINEL_SHAPE_BUCKETS=1`); the padding logic does not
+  depend on the device, only its trigger does. Restarts were forced (`SENTINEL_RECYCLE_EVERY`), and every command went
+  through the runner's own restart loop.
+
+  | check | items | max / median abs diff vs the PC's stored values | identical | decision flips |
+  |---|---|---|---|---|
+  | L3 probe, padded `LocalJudge.read` | 60 | 0.14 / 0.012 | 23 | 0 at probe_tau |
+  | L3 reply signal, padded `read_pair` | 30 | 0.022 / 0.009 | 0 | 0 at tau_L3 |
+  | Granite judge, padded, 3 fresh processes | 747 | 0.063 / 0.0 | 510 | 0 at t = 0.9 |
+  | L5 minimizer (3 modes x 7 fields), padded vs unpadded | 21 | 0.016 | | 0 at 0.5 |
+  | L6 relay judge, padded vs unpadded | 3 | 0.0000 | | |
+
+  - **Reading:** on CUDA, padding moves values at rounding level: other kernel shapes (bitsandbytes `gemm_4bit`,
+    attention tiling), amplified most near P = 0.5. There are 0 decision flips in 861 read-outs. On the Mac, the
+    parity gate measures the Apple-GPU and padding effect together against the PC.
+  - **The float64 guard on the padded paths:** no violation (probe / reply 466,045 GPU ops; minimizer and relay judge
+    clean).
+  - **Restarts in a copy of what Parth has** (`recycle_room.py`: the git files plus the pack, with the four scratch
+    scripts as in the patch; this machine's L3 files untouched, the copy deleted afterwards):
+    - **TEST replay engine,** padded, restarted every 3 steps, in a 9-minute box: 2 fresh processes. Each restored the
+      saved in-flight replies (1,008 -> 1,017 -> 1,020), and no conversation was written twice.
+    - **The labels code,** run on the 120 fresh-VAL replays (not the TEST) and restarted every 10 conversations (12
+      processes): equal to the stored VAL labels exactly, in the same order, with no partial file left.
+    - **The reply signal,** 30 stored design / VAL entries removed and recomputed with a restart every 10 conversations:
+      all 30 identical (reply and probe).
+  - **Fusion-aware build resume** (`fa_resume_check.py`, the pipeline replaced by a deterministic fake):
+    - uninterrupted: 60 accepted of 89 attempts;
+    - stopped at attempt 73, then restarted: rows, counters and rejection reasons identical;
+    - a forced recycle exits 75 at attempt 50 with its progress saved.
+    - **It found one bug in the new code before any run:** the loop's own `key` variable overwrote the progress key.
+      Renamed.
+  - **Runner checks** (`runner_check.py`): T10, the restart loop (exit 75 twice, then 0: two fresh processes, rc 0;
+    always 75: stops after MAX_RECYCLES), and T11, the patch's re-run and keep lists. All 11 checks pass.
+  - **End to end** (`patch_e2e_check.py`, on this GPU, buckets forced): a copy of what `git pull` gives Parth, in his
+    state after the second stop, run by the new runner up to the parity verdict.
+    - The runner printed "runner 2026-11-23c" and "Code update gpu-patch-1 applied (4 files); these steps run again with
+      it: parity_probe_reply".
+    - Steps 1-3 were skipped as done.
+    - Step 4 ran again (1 min). The judge ran in 3 processes (7 min), then the replay part.
+    - The gate PASSED on all four parts, and the old probe / reply files were kept as `.before_gpu-patch-1`.
+    - **This run found the last bug before it shipped:** the update was first applied just before the next step that
+      was not done. A step the update re-arms (step 4) was then already skipped, and would have run again only after
+      the TEST. The update is now applied at start, before the step loop.
+- **On the Mac after the update** (`parth_gpu_patch.zip`, gpu-patch-1, through git):
+  - The patch carries the four changed scratch scripts and re-runs the parity probe / reply part on the padded path.
+  - The first run's unpadded values are kept as `parity_*.before_gpu-patch-1.json`, so the padding effect can be
+    measured on the Mac itself.
+  - The parity gate then reads the judge part, which resumes if it recycles.
+- **Lesson:** a per-shape memory cost does not exist on the development GPU. Any long GPU loop on another backend needs
+  bounded shapes and a restart path that is tested before it ships.

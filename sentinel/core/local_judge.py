@@ -179,10 +179,34 @@ class LocalJudge:
 
     def _hook(self, layer, output):
         h = output[0] if isinstance(output, tuple) else output
-        self._captured[layer] = h[0, -1].detach().float().cpu().numpy()
+        self._captured[layer] = h[0, getattr(self, "_last", -1)].detach().float().cpu().numpy()
         span = getattr(self, "_pool_span", None)
         if span is not None:                               # read_pair: the mean over the reply tokens (harm v6)
             self._pooled[layer] = h[0, span[0]:span[1]].detach().float().mean(0).cpu().numpy()
+
+    # ---- Apple GPU shape buckets (results.md §38.9; sentinel/core/accel.py): a read's tokens are RIGHT-padded to a
+    # bucket length. Attention is causal, so no real token sees a pad: the states and logits of the real tokens are the
+    # unpadded ones (up to the rounding of a different kernel shape). The read-out and the capture hooks take the last
+    # REAL token (self._last); the pads' cache entries are cropped like the rest. Off on CUDA: every call is unchanged.
+    @property
+    def _pad_id(self) -> int:
+        t = self.tok
+        return t.pad_token_id if t.pad_token_id is not None else t.eos_token_id
+
+    def _pad_n(self, n: int) -> int:
+        from sentinel.core.accel import bucket_len, shape_buckets
+        return bucket_len(n) - n if shape_buckets(self.dev) else 0
+
+    def _keep(self, n: int, pad: int):
+        """logits_to_keep: the last position as before, or (padded) the index of the last real token."""
+        return self.torch.tensor([n - 1], device=self.dev) if pad else 1
+
+    def _mem_note(self):
+        """Every 100 reads on Apple's GPU: the driver memory, in the log (how fast the per-shape memory grows)."""
+        if self.calls % 100 == 0:
+            from sentinel.core.accel import driver_memory, is_mps
+            if is_mps(self.dev):
+                logger.info(f"local judge: {self.calls} reads, GPU driver memory {driver_memory(self.dev) / 2 ** 30:.2f} GiB")
 
     def _body(self, text: str) -> list[int]:
         from sentinel.layers.layer1_llm_judge import neutralise_delimiters
@@ -200,9 +224,11 @@ class LocalJudge:
         torch = self.torch
         body = self._body(text)
         n0 = len(self.pre)
-        x = torch.tensor([body], device=self.dev)
-        pos = torch.arange(n0, n0 + len(body), device=self.dev)[None]
+        n, pad = len(body), self._pad_n(len(body))
+        x = torch.tensor([body + [self._pad_id] * pad], device=self.dev)
+        pos = torch.arange(n0, n0 + n + pad, device=self.dev)[None]
         self._captured = {}
+        self._last = n - 1
         stop_handle, out = None, None
         if stop_after_layer is not None:
             def _stop(m, i, o):
@@ -212,13 +238,14 @@ class LocalJudge:
         try:
             with torch.no_grad():
                 out = self.model(input_ids=x, past_key_values=self.cache, use_cache=True, position_ids=pos,
-                                 cache_position=pos[0], logits_to_keep=1)
+                                 cache_position=pos[0], logits_to_keep=self._keep(n, pad))
         except _StopForward:
             out = None
         finally:
             if stop_handle is not None:
                 stop_handle.remove()
             self.cache.crop(n0)
+            self._last = -1
         if out is None:
             res = {"p_yes": None, "log_odds": None, "answer_mass": None, "probe": None,
                    "stopped_after_layer": stop_after_layer}
@@ -235,6 +262,7 @@ class LocalJudge:
                 res["probe"], res["probe_p"] = float(sc[0]), sc[1]
                 res["probe_tau"] = self.probe["tau"]
         self.calls += 1
+        self._mem_note()
         return res
 
     # ---- additional templates (L2 document judge, context-aware L1): one model, one prefix cache per template ----
@@ -332,10 +360,12 @@ class LocalJudge:
         cache = t["cache"]
 
         def fwd(ids, start):
-            x = torch.tensor([ids], device=self.model.device)
-            pos = torch.arange(start, start + len(ids), device=self.model.device)[None]
+            n, pad = len(ids), self._pad_n(len(ids))        # Apple GPU: right pads to a bucket (see _pad_n)
+            x = torch.tensor([ids + [self._pad_id] * pad], device=self.model.device)
+            pos = torch.arange(start, start + n + pad, device=self.model.device)[None]
+            self._last = n - 1
             return self.model(input_ids=x, past_key_values=cache, use_cache=True, position_ids=pos,
-                              cache_position=pos[0], logits_to_keep=1)
+                              cache_position=pos[0], logits_to_keep=self._keep(n, pad))
 
         def answer(out):
             lp = torch.log_softmax(out.logits[0, -1].float(), -1)
@@ -353,6 +383,7 @@ class LocalJudge:
                     self._pool_span = None
                 res["pooled"] = dict(self._pooled)
                 n1 = n0 + len(shared)
+                cache.crop(n1)                              # drops the shared read's pads, if any (else no-op)
                 for k, ids in enumerate((t["b0"], t["b1_pre"] + q_ids + t["b1_post"])):
                     if k:
                         cache.crop(n1)
@@ -363,7 +394,9 @@ class LocalJudge:
                 res["tokens"] = n1 + len(t["b1_pre"]) + len(q_ids) + len(t["b1_post"])
         finally:
             cache.crop(n0)
+            self._last = -1
         self.calls += 1
+        self._mem_note()
         return res
 
     def read_template(self, name: str, *slots: str, stop_after_layer: int | None = None) -> dict:
@@ -382,9 +415,11 @@ class LocalJudge:
                 ids = ids[:h] + self._ids(" ... ") + ids[-h:]
             body += ids + seg
         n0 = len(t["pre"])
-        x = torch.tensor([body], device=self.dev)
-        pos = torch.arange(n0, n0 + len(body), device=self.dev)[None]
+        n, pad = len(body), self._pad_n(len(body))
+        x = torch.tensor([body + [self._pad_id] * pad], device=self.dev)
+        pos = torch.arange(n0, n0 + n + pad, device=self.dev)[None]
         self._captured = {}
+        self._last = n - 1
         stop_handle, out = None, None
         if stop_after_layer is not None:
             def _stop(m, i, o):
@@ -394,13 +429,14 @@ class LocalJudge:
         try:
             with torch.no_grad():
                 out = self.model(input_ids=x, past_key_values=t["cache"], use_cache=True, position_ids=pos,
-                                 cache_position=pos[0], logits_to_keep=1)
+                                 cache_position=pos[0], logits_to_keep=self._keep(n, pad))
         except _StopForward:
             out = None
         finally:
             if stop_handle is not None:
                 stop_handle.remove()
             t["cache"].crop(n0)
+            self._last = -1
         if out is None:
             res = {"p_yes": None, "log_odds": None, "probe": None, "stopped_after_layer": stop_after_layer}
         else:
@@ -413,6 +449,7 @@ class LocalJudge:
             if sc is not None:
                 res["probe"], res["probe_p"], res["probe_tau"] = float(sc[0]), sc[1], pr["tau"]
         self.calls += 1
+        self._mem_note()
         return res
 
     def generate(self, system: str, user: str, max_new_tokens: int = 600) -> str:
@@ -422,6 +459,12 @@ class LocalJudge:
         text = self.tok.apply_chat_template([{"role": "system", "content": system}, {"role": "user", "content": user}],
                                             tokenize=False, add_generation_prompt=True)
         enc = self.tok(text, return_tensors="pt", add_special_tokens=False).to(self.dev)
+        n = enc["input_ids"].shape[1]
+        pad = self._pad_n(n)
+        if pad:              # Apple GPU: masked LEFT pads, so the prompt is one of a few lengths (see _pad_n)
+            ids, mask = enc["input_ids"], enc["attention_mask"]
+            enc = {"input_ids": torch.cat([ids.new_full((1, pad), self._pad_id), ids], 1),
+                   "attention_mask": torch.cat([mask.new_zeros((1, pad)), mask], 1)}
         self._captured = {}
         with torch.no_grad():
             out = self.model.generate(**enc, max_new_tokens=max_new_tokens, do_sample=False, temperature=None,

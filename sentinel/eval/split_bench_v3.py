@@ -106,6 +106,14 @@ def _save(path: Path, state: dict) -> None:
     tmp.replace(path)
 
 
+def _recycle_if_due(what: str, n: int) -> None:
+    """Apple GPU (results.md §38.9, sentinel/core/accel.py): called right after a save, so a fresh process continues
+    from it (same pools, same random stream). Never fires on CUDA / CPU unless SENTINEL_RECYCLE_* is set."""
+    from sentinel.core import accel
+    if accel.recycle_due(None, n):
+        accel.recycle_exit(what)
+
+
 async def build(args) -> None:
     from sentinel.eval.pipeline_sim import simulate_pipeline
     from sentinel.eval.second_stack import BENIGN_TOOLS, build_pools, render, _rng_state_from_json, _rng_state_to_json
@@ -126,6 +134,7 @@ async def build(args) -> None:
         if (i + 1) % 100 == 0:
             _save(pool_path, ps)
             print(f"pool scoring {i + 1}/{len(cand)} ({time.time() - t0:.0f}s)", flush=True)
+            _recycle_if_due(f"pool scoring {i + 1}/{len(cand)}", i + 1)
     _save(pool_path, ps)
     c = ceiling()
     band = {L: [x for x in cand if THETA_LO <= ps[L][x] <= c] for L in ("L1", "L2")}
@@ -173,6 +182,7 @@ async def build(args) -> None:
             att += 1
             if att % 50 == 0:
                 checkpoint(bname, acc, att, reasons)
+                _recycle_if_due(f"{bname} attempt {att}", att)
             layers = () if k == 0 else tuple(sorted(rng.sample(eligible, k)))
             doc = rng.choice(pools["docs"])
             if "L2" in layers:
@@ -423,7 +433,7 @@ async def build_fusion_aware(args) -> None:
     of the latest analysis (its weights and deployment tau, unchanged). Target 60, the same 4,080 budget; acceptance
     rate vs the per-layer adversary's is the quantity reported. Writes data/split_bench_v3_fusion_aware/."""
     from sentinel.eval.pipeline_sim import simulate_pipeline
-    from sentinel.eval.second_stack import BENIGN_TOOLS, build_pools, render
+    from sentinel.eval.second_stack import BENIGN_TOOLS, build_pools, render, _rng_state_from_json, _rng_state_to_json
     from sentinel.eval.split_bench_eval import _apply
     import sentinel.config as cfg
     fa = sorted(_RESULTS.glob("split_bench_v3_analysis_*.json"))
@@ -445,9 +455,27 @@ async def build_fusion_aware(args) -> None:
     out_dir = _DATA.parent / "split_bench_v3_fusion_aware"
     out_dir.mkdir(parents=True, exist_ok=True)
     rows, acc, att, reasons, t0 = [], 0, 0, {}, time.time()
+    # resumable since 2026-11-23 (results.md §38.9), as build(): the accepted rows, the counters and the RNG state are
+    # saved every 50 attempts and after every accepted session; a new start with the same seed / budget / target /
+    # alarm continues from them on the same random stream
+    prog_path = out_dir / "progress.json"
+    prog_key = {"seed": args.seed, "budget": args.budget, "target": args.target, "alarm_from": fa[-1].name}
+    if prog_path.exists():
+        prog = json.loads(prog_path.read_text(encoding="utf-8"))
+        if {k: prog.get(k) for k in prog_key} == prog_key:
+            rows, acc, att, reasons = prog["rows"], prog["acc"], prog["att"], prog["reasons"]
+            rng.setstate(_rng_state_from_json(prog["rng"]))
+            print(f"resumed: {acc} accepted of {att} attempts", flush=True)
+
+    def checkpoint():
+        _save(prog_path, {**prog_key, "rows": rows, "acc": acc, "att": att, "reasons": reasons,
+                          "rng": _rng_state_to_json(rng.getstate()), "elapsed_s": round(time.time() - t0)})
     l1c: dict = {}     # as in build(): L1 per turn text, reused
     while acc < args.target and att < args.budget:
         att += 1
+        if att % 50 == 0:
+            checkpoint()
+            _recycle_if_due(f"fusion-aware attempt {att}", att)
         layers = tuple(sorted(rng.sample(eligible, 2)))
         doc = rng.choice(pools["docs"]) + (" " + rng.choice(band["L2"]) if "L2" in layers else "")
         first = rng.choice(pools["carriers"]) + (" " + rng.choice(band["L1"]) if "L1" in layers else "")
@@ -465,6 +493,7 @@ async def build_fusion_aware(args) -> None:
         rows.append({"sample_id": f"v3fa_{acc}", "label": "malicious", "bucket": "k=2", "targeted_layers": list(layers),
                      "text": text, "evidence": {L: round(v, 6) for L, v in ev.items()}, "alarm_score": round(alarm, 6),
                      "final_decision": res.final_decision, "certificate": cert})
+        checkpoint()
     (out_dir / "all.jsonl").write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
     rep = {"generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"), "alarm_from": fa[-1].name, "tau": tau,
            "accepted": acc, "attempts": att, "acceptance": round(acc / att, 4) if att else None, "rejections": reasons,
