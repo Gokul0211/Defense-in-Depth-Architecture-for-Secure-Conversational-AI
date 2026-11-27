@@ -58,6 +58,8 @@ with pre-registered DEV / VAL / one-time TEST protocols on fresh, untouched test
 | **L6** answers | **Answer-provenance guard** v3.4: the final answer may not repeat an identifier or a 6-word run that first entered the session through third-party data (structured spans over YAML / JSON records, first-seen taint, whole-token identifiers, spotlighting-tolerant units, nothing before the first cue, an explicit closing tag ends the block). | v3.4 rules default ON since 2026-11-15 (`L6_STRUCTURED_SPAN`, `L6_TAINT_FIRST_SEEN`, `L6_BOUNDED_IDENT`, `L6_SPAN_V33`, `L6_SPAN_CLOSE_TAG`); L6 itself is opt-in. | Fresh local-agent TEST5 (the local Qwen3-4B as the AgentDojo agent, 406 answers, 179 relays), read once: recall **0.972**, FP **0.00 %** (0 / 227), precision **1.000**, F1 0.986, AUROC 0.986, 3.2 ms; ignore_previous recall 0.911 (51 / 56, accepted). v3.1 on 13 published agents (TEST2): recall 0.997, FP 0.14 %, precision 0.982. |
 | **Harm** (reply side) | The local 4B reads each reply in the context of the request (a probe on its forward pass, stacked with its yes / no read-out), where harm is explicit instead of disguised. | No (`L5_HARM_LOCAL` off). v5 failed (Do-Not-Answer recall 0.062: a reply-only read cannot see question-relative harm; XSTest 0.811); v6 (reply-first two-view read) separates within every dataset (VAL recall at 4 % FP 0.85 - 0.97) but no single threshold serves the datasets' different harm policies; its VAL gate failed and the TEST stays unread (results.md §31.4 - §31.5). | Fresh human-consensus labels (all three annotators agree), read once: JailbreakBench judge set recall 0.833 / FP 6.2 % / F1 0.852; HarmBench val set 0.881 / 6.6 % / 0.892; AUROC 0.96 / 0.97; 0.4 - 0.6 s per reply. No judge stored with those sets meets the mark on the same items either (GPT-4, Llama-3-70B and HarmBench's 13B classifier all exceed 4 % FP); on majority labels (WildGuardTest, kappa 0.50) a single human annotator scores recall 0.85 / FP 7.4 % (results.md §28). |
 | **Whole system** (final run) | All adopted layers in the local profile, no hosted calls. Profile final_ct: 8 CPU threads and the L1 fine-tuned tier in fp16, which stops the 4B spilling into system memory. | -- | FINAL run, read once (2026-11-19, results.md §27.3): DIDA-Bench 59 attacks blocked **0.966** [0.885, 0.991]. Benign blocked **0 / 582** (re-read) and **1 / 529** on a fresh arm (0.19 %); any alarm on benign **1.03 % / 1.32 %**. Block precision **1.000 / 0.983**, AUROC **0.9998**, **772 ms** mean per request (interim WS1: 3.6 s). Every mark is met except any-alarm precision on the fresh arm, **0.892**: 5 of its 7 benign warnings are L5 e-mail warnings with no operator policy. The run happened before the L3 v4 round because of a chain fault, so L3 v4 is not in it. |
+| **L3** multi-turn (v4.2 / v4.3) | A **conversation probe** on the shared 4B reads the user-turn history at every turn (layers 16 / 20 / 24), and a **reply check** (the v6 pair read with L3's own threshold) reads each real reply. v4.3: the reply check runs on real model replies only, never on the offline harness's stand-in output. | In the paper's local profile since 2026-11-27 (`L3_MT_V4`). The code default stays off: the reply threshold is calibrated on the local 4B's replies. | L3 TEST, read once (results.md §39.1): end-to-end recall **2 / 2** (Attack_600) and **11 / 11** (MHJ), **0 / 141** benign alarms, 607 ms per turn. The evidence is thin (Wilson lower bounds 0.34 / 0.74) and judge-sensitive (at t = 0.5: 0.756 / 0.726). Probe recall 0.917 on Attack_600 at 0 / 730 benign. |
+| **Whole system** (FINAL + L3 v4.3: the system of record since 2026-11-27) | The FINAL profile plus L3 v4.3. | -- | Read once on a FRESH benign arm v3s (results.md §39.6): DIDA-Bench attacks blocked **0.983** [0.910, 0.997] (58 / 59), any alarm **59 / 59**. Benign blocked **0 / 529**, any alarm **0.57 %** (3 / 529). Precision **1.000** (any alarm **0.952**), AUROC **1.000**, **904 ms** mean per request. Every mark met strictly. Against FINAL on the same items, L3 adds one blocked attack and no benign alarm, at +88 ms. |
 
 **Every metric, every layer** (shipped configuration unless marked; 95 % Wilson intervals; AUROC / AUPRC ranked against
 all benign rows of the same run; latency per item on an i5-12500H laptop with a 4 GB RTX 3050). Full tables, one row per
@@ -85,6 +87,9 @@ dataset slice, with sources: [`results.md`](results.md) §21.5.
 | **L2** BIPIA, middle-of-document, translated attacks vs pasted, code, e-mail, translated benign (t9 TEST) | 1,985 / 1,822 | 0.952 (lowest row: Chinese 0.916) | 0.60 % (highest row: pasted 1.76 %) | 0.994 | 0.973 | 0.996 | 0.997 | 3.1–3.8 / 6.3–9.7 s per document |
 | **L2 v8 (default)** · eleventh untouched draw (t11, stratified), read once; real runner | 2,180 / 1,630 | **0.959** (lowest row: Dutch 0.919) | 1.10 % (pasted 1.41 %; translated benign Chinese 4.35 %, Dutch 2.08 %) | **0.992** | **0.975** | **0.996** | **0.997** | **0.92 / 2.87 s** per document (VAL ingest 0.62 / 1.19 s) |
 | **L3** tom-gibbs multi-turn | 4,136 / 1,200 | 0.984 [0.980, 0.987] | 0 % [0, 0.32] | 1.000 | 0.992 | 0.996 | 0.998 | 0.39 / 0.48 s |
+| **L3 v4.2** end-to-end · Attack_600 replay vs four benign replay arms (TEST read once, §39.1) | 2 / 141 | 1.000 [0.342, 1.000] | 0 % [0, 2.65] | 1.000 | 1.000 | 1.000 | 1.000 | 0.61 s per turn |
+| L3 v4.2 end-to-end · MHJ replay vs the same benign arms | 11 / 141 | 1.000 [0.741, 1.000] | 0 % [0, 2.65] | 1.000 | 1.000 | 1.000 | 1.000 | 0.61 s per turn |
+| L3 v4.2 probe · Attack_600 vs 730 benign conversations | 600 / 730 | 0.917 [0.892, 0.936] | 0 % [0, 0.52] | 1.000 | 0.957 | 0.9998 | 0.9998 | probe read 0.12 / 0.31 s |
 | L3 · MHJ vs audited WildChat | 110 / 646 | 0.082 [0.044, 0.148] | 3.10 % [2.01, 4.73] | 0.310 | 0.130 | 0.682 | 0.249 | 0.56 / 1.3 s |
 | **L4** InjecAgent (direct + data stealing) | 1,054 / 34 | 1.000 [0.996, 1.000] | 0 % [0, 10.2] | 1.000 | 1.000 | 1.000 | — | 0.45 / 0.58–0.66 s |
 | L4 · Agent Security Bench (local profile) | 1,200 / 100 | 0.995 [0.989, 0.998] | 29 % prompted [21.0, 38.5] | 0.976 | 0.986 | 0.871 | 0.979 | not stored |
@@ -105,8 +110,13 @@ dataset slice, with sources: [`results.md`](results.md) §21.5.
 | **Pipeline, interim WS1** (2026-11-14, adopted local profile) · DIDA-Bench + benign arm, block decision | 59 / 582 | **0.966** [0.885, 0.991] | **0 %** [0, 0.66] (any alarm 1.03 % [0.47, 2.23]) | **1.000** | 0.983 (accuracy 0.9969, balanced 0.9831, MCC 0.981) | — | — | **3.59 / 7.54 s** |
 | **Pipeline, FINAL** (2026-11-19, read once; profile final_ct) · DIDA-Bench vs DIDA benign + arm v1 (re-read), block decision | 59 / 582 | **0.966** [0.885, 0.991] | **0 %** [0, 0.66] (any alarm 1.03 % [0.47, 2.23]) | **1.000** (any alarm 0.906) | 0.983 (accuracy 0.9969, balanced 0.9831, MCC 0.981) | 0.9998 | 0.998 | **0.74 / 0.87 s** per request |
 | Pipeline, FINAL · DIDA-Bench vs the FRESH benign arm v2, block decision | 59 / 529 | **0.966** [0.885, 0.991] | **0.19 %** [0.03, 1.06] (any alarm 1.32 % [0.64, 2.71]) | **0.983** (any alarm **0.892**) | 0.974 (accuracy 0.9949, balanced 0.9821, MCC 0.972) | 0.9997 | 0.998 | **0.83 / 1.07 s** per request |
+| **Pipeline, FINAL + L3 v4.3** (2026-11-27, read once; the system of record) · DIDA-Bench vs the FRESH benign arm v3s, block decision | 59 / 529 | **0.983** [0.910, 0.997] | **0 %** [0, 0.72] (any alarm 0.57 % [0.19, 1.65]) | **1.000** (any alarm **0.952**) | 0.992 (accuracy 0.9983, balanced 0.9915, MCC 0.991) | 1.000 | 1.000 | **0.90 / 1.18 s** per request |
 
-**Meets the mark** (status 2026-11-20):
+**Meets the mark** (status 2026-11-27):
+- **The whole system, FINAL + L3 v4.3** (§39.6, the system of record since 2026-11-27): every mark met strictly on a fresh
+  benign arm (blocked 0.983, benign blocked 0 / 529, any alarm 0.57 %, any-alarm precision 0.952, 904 ms).
+- **L3 v4.2 on MHJ and Attack_600** (§39.1): every pre-registered mark on its TEST, with thin evidence and a
+  judge-sensitive pass (see the table).
 - **The whole system's FINAL run** (§27.3): every mark is met except any-alarm precision on the fresh arm, 0.892, which is near
   the mark.
 - **L1H v4.1** (pooled recall 0.913, FP 3.04 %): accepted by the user as near the marks; opt-in.
@@ -129,13 +139,15 @@ with its logged root cause in [`results.md`](results.md):
     v6.1 / v6.2, §31.4 - §31.6): within one dataset the read
     separates harm (VAL recall at 4 % FP 0.85 - 0.97). The datasets' harm policies, though, need different thresholds,
     and no single threshold, cluster calibration or nonlinear head serves them all.
-- **L3 on MHJ**: the remaining layer round.
-  - **Why it is hard:** 53 of the 110 test attacks show no harmful intent in the user's turns, so an input-only
-    detector is capped near recall 0.5 (§29).
-  - **v4 (§34):** a conversation probe on the shared 4B plus an L3 reply signal on locally replayed conversations,
-    judged by Granite Guardian. It is built and unit-tested (`L3_MT_V4`, off).
-  - **Run state:** the run was stopped by hand on 2026-11-20 before any probe or end-to-end number. Resume with
-    `bash scratch/rca/l3/chain_l3_night2.sh`: VAL stop first, TEST only on a pass.
+- **L3 on MHJ: the marks are met, with caveats** (§39.1, §39.6).
+  - **Why it was hard:** 53 of the 110 test attacks show no harmful intent in the user's turns, so an input-only
+    detector is capped near recall 0.5 (§29). v4's reply check reads the protected model's replies to close that half.
+  - **Caveats:** at the judge's pre-registered t = 0.9 only 2 Attack_600 and 11 MHJ replays count as breached; at
+    t = 0.5 recall is 0.756 / 0.726. In a live deployment the reply check adds 489 ms per real reply (not measured
+    end to end), and protecting a model other than the local 4B needs its own reply-threshold calibration.
+  - **A shortcut risk (§39.8):** outside the test split, the probe BLOCKs 4 of 60 templated synthetic benign
+    DIDA-Bench conversations (2.0 % of all 200 benign; the gated rows read 0). The fix direction is a v4.4 with
+    templated benign negatives and a fresh TEST.
 - **L5 without any policy**: closed at the design limit (§33.6) and not pursued further (user decision 2026-11-20,
   §35).
   - AgentLeak's leak label is a per-task policy, and the same field is allowed by one task's policy and forbidden by
@@ -144,10 +156,8 @@ with its logged root cause in [`results.md`](results.md):
     the mark.
 - L4 on Agent Security Bench's legitimate prompts (13 %: the two genuine write tools, held by design); L2's
   three accepted residual rows.
-- **The whole system**: the FINAL run is done (§27.3).
-  - Every mark is met except any-alarm precision on the fresh benign arm, 0.892 (58 attacks caught vs 7 benign
-    warnings).
-  - Mean latency is 772 ms per request.
+- **The whole system**: FINAL + L3 v4.3 meets every mark strictly (§39.6). The earlier FINAL run (§27.3) missed only
+  any-alarm precision on arm v2 (0.892); on the fresh arm v3s FINAL reads 0.951.
 
 ---
 
@@ -257,9 +267,9 @@ Most guardrail projects ship detectors. DIDA also ships the machinery to **prove
 
 | | Contribution | What it does | Measured |
 |:---:|---|---|---|
-| **A** | **Taint-propagation graph** | Turns a session into a provenance graph (turns → retrieved chunks → tool arguments) and propagates trust along it: `taint(u,v) = 1 − w·(1 − trust(u))`. Flags high-impact calls fed by low-trust content even when no single layer fired. | Fires on exactly the same 7 held-out real attack sessions as the hand-coded RAG-plus-agent rule: it generalizes the rule rather than replacing it *(earlier configuration)* |
-| **B** | **Cost-aware sequential triage** | Runs layers as a Wald sequential test (SPRT) and stops as soon as the evidence is decisive, instead of always paying for all five layers. | Accuracy 0.9554, precision 1.0, recall 0.9153, 0 false positives; attacks are decided after **~3.4 of 5 layers** *(earlier configuration)* |
-| **C** | **Correlation-pattern mining** | Mines attack-chain patterns from labeled cross-layer event sequences (PrefixSpan-style) instead of hand-writing rules. | Recall **1.0000** on attack-chain types never seen in training (0.8841 on known types), FPR 0.0667 *(earlier configuration)* |
+| **A** | **Taint-propagation graph** | Turns a session into a provenance graph (turns → retrieved chunks → tool arguments) and propagates trust along it: `taint(u,v) = 1 − w·(1 − trust(u))`. Flags high-impact calls fed by low-trust content even when no single layer fired. | Fires on exactly the same 7 held-out real attack sessions as the hand-coded RAG-plus-agent rule: it generalizes the rule rather than replacing it *(earlier configuration)*. Today (FINAL + L3 v4.3, results.md §39.8): the rule fires on 150 / 375 DIDA-Bench attacks and the taint path on 75, every taint firing is also a rule firing, and rules without any layer add 0 recall |
+| **B** | **Cost-aware sequential triage** | Runs layers as a Wald sequential test (SPRT) and stops as soon as the evidence is decisive, instead of always paying for all five layers. | Accuracy 0.9554, precision 1.0, recall 0.9153, 0 false positives; attacks are decided after **~3.4 of 5 layers** *(earlier configuration)*. Today (§39.8): recall 59 / 59 and 0 / 53 false positives on the test split, 2.78 of 5 layers consulted on average (attacks 1.54) |
+| **C** | **Correlation-pattern mining** | Mines attack-chain patterns from labeled cross-layer event sequences (PrefixSpan-style) instead of hand-writing rules. | Recall **1.0000** on attack-chain types never seen in training (0.8841 on known types), FPR 0.0667 *(earlier configuration)*. Today (§39.8): held-out chain types 1.000, known types 0.957, benign FP 0.117 (7 / 60); the top pattern is L1 alone |
 | **D** | **Conformal risk control for false positives** | Sets each threshold with split-conformal calibration on benign data, so the false-positive rate carries a distribution-free guarantee: `k = ⌈(n+1)(1−α)⌉`. | Holds on fresh same-source traffic (0/500 at α = 0.01) and is **shown to break** under shift (14.8% on WildJailbreak's benign set). The failure is reported, not hidden |
 
 ### The theory and the measurement kit
@@ -267,9 +277,9 @@ Most guardrail projects ship detectors. DIDA also ships the machinery to **prove
 | | Contribution | What it does | Measured |
 |:---:|---|---|---|
 | **E** | **Detectability bound** | Proves that any detector reading only threshold crossings has **zero power** against an attacker who keeps every layer sub-threshold, and turns that into a prediction you can check (\|U\| = 0 on a certified corpus). | The correlation engine fired **0 times** on 510 certified attacks; the one detector that "beat" the bound turned out to be reading a lower threshold, exactly as the corollary says |
-| **F** | **Anytime-valid e-value fusion** | Fuses layer scores across layers and turns with e-values: false alarms stay controlled under *any* dependence between layers, at any stopping time. | Recovers exactly the best single layer (Jaccard **1.0000** on both corpora), proving the price of validity. Assuming independence instead catches **10/107**, 9 of which no single layer catches |
-| **G** | **SPLIT-Bench, certified sub-threshold corpora** | Generates attack sessions with a **machine-checked certificate** that every layer stays under its threshold while ≥ k layers carry real signal. Certificates are re-verified at import. | 680 sessions (v1) and 510 (v2) against DIDA, plus 447 (SPLIT-S2) against a third-party stack. Hardening DIDA made **0 of 4,080** three-layer attacks certifiable |
-| **H** | **Threshold-aware adversary and capacity sweep** | Models the attacker who knows every threshold and computes how much attack signal the stack lets them hide (*effective capacity*). | Every budget up to the capacity (3.002) fits under all thresholds; the first that doesn't is 3.040. 66.7–85.2% of that capacity is undefended. A fusion-aware variant is still certified at a 0.72 rate |
+| **F** | **Anytime-valid e-value fusion** | Fuses layer scores across layers and turns with e-values: false alarms stay controlled under *any* dependence between layers, at any stopping time. | Recovers exactly the best single layer (Jaccard **1.0000** on both corpora), proving the price of validity. Assuming independence instead catches **10/107**, 9 of which no single layer catches. On SPLIT-Bench v3 against today's DIDA (§39.3) the mean merge detects 0 / 340 and the product 23 / 340, none of them unique |
+| **G** | **SPLIT-Bench, certified sub-threshold corpora** | Generates attack sessions with a **machine-checked certificate** that every layer stays under its threshold while ≥ k layers carry real signal. Certificates are re-verified at import. | 680 sessions (v1) and 510 (v2) against DIDA, plus 447 (SPLIT-S2) against a third-party stack. Hardening DIDA made **0 of 4,080** three-layer attacks certifiable. **v3 against today's DIDA** (§39.3): k=2 certified 170 / 348, k=3 170 / 2,480. Validity limit: L1 / L3's carrier band overlaps benign text. A v3.1 rebuild with benign-relative carriers against FINAL + L3 v4.3 is in progress: calibration 190 / 200, stopped 2026-11-27 08:16 and resumable (results.md §39.9) |
+| **H** | **Threshold-aware adversary and capacity sweep** | Models the attacker who knows every threshold and computes how much attack signal the stack lets them hide (*effective capacity*). | Every budget up to the capacity (3.002) fits under all thresholds; the first that doesn't is 3.040. 66.7–85.2% of that capacity is undefended. A fusion-aware variant is still certified at a 0.72 rate. On v3 (§39.5) the fusion-aware adversary is still certified at 0.227 (per-layer 0.489), and 79.2 % of the capacity is undefended |
 
 > **Why this matters:** A–D are the cross-layer tricks people usually reach for. E–H explain where each one stops: three of the four reduce to a single layer on certified attacks, exactly as E predicts. That gives you a way to test *your own* guardrail stack before trusting it.
 

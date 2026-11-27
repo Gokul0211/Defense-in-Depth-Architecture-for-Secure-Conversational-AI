@@ -580,7 +580,9 @@ async def simulate_pipeline(
 
     # --- L5: scan sample text as an approximation of hypothetical output (see module docstring, item 2) ---
     if "L5" not in disabled_layers:
-        l5_result, _sanitized = await layer5_scan_output(sample_text, system_prompt=None, session_id=session_id)
+        # is_model_reply=False: the sample text stands in for an output; the L3 reply check needs a real reply (§39.4)
+        l5_result, _sanitized = await layer5_scan_output(sample_text, system_prompt=None, session_id=session_id,
+                                                         is_model_reply=False)
         layer_scores["L5"] = max(layer_scores["L5"], l5_result.score)
         layer_confidence["L5"] = max(
             layer_confidence["L5"], getattr(l5_result, "confidence", 0.0)

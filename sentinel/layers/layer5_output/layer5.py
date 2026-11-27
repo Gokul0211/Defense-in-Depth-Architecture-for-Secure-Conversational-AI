@@ -140,10 +140,17 @@ async def layer5_scan_output(
     response_text: str,
     system_prompt: str | None,
     session_id: str,
+    *,
+    is_model_reply: bool = True,
 ) -> tuple[L5Result, str]:
     """
     Scan an LLM response before sending it to the user.
     Returns: (L5Result, sanitized_response_text)
+
+    is_model_reply: False when `response_text` is NOT a reply of the protected model -- the offline harness
+    (eval/pipeline_sim.py) passes the sample's own input text as a stand-in for the output. The L3 v4 reply check is
+    calibrated on the protected model's real replies, so it runs only on a real reply (results.md §39.4, v4.3). Every
+    other L5 check is unchanged.
     """
     if not response_text:
         return L5Result(0.0, "CLEAN", [], 0.0, [], "Empty response", []), response_text
@@ -268,7 +275,7 @@ async def layer5_scan_output(
     # catches the multi-turn attacks whose intent never shows in the user turns (MHJ: 53 / 110). Fires -> WARN-level
     # evidence and HARMFUL_OUTPUT, independent of L5_HARM_CHECK.
     l3_reply_hit = False
-    if getattr(_c5, "L3_MT_V4", False):
+    if getattr(_c5, "L3_MT_V4", False) and is_model_reply:     # v4.3 (results.md §39.4): real replies only
         from sentinel.layers.layer3_mt import mt_reply
         _turns = [t for t in _user_supplied_text_list(session)] if session is not None else []
         mr = mt_reply(_turns[-1] if _turns else "", response_text)

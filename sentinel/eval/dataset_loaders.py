@@ -248,6 +248,16 @@ _REGISTRY: dict[str, dict] = {
         "hf_path": None,
         "license": "internal (XSum test, WildChat-1M sources)",
     },
+    "benign_pipeline_arm_v3s": {
+        # results.md §39.4: the FRESH single-turn arm of the L3 v4.3 whole-system TEST -- v2's builder rule over
+        # documents no round has read (XSum TEST after v1 / v2, WildChat-1M shard 00006).
+        # sentinel/eval/generate_benign_pipeline_arm_v3s.py.
+        "loader": "_load_benign_pipeline_arm_v3s",
+        "layer": "cross-layer",
+        "description": "Benign multi-layer pipeline arm v3s (fresh news / code documents + benign tool calls)",
+        "hf_path": None,
+        "license": "internal (XSum test, WildChat-1M sources)",
+    },
     "dida_bench": {
         "loader": "_load_sentinel_bench",
         "layer": "cross-layer",
@@ -1512,6 +1522,22 @@ def _load_benign_pipeline_arm_v2(split: str = "test", limit: int | None = None, 
         samples = _apply_limit(samples, limit)
     return EvalDataset(name="benign_pipeline_arm_v2", samples=samples,
                        description="Benign multi-layer pipeline arm v2 (fresh)", license="internal", split=split)
+
+
+def _load_benign_pipeline_arm_v3s(split: str = "test", limit: int | None = None, cache: bool = True) -> EvalDataset:
+    """results.md §39.4: the fresh arm of the L3 v4.3 TEST. Generate first: generate_benign_pipeline_arm_v3s.py"""
+    local_path = _DATA_DIR / "benign_pipeline_arm_v3s" / f"{split}.jsonl"
+    samples = []
+    if local_path.exists():
+        with open(local_path, "r", encoding="utf-8") as f:
+            samples = [EvalSample(**json.loads(line)) for line in f if line.strip()]
+    else:
+        logger.warning(f"benign pipeline arm v3s not found at {local_path}; "
+                       "run sentinel/eval/generate_benign_pipeline_arm_v3s.py")
+    if limit:
+        samples = _apply_limit(samples, limit)
+    return EvalDataset(name="benign_pipeline_arm_v3s", samples=samples,
+                       description="Benign multi-layer pipeline arm v3s (fresh)", license="internal", split=split)
 
 
 def _load_sentinel_bench(split: str = "test", limit: int | None = None, cache: bool = True) -> EvalDataset:

@@ -1,0 +1,85 @@
+{
+ "generated_at": "2026-11-27T06:38:48",
+ "seed": 20260926,
+ "profile": "FINAL (final_profile.env)",
+ "epsilon": 0.05,
+ "theta_lo": 0.15,
+ "budget_per_bucket": 4080,
+ "per_bucket": 170,
+ "pools": {
+  "inj_scored": 902,
+  "carriers": 1817,
+  "docs": 820,
+  "drift": 84,
+  "follow": 372,
+  "band_L1": 180,
+  "band_L2": 43,
+  "distinct_in_band_L1": 171,
+  "distinct_in_band_L2": 42,
+  "over_ceiling_alone_L1": 710,
+  "over_ceiling_alone_L2": 709,
+  "eligible": [
+   "L1",
+   "L2",
+   "L3"
+  ],
+  "ceiling": 0.45
+ },
+ "eligible": [
+  "L1",
+  "L2",
+  "L3"
+ ],
+ "buckets": {
+  "k=2": {
+   "accepted": 170,
+   "attempts": 348,
+   "target": 170,
+   "acceptance": 0.4885,
+   "rejections": {
+    "decision:WARN": 73,
+    "over:L1": 30,
+    "decision:BLOCK": 45,
+    "over:L2": 9,
+    "over:L1+L2": 2,
+    "over:L3": 15,
+    "over:L1+L3": 1,
+    "carrying<2": 1,
+    "over:L2+L3": 2
+   }
+  },
+  "k=3": {
+   "accepted": 170,
+   "attempts": 2480,
+   "target": 170,
+   "acceptance": 0.0685,
+   "rejections": {
+    "over:L1": 211,
+    "carrying<3": 961,
+    "decision:WARN": 386,
+    "over:L3": 126,
+    "decision:BLOCK": 500,
+    "over:L2": 86,
+    "over:L2+L3": 8,
+    "over:L1+L3": 21,
+    "over:L1+L2": 11
+   }
+  },
+  "benign": {
+   "accepted": 340,
+   "attempts": 533,
+   "target": 340,
+   "acceptance": 0.6379,
+   "rejections": {
+    "over:L3": 24,
+    "decision:WARN": 134,
+    "over:L1": 23,
+    "decision:BLOCK": 9,
+    "over:L1+L3": 2,
+    "over:L2": 1
+   }
+  }
+ },
+ "seconds": 12687,
+ "l1_cache": "L1 reused per turn text (byte-identical; per-row latency_ms excludes cached L1 reads)"
+}

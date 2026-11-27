@@ -1,0 +1,15 @@
+{
+ "generated_at": "2026-11-27T07:11:43",
+ "alarm_from": "split_bench_v3_analysis_20261127_063857.json",
+ "tau": -1.149,
+ "accepted": 60,
+ "attempts": 264,
+ "acceptance": 0.2273,
+ "rejections": {
+  "over": 138,
+  "alarm": 65,
+  "carrying": 1
+ },
+ "per_layer_adversary_acceptance_k2": 0.4885,
+ "seconds": 1964
+}

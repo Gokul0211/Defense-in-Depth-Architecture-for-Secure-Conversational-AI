@@ -115,3 +115,5 @@ parth_gpu_results/
 # results.md 38.8: the libraries the Mac's steps need, and code fixes to the (untracked) scratch scripts after the pack
 !parth_gpu_requirements.txt
 !parth_gpu_patch.zip
+# arm v3s holds third-party WildChat code with leaked tokens (GitHub push protection, 2026-11-27): kept local only
+sentinel/eval/data/benign_pipeline_arm_v3s/
